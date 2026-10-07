@@ -237,6 +237,14 @@ impl<'a> JsParser<'a> {
                 Ok((Parsed::Expr(expr, lenient), comments))
             }
             Goal::Program | Goal::Statement => {
+                // acorn-typescript keeps parenthesized types; oxc only emits them with
+                // `preserve_parens`, so keep parens and drop ParenthesizedExpressions in ToJson
+                let parser = if self.ts {
+                    Parser::new(self.alloc, text, self.source_type())
+                        .with_options(ParseOptions { preserve_parens: true, ..ParseOptions::default() })
+                } else {
+                    parser
+                };
                 let ret = parser.parse();
                 if let Some(err) = ret.diagnostics.first() {
                     return Err(first_error(std::slice::from_ref(err), base));
@@ -544,14 +552,37 @@ impl ToJson<'_> {
             m.insert("start".into(), 0.into());
             m.insert("end".into(), p.end.into());
         }
+        if self.ts {
+            remove_parens(&mut value);
+        }
         add_comments(&mut value, Src::new(self.loc.source(), 0), &self.comments[..p.comments.upto as usize], 0);
         value
     }
 
     pub fn statement(&self, s: &JsStatement) -> Value {
         let mut value = self.estree(&s.stmt);
+        if self.ts {
+            remove_parens(&mut value);
+        }
         add_comments(&mut value, s.source, &self.comments[..s.comments.upto as usize], s.comments.index as usize);
         value
+    }
+
+    /// acorn-typescript records a trailing comma in `<T,>` as `extra.trailingComma`
+    fn mark_trailing_comma(&self, map: &mut Map<String, Value>) {
+        let last_end = map.get("params").and_then(Value::as_array).and_then(|p| p.last()).and_then(|p| p.get("end")).and_then(Value::as_u64);
+        let end = map.get("end").and_then(Value::as_u64);
+        let (Some(last_end), Some(end)) = (last_end, end) else { return };
+        let source = self.loc.source().as_bytes();
+        let (from, to) = (last_end as usize, (end as usize).min(source.len()));
+        if from >= to {
+            return;
+        }
+        if let Some(p) = source[from..to].iter().position(|&b| b == b',') {
+            let mut extra = Map::new();
+            extra.insert("trailingComma".into(), (from + p).into());
+            map.insert("extra".into(), Value::Object(extra));
+        }
     }
 
     /// Add `loc`, and smooth over differences between oxc's ESTree and acorn's
@@ -572,6 +603,9 @@ impl ToJson<'_> {
                     return;
                 }
                 fix_shape(map, self.ts);
+                if map.get("type").and_then(Value::as_str) == Some("TSTypeParameterDeclaration") {
+                    self.mark_trailing_comma(map);
+                }
                 if let (Some(s), Some(e)) = (map.get("start").and_then(Value::as_u64), map.get("end").and_then(Value::as_u64)) {
                     let mut loc = Map::new();
                     loc.insert("start".into(), self.loc.acorn_position(s as usize));
@@ -901,8 +935,10 @@ fn fix_shape(map: &mut Map<String, Value>, ts: bool) {
         if let Some(source) = map.shift_remove("source") {
             map.insert("argument".into(), source);
         }
-        if map.get("options") == Some(&Value::Null) {
-            map.shift_remove("options");
+        for key in ["options", "qualifier"] {
+            if map.get(key) == Some(&Value::Null) {
+                map.shift_remove(key);
+            }
         }
     }
     if matches!(
@@ -934,9 +970,19 @@ fn fix_shape(map: &mut Map<String, Value>, ts: bool) {
     {
         map.shift_remove(if ty == "TSEnumDeclaration" { "const" } else { "global" });
     }
-    if ts && ty == "CallExpression" && map.get("typeArguments").is_some_and(|t| !t.is_null()) && map.get("optional") == Some(&Value::Bool(false)) {
-        // acorn-typescript's call-with-type-arguments path doesn't set `optional`
+    if ts
+        && ty == "CallExpression"
+        && map.get("typeArguments").is_some_and(|t| !t.is_null())
+        && map.get("optional") == Some(&Value::Bool(false))
+        && map.get("callee").and_then(|c| c.get("optional")) != Some(&Value::Bool(true))
+    {
+        // acorn-typescript's call-with-type-arguments path doesn't set `optional`, except
+        // inside an optional chain
         map.shift_remove("optional");
+    }
+    if ts && ty == "ImportExpression" && map.get("options") == Some(&Value::Null) {
+        // acorn-typescript parses `import()` itself, without import attributes
+        map.shift_remove("options");
     }
     if ty == "Decorator" {
         if let Some(Value::Object(call)) = map.get_mut("expression") {

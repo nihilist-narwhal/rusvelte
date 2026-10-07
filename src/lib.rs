@@ -67,7 +67,7 @@ fn to_utf16(node: &mut Value, loc: &Locator) {
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
                 match v {
-                    Value::Number(n) if k == "start" || k == "end" => {
+                    Value::Number(n) if k == "start" || k == "end" || k == "trailingComma" => {
                         if let Some(b) = n.as_u64() {
                             *v = loc.utf16(b as usize).into();
                         }
