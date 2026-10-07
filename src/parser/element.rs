@@ -3,11 +3,10 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
-use serde_json::{json, Value};
 
 use super::utils::*;
-use super::{node_end, node_type, style, LastAutoClosedTag, Open, Parser};
-use crate::ast::{Attr, AttrValue, Chunk, Element, Node, Script};
+use super::{style, LastAutoClosedTag, Open, Parser};
+use crate::ast::{Attr, AttrValue, Chunk, Element, Expr, IdentLoc, NameLoc, Node, Script, StyleSheet};
 use crate::error::Result;
 use crate::errors as e;
 use crate::js::JsComment;
@@ -56,6 +55,11 @@ fn meta_tag(name: &str) -> Option<&'static str> {
 }
 
 fn is_valid_element_name(name: &str) -> bool {
+    // fast path: a plain tag name like `div` or `h1` matches REGEX_VALID_TAG_NAME
+    let b = name.as_bytes();
+    if !b.is_empty() && b[0].is_ascii_alphabetic() && b.iter().all(u8::is_ascii_alphanumeric) {
+        return true;
+    }
     // !DOCTYPE
     if name.len() > 1 && name.starts_with('!') && name[1..].bytes().all(|b| b.is_ascii_alphabetic()) {
         return true;
@@ -64,6 +68,11 @@ fn is_valid_element_name(name: &str) -> bool {
 }
 
 pub fn is_valid_component_name(name: &str) -> bool {
+    // fast paths for ASCII names: `Foo` / `Foo_2` are components, plain lowercase names aren't
+    let b = name.as_bytes();
+    if !b.is_empty() && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$') {
+        return b[0].is_ascii_uppercase();
+    }
     REGEX_VALID_COMPONENT_NAME.is_match(name)
 }
 
@@ -74,14 +83,14 @@ pub fn element(parser: &mut Parser) -> Result<()> {
     let mut parent = parser.current();
 
     if parser.eat("!--") {
-        let data = parser.read_until("-->")?.to_string();
+        let data = parser.read_until("-->")?;
         parser.expect("-->")?;
         parser.append(Node::Comment { start, end: parser.index, data });
         return Ok(());
     }
 
     if parser.eat("/") {
-        let name = read_tag_name(parser, false)?.to_string();
+        let name = read_tag_name(parser, false)?;
         parser.allow_whitespace();
         parser.expect(">")?;
 
@@ -93,12 +102,12 @@ pub fn element(parser: &mut Parser) -> Result<()> {
         loop {
             let parent_name = match parent {
                 Open::Node(id) => match &parser.ast.nodes[id] {
-                    Node::Element(el) => Some(el.name.clone()),
+                    Node::Element(el) => Some(el.name),
                     _ => None,
                 },
                 Open::Root => None,
             };
-            if parent_name.as_deref() == Some(name.as_str()) {
+            if parent_name.as_deref() == Some(name) {
                 break;
             }
 
@@ -173,13 +182,13 @@ pub fn element(parser: &mut Parser) -> Result<()> {
     }
 
     if ROOT_ONLY_META_TAGS.iter().any(|(n, _)| *n == tag_name) {
-        if parser.meta_tags.contains(&tag_name) {
+        if parser.meta_tags.contains(tag_name) {
             return Err(e::svelte_meta_duplicate(start, &tag_name));
         }
         if parent != Open::Root {
             return Err(e::svelte_meta_invalid_placement(start, &tag_name));
         }
-        parser.meta_tags.insert(tag_name.clone());
+        parser.meta_tags.insert(tag_name.to_string());
     }
 
     let kind: &'static str = if let Some(t) = meta_tag(&tag_name) {
@@ -199,7 +208,7 @@ pub fn element(parser: &mut Parser) -> Result<()> {
         kind,
         start,
         end: None,
-        name: tag_name.clone(),
+        name: tag_name,
         name_loc: tag_loc,
         attributes: Vec::new(),
         fragment,
@@ -211,7 +220,7 @@ pub fn element(parser: &mut Parser) -> Result<()> {
 
     if let Open::Node(parent_id) = parent {
         let parent_info = match &parser.ast.nodes[parent_id] {
-            Node::Element(el) if el.kind == "RegularElement" => Some(el.name.clone()),
+            Node::Element(el) if el.kind == "RegularElement" => Some(el.name),
             _ => None,
         };
         if let Some(parent_name) = parent_info {
@@ -219,8 +228,8 @@ pub fn element(parser: &mut Parser) -> Result<()> {
                 parser.ast.nodes[parent_id].set_end(start);
                 parser.pop();
                 parser.last_auto_closed_tag = Some(LastAutoClosedTag {
-                    tag: parent_name,
-                    reason: tag_name.clone(),
+                    tag: parent_name.to_string(),
+                    reason: tag_name.to_string(),
                     depth: parser.stack.len(),
                 });
             }
@@ -265,7 +274,7 @@ pub fn element(parser: &mut Parser) -> Result<()> {
         let index = element
             .attributes
             .iter()
-            .position(|a| matches!(a, Attr::Attribute { name, .. } if name == "this"));
+            .position(|a| matches!(a, Attr::Attribute { name, .. } if *name == "this"));
         let Some(index) = index else {
             return Err(e::svelte_component_missing_this(start));
         };
@@ -273,49 +282,47 @@ pub fn element(parser: &mut Parser) -> Result<()> {
         if !is_expression_attribute(&definition) {
             return Err(e::svelte_component_invalid_this(definition.start()));
         }
-        element.expression = Some(get_attribute_expression(&definition));
+        element.expression = get_attribute_expression(definition);
     }
 
     if kind == "SvelteElement" {
         let index = element
             .attributes
             .iter()
-            .position(|a| matches!(a, Attr::Attribute { name, .. } if name == "this"));
+            .position(|a| matches!(a, Attr::Attribute { name, .. } if *name == "this"));
         let Some(index) = index else {
             return Err(e::svelte_element_missing_this(start));
         };
         let definition = element.attributes.remove(index);
+        let (def_start, def_end) = (definition.start(), definition.end());
         let Attr::Attribute { value, .. } = &definition else { unreachable!() };
 
         if matches!(value, AttrValue::True) {
-            return Err(e::svelte_element_missing_this((definition.start(), definition.end())));
+            return Err(e::svelte_element_missing_this((def_start, def_end)));
         }
 
         if !is_expression_attribute(&definition) {
+            // note that this is wrong, in the case of e.g. `this="h{n}"` — it will result in `<h>`.
+            // Svelte preserves the buggy Svelte 4 behaviour; TODO in 6.0, error
+            let Attr::Attribute { value, .. } = definition else { unreachable!() };
             let chunk = match value {
-                AttrValue::Sequence(chunks) => chunks[0].clone(),
-                AttrValue::Expression(c) => (**c).clone(),
+                AttrValue::Sequence(chunks) => chunks.into_iter().next().unwrap(),
+                AttrValue::Expression(c) => *c,
                 AttrValue::True => unreachable!(),
             };
             element.tag = Some(match chunk {
-                Chunk::Text { start, end, raw, data } => json!({
-                    "type": "Literal",
-                    "value": data,
-                    "raw": format!("'{raw}'"),
-                    "start": start,
-                    "end": end
-                }),
+                Chunk::Text { start, end, raw, data } => Expr::Literal { value: data.into_owned(), raw: format!("'{raw}'"), start, end },
                 Chunk::Expression { expression, .. } => expression,
             });
         } else {
-            element.tag = Some(get_attribute_expression(&definition));
+            element.tag = get_attribute_expression(definition);
         }
     }
 
     if is_top_level_script_or_style {
         parser.expect(">")?;
 
-        let mut prev_comment: Option<(String, Value)> = None;
+        let mut prev_comment: Option<(usize, usize, String)> = None;
         let root_nodes = &parser.ast.fragments[parser.root.fragment].nodes;
         for i in (0..root_nodes.len()).rev() {
             let node = &parser.ast.nodes[root_nodes[i]];
@@ -324,10 +331,7 @@ pub fn element(parser: &mut Parser) -> Result<()> {
             }
             match node {
                 Node::Comment { start, end, data } => {
-                    prev_comment = Some((
-                        data.clone(),
-                        json!({ "type": "Comment", "start": start, "end": end, "data": data }),
-                    ));
+                    prev_comment = Some((*start, *end, data.to_string()));
                     break;
                 }
                 Node::Text { data, .. } if js_trim(data).is_empty() => {}
@@ -337,13 +341,7 @@ pub fn element(parser: &mut Parser) -> Result<()> {
 
         if tag_name == "script" {
             let mut script = read_script(parser, start, element.attributes)?;
-            if let Some((data, _)) = &prev_comment {
-                script
-                    .content
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("leadingComments".into(), json!([{ "type": "Line", "value": data }]));
-            }
+            script.leading_comment = prev_comment.map(|(_, _, data)| data);
             if script.context == "module" {
                 if parser.root.module.is_some() {
                     return Err(e::script_duplicate(start));
@@ -356,13 +354,12 @@ pub fn element(parser: &mut Parser) -> Result<()> {
                 parser.root.instance = Some(script);
             }
         } else {
-            let attributes: Vec<Value> = element.attributes.iter().map(crate::ast::attr_json).collect();
-            let mut content = style::read_style(parser, start, attributes)?;
-            content["content"]["comment"] = prev_comment.map_or(Value::Null, |(_, c)| c);
+            let mut content = style::read_style(parser, start)?;
+            content.comment = prev_comment;
             if parser.root.css.is_some() {
                 return Err(e::style_duplicate(start));
             }
-            parser.root.css = Some(content);
+            parser.root.css = Some(StyleSheet { attributes: element.attributes, css: content });
         }
         return Ok(());
     }
@@ -376,7 +373,7 @@ pub fn element(parser: &mut Parser) -> Result<()> {
     if !closed {
         let Node::Element(el) = &mut parser.ast.nodes[element_id] else { unreachable!() };
         // We may have eaten an opening `<` of the next element and treated it as an attribute...
-        let last_is_lt = matches!(el.attributes.last(), Some(Attr::Attribute { name, .. }) if name == "<");
+        let last_is_lt = matches!(el.attributes.last(), Some(Attr::Attribute { name, .. }) if *name == "<");
         if last_is_lt {
             parser.index = el.attributes.last().unwrap().start();
             el.attributes.pop();
@@ -418,9 +415,9 @@ pub fn element(parser: &mut Parser) -> Result<()> {
         let close_tag = format!("</{tag_name}>");
         let close_index = parser.template[parser.index..].find(&close_tag).map(|p| p + parser.index);
         let end = close_index.unwrap_or(parser.template.len());
-        let data = parser.template[start..end].to_string();
+        let data = &parser.template[start..end];
         parser.index = end;
-        let text = parser.ast.add(Node::Text { start, end, raw: data.clone(), data });
+        let text = parser.ast.add(Node::Text { start, end, raw: data, data: data.into() });
         let Node::Element(el) = &parser.ast.nodes[element_id] else { unreachable!() };
         let frag = el.fragment;
         parser.ast.fragments[frag].nodes.push(text);
@@ -462,17 +459,17 @@ fn is_expression_attribute(attr: &Attr) -> bool {
     }
 }
 
-fn get_attribute_expression(attr: &Attr) -> Value {
+fn get_attribute_expression(attr: Attr) -> Option<Expr> {
     match attr {
-        Attr::Attribute { value: AttrValue::Expression(chunk), .. } => match &**chunk {
-            Chunk::Expression { expression, .. } => expression.clone(),
-            Chunk::Text { .. } => Value::Null,
+        Attr::Attribute { value: AttrValue::Expression(chunk), .. } => match *chunk {
+            Chunk::Expression { expression, .. } => Some(expression),
+            Chunk::Text { .. } => None,
         },
-        Attr::Attribute { value: AttrValue::Sequence(chunks), .. } => match &chunks[0] {
-            Chunk::Expression { expression, .. } => expression.clone(),
-            Chunk::Text { .. } => Value::Null,
+        Attr::Attribute { value: AttrValue::Sequence(chunks), .. } => match chunks.into_iter().next() {
+            Some(Chunk::Expression { expression, .. }) => Some(expression),
+            _ => None,
         },
-        _ => Value::Null,
+        _ => None,
     }
 }
 
@@ -498,14 +495,14 @@ fn parent_is_shadowroot_template(parser: &Parser) -> bool {
             Node::Element(el) if el.kind == "RegularElement" => el
                 .attributes
                 .iter()
-                .any(|a| matches!(a, Attr::Attribute { name, .. } if name == "shadowrootmode")),
+                .any(|a| matches!(a, Attr::Attribute { name, .. } if *name == "shadowrootmode")),
             _ => false,
         },
         Open::Root => false,
     })
 }
 
-fn read_static_attribute(parser: &mut Parser) -> Result<Option<Attr>> {
+fn read_static_attribute<'a>(parser: &mut Parser<'a>) -> Result<Option<Attr<'a>>> {
     let start = parser.index;
     let (name, name_loc) = read_tag(parser, true)?;
     if name.is_empty() {
@@ -530,7 +527,7 @@ fn read_static_attribute(parser: &mut Parser) -> Result<Option<Attr>> {
         value = AttrValue::Sequence(vec![Chunk::Text {
             start: parser.index - raw.len() - usize::from(quoted),
             end: if quoted { parser.index - 1 } else { parser.index },
-            raw: raw.to_string(),
+            raw,
             data: decode_character_references(raw, true),
         }]);
     }
@@ -542,7 +539,7 @@ fn read_static_attribute(parser: &mut Parser) -> Result<Option<Attr>> {
     Ok(Some(Attr::Attribute { start, end: parser.index, name, name_loc: Some(name_loc), value }))
 }
 
-fn read_attribute(parser: &mut Parser) -> Result<Option<Attr>> {
+fn read_attribute<'a>(parser: &mut Parser<'a>) -> Result<Option<Attr<'a>>> {
     while let Some(comment) = read_comment(parser) {
         parser.root.comments.push(comment);
         parser.allow_whitespace();
@@ -569,7 +566,7 @@ fn read_attribute(parser: &mut Parser) -> Result<Option<Attr>> {
         }
 
         let id = parser.read_identifier()?;
-        let name = id["name"].as_str().unwrap_or("").to_string();
+        let name = id.name;
         if name.is_empty() {
             if parser.loose && (parser.match_str("#") || parser.match_str("/") || parser.match_str("@") || parser.match_str(":")) {
                 return Ok(None);
@@ -583,9 +580,8 @@ fn read_attribute(parser: &mut Parser) -> Result<Option<Attr>> {
         parser.allow_whitespace();
         parser.expect("}")?;
 
-        let (id_start, id_end) = (super::node_start(&id), node_end(&id));
-        let name_loc = id["loc"].clone();
-        let chunk = Chunk::Expression { start: id_start, end: id_end, expression: id };
+        let name_loc = NameLoc { start: id.start, end: id.end };
+        let chunk = Chunk::Expression { start: id.start, end: id.end, expression: id.expr() };
         return Ok(Some(Attr::Attribute {
             start,
             end: parser.index,
@@ -628,8 +624,8 @@ fn read_attribute(parser: &mut Parser) -> Result<Option<Attr>> {
 
     if let (Some(kind), Some(colon_index)) = (directive_type, colon_index) {
         let mut parts = name[colon_index + 1..].split('|');
-        let directive_name = parts.next().unwrap_or("").to_string();
-        let modifiers: Vec<String> = parts.map(str::to_string).collect();
+        let directive_name = parts.next().unwrap_or("");
+        let modifiers: Vec<&str> = parts.collect();
 
         if directive_name.is_empty() {
             return Err(e::directive_missing_name((start, start + colon_index + 1), &name));
@@ -639,25 +635,24 @@ fn read_attribute(parser: &mut Parser) -> Result<Option<Attr>> {
             return Ok(Some(Attr::StyleDirective { start, end, name: directive_name, name_loc, modifiers, value }));
         }
 
-        let first_value = match &value {
+        let first = match value {
             AttrValue::True => None,
-            AttrValue::Expression(c) => Some((**c).clone()),
-            AttrValue::Sequence(chunks) => chunks.first().cloned(),
+            AttrValue::Expression(c) => Some(*c),
+            AttrValue::Sequence(chunks) => {
+                if chunks.len() > 1 {
+                    return Err(e::directive_invalid_value(chunks[0].start()));
+                }
+                chunks.into_iter().next()
+            }
         };
 
-        let mut expression = None;
-        if let Some(first) = first_value {
-            let len = match &value {
-                AttrValue::Sequence(chunks) => chunks.len(),
-                _ => 1,
-            };
-            if len > 1 || matches!(first, Chunk::Text { .. }) {
-                return Err(e::directive_invalid_value(first.start()));
-            }
-            if let Chunk::Expression { expression: x, .. } = first {
-                expression = Some(x);
-            }
-        }
+        let mut expression = match first {
+            None => None,
+            Some(Chunk::Text { start, .. }) => return Err(e::directive_invalid_value(start)),
+            // TODO Svelte: throw a parser error in a future version if this is `[ExpressionTag]`
+            // instead of `ExpressionTag`, which means stringified value
+            Some(Chunk::Expression { expression, .. }) => Some(expression),
+        };
 
         let intro_outro = if kind == "TransitionDirective" {
             let direction = &name[..colon_index];
@@ -668,12 +663,12 @@ fn read_attribute(parser: &mut Parser) -> Result<Option<Attr>> {
 
         // Directive name is expression, e.g. <p class:isRed />
         if (kind == "BindDirective" || kind == "ClassDirective") && expression.is_none() {
-            expression = Some(json!({
-                "start": start + colon_index + 1,
-                "end": end,
-                "type": "Identifier",
-                "name": directive_name
-            }));
+            expression = Some(Expr::Ident {
+                name: directive_name.to_string(),
+                start: start + colon_index + 1,
+                end,
+                loc: IdentLoc::None,
+            });
         }
 
         return Ok(Some(Attr::Directive {
@@ -714,7 +709,7 @@ fn read_comment(parser: &mut Parser) -> Option<JsComment> {
         value,
         start,
         end,
-        loc: Some((parser.loc.locate(start), parser.loc.locate(end))),
+        svelte_loc: true,
     })
 }
 
@@ -732,7 +727,7 @@ fn get_directive_type(name: &str) -> Option<&'static str> {
     })
 }
 
-fn read_attribute_value(parser: &mut Parser) -> Result<AttrValue> {
+fn read_attribute_value<'a>(parser: &mut Parser<'a>) -> Result<AttrValue<'a>> {
     let quote_mark = if parser.eat("'") {
         Some("'")
     } else if parser.eat("\"") {
@@ -745,8 +740,8 @@ fn read_attribute_value(parser: &mut Parser) -> Result<AttrValue> {
             return Ok(AttrValue::Sequence(vec![Chunk::Text {
                 start: parser.index - 1,
                 end: parser.index - 1,
-                raw: String::new(),
-                data: String::new(),
+                raw: "",
+                data: "".into(),
             }]));
         }
     }
@@ -794,17 +789,18 @@ fn read_attribute_value(parser: &mut Parser) -> Result<AttrValue> {
     }
 }
 
-fn read_sequence(parser: &mut Parser, done: impl Fn(&Parser) -> bool, location: &str) -> Result<Vec<Chunk>> {
+fn read_sequence<'a>(parser: &mut Parser<'a>, done: impl Fn(&Parser) -> bool, location: &str) -> Result<Vec<Chunk<'a>>> {
     let mut chunks = Vec::new();
     let mut chunk_start = parser.index;
 
-    let flush = |parser: &Parser, chunks: &mut Vec<Chunk>, chunk_start: usize, end: usize| {
+    let template = parser.template;
+    let flush = |chunks: &mut Vec<Chunk<'a>>, chunk_start: usize, end: usize| {
         if end > chunk_start {
-            let raw = &parser.template[chunk_start..end];
+            let raw = &template[chunk_start..end];
             chunks.push(Chunk::Text {
                 start: chunk_start,
                 end,
-                raw: raw.to_string(),
+                raw,
                 data: decode_character_references(raw, true),
             });
         }
@@ -814,7 +810,7 @@ fn read_sequence(parser: &mut Parser, done: impl Fn(&Parser) -> bool, location: 
         let index = parser.index;
 
         if done(parser) {
-            flush(parser, &mut chunks, chunk_start, parser.index);
+            flush(&mut chunks, chunk_start, parser.index);
             return Ok(chunks);
         } else if parser.eat("{") {
             if parser.match_str("#") {
@@ -829,7 +825,7 @@ fn read_sequence(parser: &mut Parser, done: impl Fn(&Parser) -> bool, location: 
                 return Err(e::tag_invalid_placement(index, name, location));
             }
 
-            flush(parser, &mut chunks, chunk_start, parser.index - 1);
+            flush(&mut chunks, chunk_start, parser.index - 1);
 
             parser.allow_whitespace();
             let expression = parser.read_expression()?;
@@ -858,20 +854,30 @@ fn read_tag_name<'s>(parser: &mut Parser<'s>, attribute: bool) -> Result<&'s str
         return Err(e::unexpected_eof(parser.template.len()));
     }
     let template = parser.template;
-    while let Some(c) = char_at(template, parser.index) {
-        if is_whitespace_char(c) || c == '/' || c == '>' || (attribute && (c == '"' || c == '\'' || c == '=')) {
-            break;
+    let bytes = template.as_bytes();
+    while parser.index < bytes.len() {
+        let b = bytes[parser.index];
+        if b < 0x80 {
+            if matches!(b, b' ' | b'\t'..=b'\r' | b'/' | b'>') || (attribute && matches!(b, b'"' | b'\'' | b'=')) {
+                break;
+            }
+            parser.index += 1;
+        } else {
+            let c = char_at(template, parser.index).unwrap();
+            if is_whitespace_char(c) {
+                break;
+            }
+            parser.index += c.len_utf8();
         }
-        parser.index += c.len_utf8();
     }
     Ok(&template[start..parser.index])
 }
 
-fn read_tag(parser: &mut Parser, attribute: bool) -> Result<(String, Value)> {
+fn read_tag<'a>(parser: &mut Parser<'a>, attribute: bool) -> Result<(&'a str, NameLoc)> {
     let start = parser.index;
-    let name = read_tag_name(parser, attribute)?.to_string();
+    let name = read_tag_name(parser, attribute)?;
     let end = parser.index;
-    Ok((name, json!({ "start": parser.loc.locate(start), "end": parser.loc.locate(end) })))
+    Ok((name, NameLoc { start, end }))
 }
 
 fn read_lowercase_name<'s>(parser: &mut Parser<'s>) -> &'s str {
@@ -886,7 +892,7 @@ fn read_lowercase_name<'s>(parser: &mut Parser<'s>) -> &'s str {
 
 const RESERVED_ATTRIBUTES: &[&str] = &["server", "client", "worker", "test", "default"];
 
-fn read_script(parser: &mut Parser, start: usize, attributes: Vec<Attr>) -> Result<Script> {
+fn read_script<'a>(parser: &mut Parser<'a>, start: usize, attributes: Vec<Attr<'a>>) -> Result<Script<'a>> {
     let script_start = parser.index;
     let template = parser.template;
     if script_start >= template.len() && !parser.loose {
@@ -903,32 +909,24 @@ fn read_script(parser: &mut Parser, start: usize, attributes: Vec<Attr>) -> Resu
     let data = &template[script_start..data_end];
     parser.index += close_len;
 
-    let mut ast = parser.js.parse_program(data, script_start, &mut parser.root.comments)?;
-    {
-        let m = ast.as_object_mut().unwrap();
-        m.insert("start".into(), script_start.into());
-        m.insert(
-            "loc".into(),
-            json!({ "start": parser.loc.position(start), "end": parser.loc.position(parser.index) }),
-        );
-    }
+    let content = parser.js.parse_program(data, script_start, &mut parser.root.comments)?;
 
     let mut context = "default";
     for attribute in &attributes {
         let Attr::Attribute { name, value, .. } = attribute else { continue };
-        if RESERVED_ATTRIBUTES.contains(&name.as_str()) {
+        if RESERVED_ATTRIBUTES.contains(name) {
             return Err(e::script_reserved_attribute((attribute.start(), attribute.end()), name));
         }
-        if name == "module" {
+        if *name == "module" {
             if !matches!(value, AttrValue::True) {
                 return Err(e::script_invalid_attribute_value((attribute.start(), attribute.end()), name));
             }
             context = "module";
         }
-        if name == "context" {
+        if *name == "context" {
             let text = match value {
                 AttrValue::Sequence(chunks) if chunks.len() == 1 => match &chunks[0] {
-                    Chunk::Text { data, .. } => Some(data.as_str()),
+                    Chunk::Text { data, .. } => Some(data.as_ref()),
                     _ => None,
                 },
                 _ => None,
@@ -940,6 +938,5 @@ fn read_script(parser: &mut Parser, start: usize, attributes: Vec<Attr>) -> Resu
         }
     }
 
-    let _ = node_type;
-    Ok(Script { start, end: parser.index, context, content: ast, attributes })
+    Ok(Script { start, end: parser.index, context, content, attributes, leading_comment: None })
 }

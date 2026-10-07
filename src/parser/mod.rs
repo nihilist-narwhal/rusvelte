@@ -8,14 +8,19 @@ mod tag;
 pub mod utils;
 
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::LazyLock;
 
-use serde_json::{json, Map, Value};
+use oxc_allocator::Allocator;
+use oxc_ast::ast::{Expression, IdentifierName};
+use oxc_ast::builder::AstBuilder;
+use oxc_span::{GetSpan, Span};
+use serde_json::Value;
 
-use crate::ast::{Ast, FragId, Js, Node, NodeId, Root};
-use crate::error::{CompileError, Result};
+use crate::ast::{Ast, Expr, FragId, IdentLoc, Node, NodeId, Pattern, Root, TypeAnn};
+use crate::error::Result;
 use crate::errors as e;
-use crate::js::{remove_parens, Js as JsParser};
+use crate::js::{JsExpr, JsParser, Src};
 use crate::locator::Locator;
 pub use utils::is_whitespace_char;
 use utils::*;
@@ -33,23 +38,39 @@ pub struct LastAutoClosedTag {
     pub depth: usize,
 }
 
-pub struct Parser<'s> {
+pub struct Parser<'a> {
     /// The (trimmed) template
-    pub full: &'s str,
+    pub full: &'a str,
     /// Usually `full`; temporarily truncated while reading `{#each}` expressions
-    pub template: &'s str,
+    pub template: &'a str,
     pub index: usize,
     pub loose: bool,
     pub ts: bool,
-    pub ast: Ast,
-    pub root: Root,
+    pub ast: Ast<'a>,
+    pub root: Root<'a>,
     pub stack: Vec<Open>,
     pub fragments: Vec<FragId>,
     pub meta_tags: HashSet<String>,
     pub last_auto_closed_tag: Option<LastAutoClosedTag>,
-    pub css_comments: Vec<Value>,
-    pub loc: &'s Locator<'s>,
-    pub js: JsParser<'s>,
+    pub css_comments: Vec<crate::css::CssComment>,
+    pub loc: Rc<Locator<'a>>,
+    pub js: JsParser<'a>,
+    pub builder: AstBuilder<'a>,
+}
+
+/// An identifier read by `read_identifier` (the name may be empty)
+#[derive(Debug, Clone, Copy)]
+pub struct Ident<'a> {
+    pub name: &'a str,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Ident<'_> {
+    /// As an expression, with Svelte's `loc` (with `character`)
+    pub fn expr<'x>(&self) -> Expr<'x> {
+        Expr::Ident { name: self.name.to_string(), start: self.start, end: self.end, loc: IdentLoc::Svelte }
+    }
 }
 
 /// What `regex_lang_attribute` finds: the `lang` of the first `<script ...>` tag outside an
@@ -109,7 +130,7 @@ fn lang_in_tag(rest: &str) -> Option<&str> {
 }
 
 /// Parse a component. `source` must already have its BOM removed.
-pub fn parse<'s>(source: &'s str, loc: &'s Locator<'s>, loose: bool) -> Result<(Ast, Root)> {
+pub fn parse<'a>(alloc: &'a Allocator, source: &'a str, loc: Rc<Locator<'a>>, loose: bool) -> Result<(Ast<'a>, Root<'a>)> {
     let template = js_trim_end(source);
 
     let ts = script_lang(source) == Some("ts");
@@ -141,8 +162,9 @@ pub fn parse<'s>(source: &'s str, loc: &'s Locator<'s>, loose: bool) -> Result<(
         meta_tags: HashSet::new(),
         last_auto_closed_tag: None,
         css_comments: Vec::new(),
+        js: JsParser::new(ts, loc.clone(), alloc),
         loc,
-        js: JsParser::new(ts, loc),
+        builder: AstBuilder::new(alloc),
     };
 
     while parser.index < parser.template.len() {
@@ -166,7 +188,7 @@ pub fn parse<'s>(source: &'s str, loc: &'s Locator<'s>, loose: bool) -> Result<(
             node.set_end(start + 1);
             if let Node::Element(el) = node {
                 if el.kind == "RegularElement" {
-                    let name = el.name.clone();
+                    let name = el.name;
                     return Err(e::element_unclosed((start, start + 1), &name));
                 }
             }
@@ -184,7 +206,7 @@ pub fn parse<'s>(source: &'s str, loc: &'s Locator<'s>, loose: bool) -> Result<(
         .position(|&n| parser.ast.nodes[n].type_name() == "SvelteOptions");
     if let Some(i) = options_index {
         let id = parser.ast.fragments[root_fragment].nodes.remove(i);
-        let options = options::read_options(&parser.ast, id)?;
+        let options = options::read_options(&mut parser, id)?;
         parser.root.options = Some(options);
 
         // disallow_children
@@ -192,24 +214,17 @@ pub fn parse<'s>(source: &'s str, loc: &'s Locator<'s>, loose: bool) -> Result<(
         let nodes = &parser.ast.fragments[el.fragment].nodes;
         if let (Some(&first), Some(&last)) = (nodes.first(), nodes.last()) {
             let start = parser.ast.nodes[first].start();
-            let end = parser.ast.nodes[last].end().map_or(-1i64, |e| e as i64);
-            return Err(e::svelte_meta_invalid_content((start, end.max(0) as usize), &el.name));
+            let end = parser.ast.nodes[last].end().unwrap_or(0);
+            return Err(e::svelte_meta_invalid_content((start, end), &el.name));
         }
     }
 
     Ok((parser.ast, parser.root))
 }
 
-impl<'s> Parser<'s> {
+impl<'a> Parser<'a> {
     pub fn current(&self) -> Open {
         *self.stack.last().unwrap()
-    }
-
-    pub fn current_type(&self) -> &'static str {
-        match self.current() {
-            Open::Root => "Root",
-            Open::Node(id) => self.ast.nodes[id].type_name(),
-        }
     }
 
     #[inline]
@@ -267,8 +282,8 @@ impl<'s> Parser<'s> {
         }
     }
 
-    /// `read_identifier`: an Identifier node (name may be empty)
-    pub fn read_identifier(&mut self) -> Result<Js> {
+    /// `read_identifier`: the name may be empty
+    pub fn read_identifier(&mut self) -> Result<Ident<'a>> {
         let start = self.index;
         let mut end = start;
         if let Some(c) = char_at(self.template, start) {
@@ -287,16 +302,10 @@ impl<'s> Parser<'s> {
                 }
             }
         }
-        Ok(json!({
-            "type": "Identifier",
-            "name": &self.template[start..end],
-            "start": start,
-            "end": end,
-            "loc": { "start": self.loc.locate(start), "end": self.loc.locate(end) }
-        }))
+        Ok(Ident { name: &self.template[start..end], start, end })
     }
 
-    pub fn read_until(&mut self, delimiter: &str) -> Result<&'s str> {
+    pub fn read_until(&mut self, delimiter: &str) -> Result<&'a str> {
         if self.index >= self.template.len() {
             if self.loose {
                 return Ok("");
@@ -329,13 +338,13 @@ impl<'s> Parser<'s> {
         let node = Node::Text {
             start,
             end: i,
-            raw: raw.to_string(),
+            raw,
             data: decode_character_references(raw, false),
         };
         self.append(node);
     }
 
-    pub fn append(&mut self, node: Node) -> NodeId {
+    pub fn append(&mut self, node: Node<'a>) -> NodeId {
         let id = self.ast.add(node);
         let frag = *self.fragments.last().unwrap();
         self.ast.fragments[frag].nodes.push(id);
@@ -353,36 +362,36 @@ impl<'s> Parser<'s> {
 
     // --- JS ------------------------------------------------------------------------------
 
-    pub fn parse_expression_at(&mut self, source: &str, index: usize) -> Result<Js> {
+    pub fn parse_expression_at(&mut self, source: Src<'a>, index: usize) -> Result<JsExpr<'a>> {
         self.js.parse_expression_at(source, index, &mut self.root.comments)
     }
 
     /// `get_loose_identifier`
-    pub fn get_loose_identifier(&mut self, opening_token: u8) -> Option<Js> {
+    pub fn get_loose_identifier(&mut self, opening_token: u8) -> Option<Expr<'a>> {
         let end = find_matching_bracket(self.template, self.index, opening_token)?;
         let start = self.index;
         self.index = end;
-        Some(json!({ "type": "Identifier", "start": start, "end": end, "name": "" }))
+        Some(Expr::Ident { name: String::new(), start, end, loc: IdentLoc::None })
     }
 
     /// `read_expression(parser, opening_token, disallow_loose)`
-    pub fn read_expression_with(&mut self, opening_token: u8, disallow_loose: bool) -> Result<Js> {
+    pub fn read_expression_with(&mut self, opening_token: u8, disallow_loose: bool) -> Result<Expr<'a>> {
         if let Some(simple) = self.read_simple_expression() {
             return Ok(simple);
         }
 
-        let template = self.template;
+        let template = Src::new(self.template, 0);
         match self.parse_expression_at(template, self.index) {
-            Ok(mut node) => {
-                let mut index = node_end(&node);
+            Ok(node) => {
+                // the end including any parentheses around the expression
+                let mut index = node.end();
                 if let Some(last) = self.root.comments.last() {
                     if last.end > index {
                         index = last.end;
                     }
                 }
                 self.index = index;
-                remove_parens(&mut node);
-                Ok(node)
+                Ok(Expr::Js(node))
             }
             Err(err) => {
                 if self.loose && !disallow_loose {
@@ -395,11 +404,13 @@ impl<'s> Parser<'s> {
         }
     }
 
-    pub fn read_expression(&mut self) -> Result<Js> {
+    pub fn read_expression(&mut self) -> Result<Expr<'a>> {
         self.read_expression_with(b'{', false)
     }
 
-    fn read_simple_expression(&mut self) -> Option<Js> {
+    /// Most template expressions are an identifier or an `a.b.c` member chain followed by `}`;
+    /// build those directly
+    fn read_simple_expression(&mut self) -> Option<Expr<'a>> {
         if !self.loc.lf_only() {
             return None;
         }
@@ -417,58 +428,42 @@ impl<'s> Parser<'s> {
             return None;
         }
 
-        let mut node = self.simple_identifier(start, end);
-        while template.as_bytes().get(end) == Some(&b'.') {
-            let Some(property_end) = read_word(template, end + 1) else {
+        // check the shape before building anything
+        let mut chain_end = end;
+        while template.as_bytes().get(chain_end) == Some(&b'.') {
+            let Some(property_end) = read_word(template, chain_end + 1) else {
                 self.index = index;
                 return None;
             };
-            let property = self.simple_identifier(end + 1, property_end);
-            node = json!({
-                "type": "MemberExpression",
-                "start": start,
-                "end": property_end,
-                "loc": { "start": self.loc.position(start), "end": self.loc.position(property_end) },
-                "object": node,
-                "property": property,
-                "computed": false,
-                "optional": false
-            });
-            end = property_end;
+            chain_end = property_end;
         }
-
-        self.index = end;
+        self.index = chain_end;
         self.allow_whitespace();
         if !self.match_str("}") {
             self.index = index;
             return None;
         }
-        self.index = end;
-        Some(node)
-    }
+        self.index = chain_end;
 
-    fn simple_identifier(&self, start: usize, end: usize) -> Js {
-        json!({
-            "type": "Identifier",
-            "start": start,
-            "end": end,
-            "loc": { "start": self.loc.position(start), "end": self.loc.position(end) },
-            "name": &self.template[start..end]
-        })
+        let span = |s: usize, e: usize| Span::new(s as u32, e as u32);
+        let mut node = Expression::new_identifier(span(start, end), &template[start..end], &self.builder);
+        while end < chain_end {
+            let property_end = read_word(template, end + 1).unwrap();
+            let property = IdentifierName::new(span(end + 1, property_end), &template[end + 1..property_end], &self.builder);
+            node = Expression::new_static_member_expression(span(start, property_end), node, property, false, &self.builder);
+            end = property_end;
+        }
+        Some(Expr::Js(JsExpr { expr: node, source: Src::new(template, 0), comments: None, lenient: false, remove_parens: true, fix: None }))
     }
 
     /// `read_pattern` (read/context.js)
-    pub fn read_pattern(&mut self) -> Result<Js> {
+    pub fn read_pattern(&mut self) -> Result<Pattern<'a>> {
         let start = self.index;
         let id = self.read_identifier()?;
 
-        if id["name"].as_str() != Some("") {
-            let annotation = self.read_type_annotation()?;
-            let mut id = id;
-            if let Some(a) = annotation {
-                id.as_object_mut().unwrap().insert("typeAnnotation".into(), a);
-            }
-            return Ok(id);
+        if !id.name.is_empty() {
+            let type_ann = self.read_type_annotation()?;
+            return Ok(Pattern::Ident { name: id.name.to_string(), start: id.start, end: id.end, type_ann });
         }
 
         match self.byte(start) {
@@ -479,22 +474,13 @@ impl<'s> Parser<'s> {
         let i = match_bracket(self.template, start, DEFAULT_BRACKETS)?;
         self.index = i;
 
-        let source = format!("{} = 1", &self.template[..i]);
-        let mut expression = self.parse_expression_at(&source, start)?;
-        remove_parens(&mut expression);
-        let mut expression = expression.get_mut("left").map(Value::take).unwrap_or(Value::Null);
-
-        if let Some(annotation) = self.read_type_annotation()? {
-            let end = annotation["end"].clone();
-            let m = expression.as_object_mut().unwrap();
-            m.insert("typeAnnotation".into(), annotation);
-            m.insert("end".into(), end);
-        }
-
-        Ok(expression)
+        let source = self.js.alloc_str(&format!("{} = 1", &self.template[start..i]));
+        let assign = self.parse_expression_at(Src::new(source, start), start)?;
+        let type_ann = self.read_type_annotation()?;
+        Ok(Pattern::Destructure { assign, type_ann })
     }
 
-    fn read_type_annotation(&mut self) -> Result<Option<Js>> {
+    fn read_type_annotation(&mut self) -> Result<Option<TypeAnn<'a>>> {
         let start = self.index;
         self.allow_whitespace();
 
@@ -510,36 +496,32 @@ impl<'s> Parser<'s> {
         }
         let padding = " ".repeat(self.index - "_ as ".len() - a);
         let rest = REGEX_OPTIONAL_COLON.replace_all(&self.template[self.index..], ":");
-        let template = format!("{}{}_ as {}", &self.template[..a], padding, rest);
+        // only the text from `_ as` on is needed: the JS parser never reads before it
+        let template = Src::new(self.js.alloc_str(&format!("{padding}_ as {rest}")), a);
         let a = a + padding.len();
 
-        let mut expression = self.parse_expression_at(&template, a)?;
-        remove_parens(&mut expression);
+        let mut expr = self.parse_expression_at(template, a)?;
 
         // `foo: bar = baz` gets mangled — fix it
-        if expression["type"] == "AssignmentExpression" {
-            let mut b = node_start(&expression["right"]);
-            while template.as_bytes()[b] != b'=' {
+        if let Expression::AssignmentExpression(assign) = expr.inner() {
+            let mut b = assign.right.without_parentheses().span().start as usize;
+            while template.byte(b) != Some(b'=') {
                 b -= 1;
             }
-            expression = self.parse_expression_at(&template[..b], a)?;
-            remove_parens(&mut expression);
+            expr = self.parse_expression_at(Src::new(template.slice(template.base, b), template.base), a)?;
         }
 
         // `array as item: string, index` becomes `string, index` — fix that
-        if expression["type"] == "SequenceExpression" {
-            expression = expression["expressions"][0].take();
+        let (end, seq_first) = match expr.inner() {
+            Expression::SequenceExpression(seq) => (seq.expressions[0].without_parentheses().span().end as usize, true),
+            other => (other.span().end as usize, false),
+        };
+        if seq_first {
+            expr.fix = Some(Box::new(crate::js::ExprFix { seq_first: true, ..Default::default() }));
         }
 
-        self.index = node_end(&expression);
-        let mut m = Map::new();
-        m.insert("type".into(), "TSTypeAnnotation".into());
-        m.insert("start".into(), start.into());
-        m.insert("end".into(), self.index.into());
-        if let Some(t) = expression.get_mut("typeAnnotation") {
-            m.insert("typeAnnotation".into(), t.take());
-        }
-        Ok(Some(Value::Object(m)))
+        self.index = end;
+        Ok(Some(TypeAnn { start, end, expr }))
     }
 }
 
@@ -562,16 +544,6 @@ fn read_word(template: &str, start: usize) -> Option<usize> {
     Some(end)
 }
 
-pub fn node_start(node: &Value) -> usize {
-    node.get("start").and_then(Value::as_u64).unwrap_or(0) as usize
-}
-
-pub fn node_end(node: &Value) -> usize {
-    node.get("end").and_then(Value::as_u64).unwrap_or(0) as usize
-}
-
 pub fn node_type(node: &Value) -> &str {
     node.get("type").and_then(Value::as_str).unwrap_or("")
 }
-
-pub type ParseResult = std::result::Result<(Ast, Root), CompileError>;

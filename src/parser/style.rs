@@ -2,10 +2,9 @@
 
 use std::sync::LazyLock;
 
-use serde_json::{json, Map, Value};
-
 use super::utils::*;
 use super::Parser;
+use crate::css::*;
 use crate::error::Result;
 use crate::errors as e;
 
@@ -17,15 +16,8 @@ static REGEX_UNICODE_SEQUENCE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^\\[0-9a-fA-F]{1,6}(\r\n|\s)?").unwrap());
 static REGEX_CLOSING_STYLE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^\s*>").unwrap());
 
-fn obj(pairs: Vec<(&str, Value)>) -> Value {
-    let mut m = Map::with_capacity(pairs.len());
-    for (k, v) in pairs {
-        m.insert(k.to_string(), v);
-    }
-    Value::Object(m)
-}
-
-pub fn read_style(parser: &mut Parser, start: usize, attributes: Vec<Value>) -> Result<Value> {
+/// The StyleSheet, without its `attributes`
+pub fn read_style(parser: &mut Parser, start: usize) -> Result<StyleSheet> {
     let content_start = parser.index;
     parser.css_comments.clear();
     let children = read_body(parser, |p| p.match_str("</style") || p.index >= p.template.len())?;
@@ -36,26 +28,18 @@ pub fn read_style(parser: &mut Parser, start: usize, attributes: Vec<Value>) -> 
         parser.index += m.end();
     }
 
-    Ok(obj(vec![
-        ("type", "StyleSheet".into()),
-        ("start", start.into()),
-        ("end", parser.index.into()),
-        ("attributes", Value::Array(attributes)),
-        ("children", Value::Array(children)),
-        ("comments", Value::Array(std::mem::take(&mut parser.css_comments))),
-        (
-            "content",
-            obj(vec![
-                ("start", content_start.into()),
-                ("end", content_end.into()),
-                ("styles", parser.template[content_start..content_end].into()),
-                ("comment", Value::Null),
-            ]),
-        ),
-    ]))
+    Ok(StyleSheet {
+        start,
+        end: parser.index,
+        children,
+        comments: std::mem::take(&mut parser.css_comments),
+        content_start,
+        content_end,
+        comment: None,
+    })
 }
 
-fn read_body(parser: &mut Parser, finished: impl Fn(&Parser) -> bool) -> Result<Vec<Value>> {
+fn read_body(parser: &mut Parser, finished: impl Fn(&Parser) -> bool) -> Result<Vec<BlockChild>> {
     let mut children = Vec::new();
     loop {
         allow_comment_or_whitespace(parser, true)?;
@@ -63,51 +47,38 @@ fn read_body(parser: &mut Parser, finished: impl Fn(&Parser) -> bool) -> Result<
             break;
         }
         if parser.match_str("@") {
-            children.push(read_at_rule(parser)?);
+            children.push(BlockChild::Atrule(read_at_rule(parser)?));
         } else {
-            children.push(read_rule(parser)?);
+            children.push(BlockChild::Rule(read_rule(parser)?));
         }
     }
     Ok(children)
 }
 
-fn read_at_rule(parser: &mut Parser) -> Result<Value> {
+fn read_at_rule(parser: &mut Parser) -> Result<Atrule> {
     let start = parser.index;
     parser.expect("@")?;
     let name = read_identifier(parser)?;
     let prelude = read_value(parser, true)?;
 
     let block = if parser.match_str("{") {
-        read_block(parser)?
+        Some(read_block(parser)?)
     } else {
         parser.expect(";")?;
-        Value::Null
+        None
     };
 
-    Ok(obj(vec![
-        ("type", "Atrule".into()),
-        ("start", start.into()),
-        ("end", parser.index.into()),
-        ("name", name.into()),
-        ("prelude", prelude.into()),
-        ("block", block),
-    ]))
+    Ok(Atrule { start, end: parser.index, name, prelude, block })
 }
 
-fn read_rule(parser: &mut Parser) -> Result<Value> {
+fn read_rule(parser: &mut Parser) -> Result<Rule> {
     let start = parser.index;
     let prelude = read_selector_list(parser, false)?;
     let block = read_block(parser)?;
-    Ok(obj(vec![
-        ("type", "Rule".into()),
-        ("prelude", prelude),
-        ("block", block),
-        ("start", start.into()),
-        ("end", parser.index.into()),
-    ]))
+    Ok(Rule { start, end: parser.index, prelude, block })
 }
 
-fn read_selector_list(parser: &mut Parser, inside_pseudo_class: bool) -> Result<Value> {
+fn read_selector_list(parser: &mut Parser, inside_pseudo_class: bool) -> Result<SelectorList> {
     let mut children = Vec::new();
     allow_comment_or_whitespace(parser, true)?;
     let start = parser.index;
@@ -118,12 +89,7 @@ fn read_selector_list(parser: &mut Parser, inside_pseudo_class: bool) -> Result<
         allow_comment_or_whitespace(parser, true)?;
 
         if if inside_pseudo_class { parser.match_str(")") } else { parser.match_str("{") } {
-            return Ok(obj(vec![
-                ("type", "SelectorList".into()),
-                ("start", start.into()),
-                ("end", end.into()),
-                ("children", Value::Array(children)),
-            ]));
+            return Ok(SelectorList { start, end, children });
         } else {
             parser.expect(",")?;
             allow_comment_or_whitespace(parser, true)?;
@@ -133,30 +99,16 @@ fn read_selector_list(parser: &mut Parser, inside_pseudo_class: bool) -> Result<
     Err(e::unexpected_eof(parser.template.len()))
 }
 
-fn relative_selector(combinator: Value, start: usize) -> (Value, usize, Vec<Value>) {
-    (combinator, start, Vec::new())
-}
-
-fn finish_relative((combinator, start, selectors): (Value, usize, Vec<Value>), end: usize) -> Value {
-    obj(vec![
-        ("type", "RelativeSelector".into()),
-        ("combinator", combinator),
-        ("selectors", Value::Array(selectors)),
-        ("start", start.into()),
-        ("end", end.into()),
-    ])
-}
-
-fn read_selector(parser: &mut Parser, inside_pseudo_class: bool) -> Result<Value> {
+fn read_selector(parser: &mut Parser, inside_pseudo_class: bool) -> Result<ComplexSelector> {
     let list_start = parser.index;
     let mut children = Vec::new();
-    let mut relative = relative_selector(Value::Null, parser.index);
+    let mut relative = RelativeSelector { start: parser.index, end: 0, combinator: None, selectors: Vec::new() };
 
     while parser.index < parser.template.len() {
         let start = parser.index;
 
         if parser.eat("&") {
-            relative.2.push(json!({ "type": "NestingSelector", "name": "&", "start": start, "end": parser.index }));
+            relative.selectors.push(SimpleSelector::Nesting { start, end: parser.index });
         } else if parser.eat("*") {
             let mut name = "*".to_string();
             let mut namespace = None;
@@ -164,13 +116,13 @@ fn read_selector(parser: &mut Parser, inside_pseudo_class: bool) -> Result<Value
                 namespace = Some(name);
                 name = if parser.eat("*") { "*".into() } else { read_identifier(parser)? };
             }
-            relative.2.push(type_selector(name, namespace, start, parser.index));
+            relative.selectors.push(SimpleSelector::Type { start, end: parser.index, name, namespace });
         } else if parser.eat("#") {
             let name = read_identifier(parser)?;
-            relative.2.push(json!({ "type": "IdSelector", "name": name, "start": start, "end": parser.index }));
+            relative.selectors.push(SimpleSelector::Id { start, end: parser.index, name });
         } else if parser.eat(".") {
             let name = read_identifier(parser)?;
-            relative.2.push(json!({ "type": "ClassSelector", "name": name, "start": start, "end": parser.index }));
+            relative.selectors.push(SimpleSelector::Class { start, end: parser.index, name });
         } else if parser.eat("::") {
             let name = read_identifier(parser)?;
             let mut args = None;
@@ -178,40 +130,25 @@ fn read_selector(parser: &mut Parser, inside_pseudo_class: bool) -> Result<Value
                 args = Some(read_selector_list(parser, true)?);
                 parser.expect(")")?;
             }
-            let mut pairs = vec![
-                ("type", "PseudoElementSelector".into()),
-                ("name", name.into()),
-                ("start", start.into()),
-                ("end", parser.index.into()),
-            ];
-            if let Some(args) = args {
-                pairs.push(("args", args));
-            }
-            relative.2.push(obj(pairs));
+            relative.selectors.push(SimpleSelector::PseudoElement { start, end: parser.index, name, args });
         } else if parser.eat(":") {
             let name = read_identifier(parser)?;
-            let mut args = Value::Null;
+            let mut args = None;
             if parser.eat("(") {
-                args = read_selector_list(parser, true)?;
+                args = Some(read_selector_list(parser, true)?);
                 parser.expect(")")?;
             }
-            relative.2.push(obj(vec![
-                ("type", "PseudoClassSelector".into()),
-                ("name", name.into()),
-                ("args", args),
-                ("start", start.into()),
-                ("end", parser.index.into()),
-            ]));
+            relative.selectors.push(SimpleSelector::PseudoClass { start, end: parser.index, name, args });
         } else if parser.eat("[") {
             parser.allow_whitespace();
             let name = read_identifier(parser)?;
             parser.allow_whitespace();
 
-            let mut value = Value::Null;
+            let mut value = None;
             let matcher = read_matcher(parser);
             if matcher.is_some() {
                 parser.allow_whitespace();
-                value = read_attribute_value(parser)?.into();
+                value = Some(read_attribute_value(parser)?);
             }
             parser.allow_whitespace();
 
@@ -219,34 +156,22 @@ fn read_selector(parser: &mut Parser, inside_pseudo_class: bool) -> Result<Value
             while matches!(parser.byte(parser.index), Some(b) if b.is_ascii_alphabetic()) {
                 parser.index += 1;
             }
-            let flags = if parser.index > flags_start {
-                Value::String(parser.template[flags_start..parser.index].to_string())
-            } else {
-                Value::Null
-            };
+            let flags = (parser.index > flags_start).then(|| parser.template[flags_start..parser.index].to_string());
 
             parser.allow_whitespace();
             parser.expect("]")?;
 
-            relative.2.push(obj(vec![
-                ("type", "AttributeSelector".into()),
-                ("start", start.into()),
-                ("end", parser.index.into()),
-                ("name", name.into()),
-                ("matcher", matcher.map_or(Value::Null, Value::String)),
-                ("value", value),
-                ("flags", flags),
-            ]));
+            relative.selectors.push(SimpleSelector::Attribute { start, end: parser.index, name, matcher, value, flags });
         } else if inside_pseudo_class && nth_of(parser).is_some() {
             // must come before the combinator check, else the '+' in '+2n-1' would be a combinator
             let len = nth_of(parser).unwrap();
             let value = parser.template[parser.index..parser.index + len].to_string();
             parser.index += len;
-            relative.2.push(json!({ "type": "Nth", "value": value, "start": start, "end": parser.index }));
+            relative.selectors.push(SimpleSelector::Nth { start, end: parser.index, value });
         } else if let Some(m) = REGEX_PERCENTAGE.find(&parser.template[parser.index..]) {
             let value = m.as_str().to_string();
             parser.index += m.end();
-            relative.2.push(json!({ "type": "Percentage", "value": value, "start": start, "end": parser.index }));
+            relative.selectors.push(SimpleSelector::Percentage { start, end: parser.index, value });
         } else if !matches_combinator(parser) {
             let mut name = read_identifier(parser)?;
             let mut namespace = None;
@@ -254,7 +179,7 @@ fn read_selector(parser: &mut Parser, inside_pseudo_class: bool) -> Result<Value
                 namespace = Some(name);
                 name = if parser.eat("*") { "*".into() } else { read_identifier(parser)? };
             }
-            relative.2.push(type_selector(name, namespace, start, parser.index));
+            relative.selectors.push(SimpleSelector::Type { start, end: parser.index, name, namespace });
         }
 
         let index = parser.index;
@@ -263,21 +188,19 @@ fn read_selector(parser: &mut Parser, inside_pseudo_class: bool) -> Result<Value
         if parser.match_str(",") || (if inside_pseudo_class { parser.match_str(")") } else { parser.match_str("{") }) {
             // rewind, so we know whether to continue building the selector list
             parser.index = index;
-            children.push(finish_relative(relative, index));
-            return Ok(obj(vec![
-                ("type", "ComplexSelector".into()),
-                ("start", list_start.into()),
-                ("end", index.into()),
-                ("children", Value::Array(children)),
-            ]));
+            relative.end = index;
+            children.push(relative);
+            return Ok(ComplexSelector { start: list_start, end: index, children });
         }
 
         parser.index = index;
         if let Some(combinator) = read_combinator(parser) {
-            let combinator_start = combinator["start"].as_u64().unwrap() as usize;
-            let prev = std::mem::replace(&mut relative, relative_selector(combinator, combinator_start));
-            if !prev.2.is_empty() {
-                children.push(finish_relative(prev, index));
+            let combinator_start = combinator.start;
+            let new = RelativeSelector { start: combinator_start, end: 0, combinator: Some(combinator), selectors: Vec::new() };
+            let mut prev = std::mem::replace(&mut relative, new);
+            if !prev.selectors.is_empty() {
+                prev.end = index;
+                children.push(prev);
             }
 
             parser.allow_whitespace();
@@ -288,16 +211,6 @@ fn read_selector(parser: &mut Parser, inside_pseudo_class: bool) -> Result<Value
     }
 
     Err(e::unexpected_eof(parser.template.len()))
-}
-
-fn type_selector(name: String, namespace: Option<String>, start: usize, end: usize) -> Value {
-    let mut pairs = vec![("type", "TypeSelector".into()), ("name", name.into())];
-    if let Some(ns) = namespace {
-        pairs.push(("namespace", ns.into()));
-    }
-    pairs.push(("start", start.into()));
-    pairs.push(("end", end.into()));
-    obj(pairs)
 }
 
 /// `[~^$*|]?=`
@@ -331,27 +244,32 @@ fn matches_combinator(parser: &Parser) -> bool {
     combinator_len(parser).is_some()
 }
 
-fn read_combinator(parser: &mut Parser) -> Option<Value> {
+fn read_combinator(parser: &mut Parser) -> Option<Combinator> {
     let start = parser.index;
     parser.allow_whitespace();
 
     let index = parser.index;
     if let Some(len) = combinator_len(parser) {
-        let name = parser.template[index..index + len].to_string();
+        let name = match &parser.template[index..index + len] {
+            "+" => "+",
+            "~" => "~",
+            ">" => ">",
+            _ => "||",
+        };
         parser.index += len;
         let end = parser.index;
         parser.allow_whitespace();
-        return Some(json!({ "type": "Combinator", "name": name, "start": index, "end": end }));
+        return Some(Combinator { start: index, end, name });
     }
 
     if parser.index != start {
-        return Some(json!({ "type": "Combinator", "name": " ", "start": start, "end": parser.index }));
+        return Some(Combinator { start, end: parser.index, name: " " });
     }
 
     None
 }
 
-fn read_block(parser: &mut Parser) -> Result<Value> {
+fn read_block(parser: &mut Parser) -> Result<Block> {
     let start = parser.index;
     parser.expect("{")?;
     let mut children = Vec::new();
@@ -365,17 +283,12 @@ fn read_block(parser: &mut Parser) -> Result<Value> {
     }
 
     parser.expect("}")?;
-    Ok(obj(vec![
-        ("type", "Block".into()),
-        ("start", start.into()),
-        ("end", parser.index.into()),
-        ("children", Value::Array(children)),
-    ]))
+    Ok(Block { start, end: parser.index, children })
 }
 
-fn read_block_item(parser: &mut Parser) -> Result<Value> {
+fn read_block_item(parser: &mut Parser) -> Result<BlockChild> {
     if parser.match_str("@") {
-        return read_at_rule(parser);
+        return Ok(BlockChild::Atrule(read_at_rule(parser)?));
     }
     // read ahead to understand whether we're dealing with a declaration or a nested rule
     let start = parser.index;
@@ -384,13 +297,13 @@ fn read_block_item(parser: &mut Parser) -> Result<Value> {
     parser.index = start;
 
     if ch == Some(b'{') {
-        read_rule(parser)
+        Ok(BlockChild::Rule(read_rule(parser)?))
     } else {
-        read_declaration(parser)
+        Ok(BlockChild::Declaration(read_declaration(parser)?))
     }
 }
 
-fn read_declaration(parser: &mut Parser) -> Result<Value> {
+fn read_declaration(parser: &mut Parser) -> Result<Declaration> {
     let start = parser.index;
 
     // read_until_regex(/[\s:]/)
@@ -424,13 +337,7 @@ fn read_declaration(parser: &mut Parser) -> Result<Value> {
         parser.expect(";")?;
     }
 
-    Ok(obj(vec![
-        ("type", "Declaration".into()),
-        ("start", start.into()),
-        ("end", end.into()),
-        ("property", property.into()),
-        ("value", value.into()),
-    ]))
+    Ok(Declaration { start, end, property: property.to_string(), value })
 }
 
 fn read_value(parser: &mut Parser, capture_comments: bool) -> Result<String> {
@@ -466,14 +373,14 @@ fn read_value(parser: &mut Parser, capture_comments: bool) -> Result<String> {
             let leading_whitespace = js_len(&value[..value.len() - trimmed_start.len()]) as i64;
             for &i in &value_comments {
                 let comment = &mut parser.css_comments[i];
-                let position = comment["position"].as_i64().unwrap_or(0);
-                comment["position"] = (position - leading_whitespace).max(0).into();
+                let position = comment.position.unwrap_or(0);
+                comment.position = Some((position - leading_whitespace).max(0));
             }
             return Ok(js_trim(&value).to_string());
         } else if c == '/' && !in_url && quote_mark.is_none() && parser.byte(parser.index + 1) == Some(b'*') {
             let mut comment = read_comment(parser)?;
             if capture_comments {
-                comment["position"] = js_len(&value).into();
+                comment.position = Some(js_len(&value) as i64);
                 parser.css_comments.push(comment);
                 value_comments.push(parser.css_comments.len() - 1);
             }
@@ -590,15 +497,10 @@ fn allow_comment_or_whitespace(parser: &mut Parser, capture_comments: bool) -> R
     Ok(())
 }
 
-fn read_comment(parser: &mut Parser) -> Result<Value> {
+fn read_comment(parser: &mut Parser) -> Result<CssComment> {
     let start = parser.index;
     parser.expect("/*")?;
     let value = parser.read_until("*/")?.to_string();
     parser.expect("*/")?;
-    Ok(obj(vec![
-        ("type", "CSSComment".into()),
-        ("value", value.into()),
-        ("start", start.into()),
-        ("end", parser.index.into()),
-    ]))
+    Ok(CssComment { start, end: parser.index, value, position: None })
 }

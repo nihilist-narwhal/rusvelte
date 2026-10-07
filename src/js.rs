@@ -1,18 +1,20 @@
 //! The JS side of the parser: a port of `phases/1-parse/acorn.js` on top of oxc.
 //!
-//! JS subtrees are kept as ESTree JSON (`serde_json::Value`), like the objects acorn
-//! produces, so the template parser can manipulate them the same way the JS code does.
-//! While parsing, every `start`/`end` is a byte offset into the template; `loc` is
-//! filled in at parse time. Offsets are converted to UTF-16 when the AST is serialized.
+//! JS is parsed into oxc's AST, allocated in the component's arena, with spans rebased to
+//! byte offsets in the template. Nothing is converted to ESTree JSON while parsing: the
+//! parser records what Svelte's JS code does to the acorn AST (which comments were candidates
+//! for attachment, parentheses removal, a few node rewrites), and [`ToJson`] replays that when
+//! JSON in the shape of `svelte/compiler`'s `parse` is wanted.
 
-use oxc_allocator::Allocator;
-use oxc_ast::ast::CommentKind;
+use oxc_allocator::{Allocator, Vec as ArenaVec};
+use oxc_ast::ast::{CommentKind, Expression, Program, Statement};
+use oxc_ast_visit::VisitMut;
 use oxc_estree::{CompactSerializer, ESTree};
 use oxc_parser::{ParseOptions, Parser};
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType, Span};
 use serde_json::{Map, Value};
 
-use crate::error::{CompileError, Result};
+use crate::error::Result;
 use crate::errors as e;
 use crate::locator::Locator;
 
@@ -23,24 +25,27 @@ pub struct JsComment {
     pub value: String,
     pub start: usize,
     pub end: usize,
-    /// `{ start, end }` locations, already in output form. Comments read by Svelte itself
-    /// (`read_comment` in attributes) use Svelte's locator and carry `character` as well
-    pub loc: Option<(Value, Value)>,
+    /// Comments read by Svelte itself (`read_comment` in attributes) get `loc` from Svelte's
+    /// locator, which includes `character`; the others get acorn's
+    pub svelte_loc: bool,
 }
 
 impl JsComment {
-    pub fn to_json(&self) -> Value {
+    pub fn to_json(&self, locator: &Locator) -> Value {
         let mut m = Map::new();
         m.insert("type".into(), (if self.block { "Block" } else { "Line" }).into());
         m.insert("value".into(), self.value.clone().into());
         m.insert("start".into(), self.start.into());
         m.insert("end".into(), self.end.into());
-        if let Some((s, e)) = &self.loc {
-            let mut loc = Map::new();
-            loc.insert("start".into(), s.clone());
-            loc.insert("end".into(), e.clone());
-            m.insert("loc".into(), Value::Object(loc));
-        }
+        let (s, e) = if self.svelte_loc {
+            (locator.locate(self.start), locator.locate(self.end))
+        } else {
+            (locator.acorn_position(self.start), locator.acorn_position(self.end))
+        };
+        let mut loc = Map::new();
+        loc.insert("start".into(), s);
+        loc.insert("end".into(), e);
+        m.insert("loc".into(), Value::Object(loc));
         Value::Object(m)
     }
 
@@ -55,17 +60,111 @@ impl JsComment {
     }
 }
 
-pub struct Js<'t> {
-    pub ts: bool,
-    pub loc: &'t Locator<'t>,
-    alloc: Allocator,
+/// Text to parse JS from: the template, or a piece of a modified copy of it (Svelte parses
+/// things like `<pattern> = 1`). `text[0]` is at template offset `base`, so positions are
+/// template offsets throughout.
+#[derive(Debug, Clone, Copy)]
+pub struct Src<'a> {
+    pub text: &'a str,
+    pub base: usize,
 }
 
-/// Result of an oxc parse of `source[base..]`, positions already rebased
-struct Parsed {
-    node: Value,
-    /// comments inside the parsed range, in source order
-    comments: Vec<JsComment>,
+impl<'a> Src<'a> {
+    pub fn new(text: &'a str, base: usize) -> Self {
+        Src { text, base }
+    }
+    /// The offset just past the end, like `source.length` in the JS
+    pub fn len(&self) -> usize {
+        self.base + self.text.len()
+    }
+    pub fn slice(&self, start: usize, end: usize) -> &'a str {
+        &self.text[start - self.base..end - self.base]
+    }
+    pub fn from(&self, start: usize) -> &'a str {
+        &self.text[start - self.base..]
+    }
+    pub fn byte(&self, i: usize) -> Option<u8> {
+        i.checked_sub(self.base).and_then(|i| self.text.as_bytes().get(i).copied())
+    }
+}
+
+/// Which comments acorn's `add_comments` would have considered for a parse: those in
+/// `root.comments[..upto]` that start at or after `index`
+#[derive(Debug, Clone, Copy)]
+pub struct CommentCtx {
+    pub index: u32,
+    pub upto: u32,
+}
+
+/// Rewrites Svelte applies to an expression after parsing (`{#each}` and patterns)
+#[derive(Debug, Clone, Default)]
+pub struct ExprFix {
+    /// take `expressions[0]` of a SequenceExpression
+    pub seq_first: bool,
+    /// replace the TSAsExpression ending here by its expression
+    pub strip_as_end: Option<u32>,
+    /// overwrite `end`
+    pub set_end: Option<u32>,
+}
+
+/// A parsed JS expression
+#[derive(Debug)]
+pub struct JsExpr<'a> {
+    pub expr: Expression<'a>,
+    /// The text it was parsed from, for comment attachment
+    pub source: Src<'a>,
+    /// `None` for expressions Svelte builds itself (no comment attachment pass)
+    pub comments: Option<CommentCtx>,
+    /// parsed despite an oxc error that acorn doesn't raise (see `ACORN_ACCEPTS`)
+    pub lenient: bool,
+    /// whether Svelte runs `remove_parens` on the result (everywhere except snippet parameters)
+    pub remove_parens: bool,
+    pub fix: Option<Box<ExprFix>>,
+}
+
+impl<'a> JsExpr<'a> {
+    pub fn start(&self) -> usize {
+        self.expr.span().start as usize
+    }
+    pub fn end(&self) -> usize {
+        self.expr.span().end as usize
+    }
+    /// The expression with outer parentheses removed (what Svelte's code sees after `remove_parens`)
+    pub fn inner(&self) -> &Expression<'a> {
+        self.expr.without_parentheses()
+    }
+}
+
+#[derive(Debug)]
+pub struct JsProgram<'a> {
+    pub program: Program<'a>,
+    pub comments: CommentCtx,
+    /// where the script content starts and ends in the template
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug)]
+pub struct JsStatement<'a> {
+    pub stmt: Statement<'a>,
+    pub source: Src<'a>,
+    pub comments: CommentCtx,
+}
+
+/// Shift every span by `delta`
+struct Rebase(i64);
+
+impl<'a> VisitMut<'a> for Rebase {
+    fn visit_span(&mut self, span: &mut Span) {
+        span.start = (span.start as i64 + self.0) as u32;
+        span.end = (span.end as i64 + self.0) as u32;
+    }
+}
+
+enum Parsed<'a> {
+    Expr(Expression<'a>, bool),
+    Program(Program<'a>),
+    Statement(Statement<'a>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -75,9 +174,19 @@ enum Goal {
     Statement,
 }
 
-impl<'t> Js<'t> {
-    pub fn new(ts: bool, loc: &'t Locator<'t>) -> Self {
-        Js { ts, loc, alloc: Allocator::default() }
+pub struct JsParser<'a> {
+    pub ts: bool,
+    pub loc: std::rc::Rc<Locator<'a>>,
+    alloc: &'a Allocator,
+}
+
+impl<'a> JsParser<'a> {
+    pub fn new(ts: bool, loc: std::rc::Rc<Locator<'a>>, alloc: &'a Allocator) -> Self {
+        JsParser { ts, loc, alloc }
+    }
+
+    pub fn alloc_str(&self, s: &str) -> &'a str {
+        self.alloc.alloc_str(s)
     }
 
     fn source_type(&self) -> SourceType {
@@ -88,41 +197,45 @@ impl<'t> Js<'t> {
         }
     }
 
-    /// Parse `text` (which starts at byte `base` of the template) with oxc.
-    /// On failure returns the byte position (in template coordinates) and message of the
-    /// first error.
+    /// Parse `text` (which starts at byte `base` of the template) with oxc, rebasing spans
+    /// to template offsets. On failure returns the position and message of the first error.
     fn oxc_parse(
-        &mut self,
-        text: &str,
+        &self,
+        text: &'a str,
         base: usize,
         goal: Goal,
         preserve_parens: bool,
-    ) -> std::result::Result<Parsed, (usize, String)> {
-        self.alloc.reset();
+    ) -> std::result::Result<(Parsed<'a>, Vec<JsComment>), (usize, String)> {
         let options = ParseOptions { preserve_parens, ..ParseOptions::default() };
-        let parser = Parser::new(&self.alloc, text, self.source_type()).with_options(options);
+        let parser = Parser::new(self.alloc, text, self.source_type()).with_options(options);
+        let mut rebase = Rebase(base as i64);
 
-        let (json, comments) = match goal {
-            Goal::Expression => match parser.parse_expression() {
-                Ok(expr) => {
-                    let mut s = CompactSerializer::new(self.ts, false);
-                    expr.serialize(&mut s);
-                    (s.into_string(), None)
-                }
-                Err(errors) => {
-                    // oxc rejects a few things acorn accepts; parse those through a program
-                    // (which keeps the AST alongside the diagnostics) and ignore the diagnostics
-                    if errors.iter().all(|e| ACORN_ACCEPTS.contains(&e.message.as_ref())) {
-                        if let Some(json) = self.lenient_expression(text) {
-                            (json, None)
-                        } else {
+        match goal {
+            Goal::Expression => {
+                let (mut expr, lenient) = match parser.parse_expression() {
+                    Ok(expr) => (expr, false),
+                    Err(errors) => {
+                        // oxc rejects a few things acorn accepts; parse those through a program
+                        // (which keeps the AST alongside the diagnostics) and ignore the diagnostics
+                        if !errors.iter().all(|e| ACORN_ACCEPTS.contains(&e.message.as_ref())) {
                             return Err(first_error(&errors, base));
                         }
-                    } else {
-                        return Err(first_error(&errors, base));
+                        match self.lenient_expression(text) {
+                            Some(expr) => (expr, true),
+                            None => return Err(first_error(&errors, base)),
+                        }
                     }
-                }
-            },
+                };
+                rebase.visit_expression(&mut expr);
+                // `parse_expression` doesn't hand out comments; if there might be any, get them
+                // from a program parse of `(<text>\n)`
+                let comments = if text.contains("//") || text.contains("/*") {
+                    self.expression_comments(text, base)
+                } else {
+                    Vec::new()
+                };
+                Ok((Parsed::Expr(expr, lenient), comments))
+            }
             Goal::Program | Goal::Statement => {
                 let ret = parser.parse();
                 if let Some(err) = ret.diagnostics.first() {
@@ -134,57 +247,43 @@ impl<'t> Js<'t> {
                     .iter()
                     .map(|c| self.make_comment(text, base, c.span.start as usize, c.span.end as usize, c.kind != CommentKind::Line))
                     .collect();
-                let json = if goal == Goal::Program {
-                    let mut s = CompactSerializer::new(self.ts, false);
-                    ret.program.serialize(&mut s);
-                    s.into_string()
+                let mut program = ret.program;
+                if goal == Goal::Program {
+                    rebase.visit_program(&mut program);
+                    Ok((Parsed::Program(program), comments))
                 } else {
-                    let Some(stmt) = ret.program.body.first() else {
+                    if program.body.is_empty() {
                         return Err((base + text.len(), "Unexpected token".into()));
-                    };
-                    let mut s = CompactSerializer::new(self.ts, false);
-                    stmt.serialize(&mut s);
-                    s.into_string()
-                };
-                (json, Some(comments))
+                    }
+                    let mut stmt = program.body.remove(0);
+                    rebase.visit_statement(&mut stmt);
+                    Ok((Parsed::Statement(stmt), comments))
+                }
             }
-        };
-
-        let mut node: Value = serde_json::from_str(&json).expect("oxc produced invalid JSON");
-        self.fix_node(&mut node, base);
-
-        let comments = match comments {
-            Some(c) => c,
-            // `parse_expression` doesn't hand out comments; if there might be any, get them
-            // from a program parse of `(<text>\n)`
-            None if text.contains("//") || text.contains("/*") => self.expression_comments(text, base),
-            None => Vec::new(),
-        };
-
-        Ok(Parsed { node, comments })
+        }
     }
 
-    /// Parse `(<text>\n)` as a program and serialize the expression inside, with positions
-    /// shifted back to `text`
-    fn lenient_expression(&self, text: &str) -> Option<String> {
-        let wrapped = format!("({text}\n)");
-        let alloc = Allocator::default();
+    /// Parse `(<text>\n)` as a program and return the expression inside, with spans relative
+    /// to `text`
+    fn lenient_expression(&self, text: &str) -> Option<Expression<'a>> {
+        let wrapped = self.alloc.alloc_str(&format!("({text}\n)"));
         let options = ParseOptions { preserve_parens: true, ..ParseOptions::default() };
-        let ret = Parser::new(&alloc, &wrapped, self.source_type()).with_options(options).parse();
+        let ret = Parser::new(self.alloc, wrapped, self.source_type()).with_options(options).parse();
         if ret.fatal_error || !ret.diagnostics.iter().all(|e| ACORN_ACCEPTS.contains(&e.message.as_ref())) {
             return None;
         }
-        let oxc_ast::ast::Statement::ExpressionStatement(stmt) = ret.program.body.first()? else { return None };
-        let oxc_ast::ast::Expression::ParenthesizedExpression(paren) = &stmt.expression else { return None };
-        let mut s = CompactSerializer::new(self.ts, false);
-        paren.expression.serialize(&mut s);
-        let mut node: Value = serde_json::from_str(&s.into_string()).ok()?;
-        shift_positions(&mut node, -1);
-        mark_optional_defaults(&mut node, text);
-        Some(node.to_string())
+        let mut body: ArenaVec<'a, Statement<'a>> = ret.program.body;
+        if body.is_empty() {
+            return None;
+        }
+        let Statement::ExpressionStatement(stmt) = body.remove(0) else { return None };
+        let Expression::ParenthesizedExpression(paren) = stmt.unbox().expression else { return None };
+        let mut expr = paren.unbox().expression;
+        Rebase(-1).visit_expression(&mut expr);
+        Some(expr)
     }
 
-    fn expression_comments(&mut self, text: &str, base: usize) -> Vec<JsComment> {
+    fn expression_comments(&self, text: &str, base: usize) -> Vec<JsComment> {
         let wrapped = format!("({text}\n)");
         let spans: Vec<(usize, usize, bool)> = {
             let alloc = Allocator::default();
@@ -225,84 +324,46 @@ impl<'t> Js<'t> {
             value,
             start,
             end,
-            loc: Some((self.loc.acorn_position(start), self.loc.acorn_position(end))),
-        }
-    }
-
-    /// Rebase positions, add `loc`, and smooth over differences between oxc's ESTree and acorn's
-    fn fix_node(&self, node: &mut Value, base: usize) {
-        match node {
-            Value::Array(items) => {
-                for item in items {
-                    self.fix_node(item, base);
-                }
-            }
-            Value::Object(map) => {
-                for (_, v) in map.iter_mut() {
-                    if v.is_object() || v.is_array() {
-                        self.fix_node(v, base);
-                    }
-                }
-                if !map.contains_key("type") {
-                    return;
-                }
-                fix_shape(map, self.ts);
-                if let (Some(s), Some(e)) = (
-                    map.get("start").and_then(Value::as_u64),
-                    map.get("end").and_then(Value::as_u64),
-                ) {
-                    let (s, e) = (s as usize + base, e as usize + base);
-                    map.insert("start".into(), s.into());
-                    map.insert("end".into(), e.into());
-                    let mut loc = Map::new();
-                    loc.insert("start".into(), self.loc.acorn_position(s));
-                    loc.insert("end".into(), self.loc.acorn_position(e));
-                    map.insert("loc".into(), Value::Object(loc));
-                }
-            }
-            _ => {}
+            svelte_loc: false,
         }
     }
 
     /// `acorn.parse` for a `<script>`'s contents. `content` starts at byte `base`.
     /// `root_comments` is the template-wide comment list (comments are appended to it).
     pub fn parse_program(
-        &mut self,
-        content: &str,
+        &self,
+        content: &'a str,
         base: usize,
         root_comments: &mut Vec<JsComment>,
-    ) -> Result<Value> {
-        let parsed = self
+    ) -> Result<JsProgram<'a>> {
+        let (parsed, comments) = self
             .oxc_parse(content, base, Goal::Program, false)
             .map_err(|(pos, msg)| e::js_parse_error(pos, &msg))?;
-        let mut ast = parsed.node;
-        // acorn's Program spans the whole (padded) source from 0
-        if let Value::Object(m) = &mut ast {
-            m.shift_remove("hashbang");
-            m.insert("start".into(), 0.into());
-            m.insert("end".into(), (base + content.len()).into());
-        }
-        root_comments.extend(parsed.comments);
-        add_comments(&mut ast, self.loc.source(), root_comments, 0);
-        Ok(ast)
+        let Parsed::Program(program) = parsed else { unreachable!() };
+        root_comments.extend(comments);
+        Ok(JsProgram {
+            program,
+            comments: CommentCtx { index: 0, upto: root_comments.len() as u32 },
+            start: base,
+            end: base + content.len(),
+        })
     }
 
     /// `acorn.parseExpressionAt(source, index)`: parse the longest expression starting at
-    /// `index`. `source` is the template, or a modified copy that agrees with it up to the
-    /// point of modification.
+    /// `index`
     pub fn parse_expression_at(
-        &mut self,
-        source: &str,
+        &self,
+        source: Src<'a>,
         index: usize,
         root_comments: &mut Vec<JsComment>,
-    ) -> Result<Value> {
-        let text = &source[index..];
+    ) -> Result<JsExpr<'a>> {
+        let text = source.from(index);
         // Usually the expression runs up to the `}` closing the tag: try that first, so the
         // common case is a single parse. Only accept it if what follows is a token that can't
         // continue an expression, so the result is the same as the longest-prefix parse.
-        if let Some(close) = crate::parser::utils::find_matching_bracket(source, index, b'{') {
-            if let Ok(parsed) = self.oxc_parse(&source[index..close], index, Goal::Expression, true) {
-                if self.ts || find_ts_operator(&parsed.node, source).is_none() {
+        if let Some(close) = crate::parser::utils::find_matching_bracket(text, 0, b'{') {
+            if let Ok(parsed) = self.oxc_parse(&text[..close], index, Goal::Expression, true) {
+                if self.ts || find_ts_operator(expr_of(&parsed.0), source).is_none() {
                     return Ok(self.finish_expression(parsed, source, index, root_comments));
                 }
             }
@@ -312,7 +373,7 @@ impl<'t> Js<'t> {
             Err((pos, msg)) if !self.ts && msg.contains("TypeScript files") => {
                 // a TS-only construct in a JS file: acorn would have stopped at the keyword
                 let cut = find_keyword(source, pos, &["as", "satisfies"]).unwrap_or(pos);
-                match self.oxc_parse(&source[index..cut], index, Goal::Expression, true) {
+                match self.oxc_parse(source.slice(index, cut), index, Goal::Expression, true) {
                     Ok(p) => p,
                     Err(_) => return Err(e::js_parse_error(pos, &msg)),
                 }
@@ -321,7 +382,7 @@ impl<'t> Js<'t> {
                 // oxc wants the whole input to be the expression; acorn stops at the first
                 // token that can't continue it. Retry with everything before that token.
                 if pos > index && pos <= source.len() {
-                    match self.oxc_parse(&source[index..pos], index, Goal::Expression, true) {
+                    match self.oxc_parse(source.slice(index, pos), index, Goal::Expression, true) {
                         Ok(p) => p,
                         Err(_) => return Err(e::js_parse_error(pos, &msg)),
                     }
@@ -335,8 +396,8 @@ impl<'t> Js<'t> {
         if !self.ts {
             // acorn (without the TS plugin) stops at `as`/`satisfies`, while oxc reads a TS
             // assertion and complains later. Cut the expression off before the keyword.
-            if let Some(cut) = find_ts_operator(&parsed.node, source) {
-                if let Ok(p) = self.oxc_parse(&source[index..cut], index, Goal::Expression, true) {
+            if let Some(cut) = find_ts_operator(expr_of(&parsed.0), source) {
+                if let Ok(p) = self.oxc_parse(source.slice(index, cut), index, Goal::Expression, true) {
                     parsed = p;
                 }
             }
@@ -345,36 +406,47 @@ impl<'t> Js<'t> {
         Ok(self.finish_expression(parsed, source, index, root_comments))
     }
 
-    fn finish_expression(&mut self, parsed: Parsed, source: &str, index: usize, root_comments: &mut Vec<JsComment>) -> Value {
-        let mut node = parsed.node;
-        let mut comments = parsed.comments;
+    fn finish_expression(
+        &self,
+        (parsed, mut comments): (Parsed<'a>, Vec<JsComment>),
+        source: Src<'a>,
+        index: usize,
+        root_comments: &mut Vec<JsComment>,
+    ) -> JsExpr<'a> {
+        let Parsed::Expr(expr, lenient) = parsed else { unreachable!() };
 
         // acorn has also consumed comments between the expression and the next token
-        let end = node_end(&node);
-        for (s, e, block) in scan_comments(source, end, source.len()) {
-            if comments.iter().any(|c| c.start == s) {
+        let end = expr.span().end as usize;
+        for (s, e, block) in scan_comments(source.text, end - source.base, source.text.len()) {
+            if comments.iter().any(|c| c.start == s + source.base) {
                 continue;
             }
-            comments.push(self.make_comment(source, 0, s, e, block));
+            comments.push(self.make_comment(source.text, source.base, s, e, block));
         }
         comments.sort_by_key(|c| c.start);
 
         root_comments.extend(comments);
-        add_comments(&mut node, source, root_comments, index);
-        node
+        JsExpr {
+            expr,
+            source,
+            comments: Some(CommentCtx { index: index as u32, upto: root_comments.len() as u32 }),
+            lenient,
+            remove_parens: true,
+            fix: None,
+        }
     }
 
     /// Like `parse_expression_at`, but for a statement (used by declaration tags)
     pub fn parse_statement_at(
-        &mut self,
-        source: &str,
+        &self,
+        source: Src<'a>,
         index: usize,
         root_comments: &mut Vec<JsComment>,
-    ) -> Result<Value> {
+    ) -> Result<JsStatement<'a>> {
         // find the end of the statement: the `}` closing the tag
-        let end = crate::parser::utils::find_matching_bracket(source, index, b'{').unwrap_or(source.len());
-        let text = &source[index..end];
-        let parsed = match self.oxc_parse(text, index, Goal::Statement, false) {
+        let rest = source.from(index);
+        let end = crate::parser::utils::find_matching_bracket(rest, 0, b'{').map_or(source.len(), |e| e + index);
+        let (parsed, comments) = match self.oxc_parse(source.slice(index, end), index, Goal::Statement, false) {
             Ok(p) => p,
             Err((pos, msg)) => {
                 if pos >= source.len() || end == source.len() {
@@ -383,44 +455,179 @@ impl<'t> Js<'t> {
                 return Err(e::js_parse_error(pos, &msg));
             }
         };
-        let mut node = parsed.node;
-        root_comments.extend(parsed.comments);
-        add_comments(&mut node, source, root_comments, index);
-        Ok(node)
+        let Parsed::Statement(stmt) = parsed else { unreachable!() };
+        root_comments.extend(comments);
+        Ok(JsStatement {
+            stmt,
+            source,
+            comments: CommentCtx { index: index as u32, upto: root_comments.len() as u32 },
+        })
+    }
+}
+
+fn expr_of<'b, 'a>(parsed: &'b Parsed<'a>) -> &'b Expression<'a> {
+    match parsed {
+        Parsed::Expr(e, _) => e,
+        _ => unreachable!(),
     }
 }
 
 /// If the outermost expression is a TS `as`/`satisfies`, the offset of that keyword
-fn find_ts_operator(node: &Value, source: &str) -> Option<usize> {
-    let mut node = node;
+fn find_ts_operator(expr: &Expression, source: Src) -> Option<usize> {
+    let mut node = expr;
     loop {
-        match node.get("type").and_then(Value::as_str) {
-            Some("TSAsExpression" | "TSSatisfiesExpression") => {
-                let inner = &node["expression"];
-                // the leftmost one is where acorn stops
-                if matches!(inner.get("type").and_then(Value::as_str), Some("TSAsExpression" | "TSSatisfiesExpression")) {
-                    node = inner;
-                    continue;
-                }
-                return find_keyword(source, node_end(inner), &["as", "satisfies"]);
-            }
+        let inner = match node {
+            Expression::TSAsExpression(e) => &e.expression,
+            Expression::TSSatisfiesExpression(e) => &e.expression,
             _ => return None,
+        };
+        // the leftmost one is where acorn stops
+        if matches!(inner, Expression::TSAsExpression(_) | Expression::TSSatisfiesExpression(_)) {
+            node = inner;
+            continue;
+        }
+        return find_keyword(source, inner.span().end as usize, &["as", "satisfies"]);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Conversion to ESTree JSON in acorn's shape
+
+/// Everything needed to turn JS nodes into the JSON `svelte/compiler` produces
+pub struct ToJson<'c> {
+    pub ts: bool,
+    pub loc: &'c Locator<'c>,
+    pub comments: &'c [JsComment],
+}
+
+impl ToJson<'_> {
+    fn estree<T: ESTree>(&self, node: &T) -> Value {
+        let mut s = CompactSerializer::new(self.ts, false);
+        node.serialize(&mut s);
+        let mut value: Value = serde_json::from_str(&s.into_string()).expect("oxc produced invalid JSON");
+        self.fix_node(&mut value);
+        value
+    }
+
+    /// An expression as `read_expression` returns it: comments attached, parentheses removed,
+    /// and Svelte's rewrites applied
+    pub fn expr(&self, e: &JsExpr) -> Value {
+        let mut value = self.estree(&e.expr);
+        if e.lenient {
+            mark_optional_defaults(&mut value, e.source);
+        }
+        if let Some(ctx) = e.comments {
+            add_comments(&mut value, e.source, &self.comments[..ctx.upto as usize], ctx.index as usize);
+        }
+        if e.remove_parens {
+            remove_parens(&mut value);
+        }
+        if let Some(fix) = &e.fix {
+            if fix.seq_first && value.get("type").and_then(Value::as_str) == Some("SequenceExpression") {
+                value = value["expressions"][0].take();
+            }
+            if let Some(end) = fix.strip_as_end {
+                strip_trailing_as(&mut value, end as usize);
+            }
+            if let Some(end) = fix.set_end {
+                value["end"] = end.into();
+            }
+        }
+        value
+    }
+
+    pub fn program(&self, p: &JsProgram) -> Value {
+        let mut value = self.estree(&p.program);
+        if let Value::Object(m) = &mut value {
+            m.shift_remove("hashbang");
+            // acorn's Program spans the whole (padded) source from 0
+            m.insert("start".into(), 0.into());
+            m.insert("end".into(), p.end.into());
+        }
+        add_comments(&mut value, Src::new(self.loc.source(), 0), &self.comments[..p.comments.upto as usize], 0);
+        value
+    }
+
+    pub fn statement(&self, s: &JsStatement) -> Value {
+        let mut value = self.estree(&s.stmt);
+        add_comments(&mut value, s.source, &self.comments[..s.comments.upto as usize], s.comments.index as usize);
+        value
+    }
+
+    /// Add `loc`, and smooth over differences between oxc's ESTree and acorn's
+    fn fix_node(&self, node: &mut Value) {
+        match node {
+            Value::Array(items) => {
+                for item in items {
+                    self.fix_node(item);
+                }
+            }
+            Value::Object(map) => {
+                for (_, v) in map.iter_mut() {
+                    if v.is_object() || v.is_array() {
+                        self.fix_node(v);
+                    }
+                }
+                if !map.contains_key("type") {
+                    return;
+                }
+                fix_shape(map, self.ts);
+                if let (Some(s), Some(e)) = (map.get("start").and_then(Value::as_u64), map.get("end").and_then(Value::as_u64)) {
+                    let mut loc = Map::new();
+                    loc.insert("start".into(), self.loc.acorn_position(s as usize));
+                    loc.insert("end".into(), self.loc.acorn_position(e as usize));
+                    map.insert("loc".into(), Value::Object(loc));
+                }
+            }
+            _ => {}
         }
     }
 }
 
+/// Remove a trailing `as T` that the TS parser read into an `{#each}` expression
+fn strip_trailing_as(node: &mut Value, target_end: usize) -> bool {
+    if node.get("type").and_then(Value::as_str) == Some("TSAsExpression") && node_end(node) == target_end {
+        let inner = node["expression"].take();
+        *node = inner;
+        return true;
+    }
+    if let Value::Object(map) = node {
+        for (k, v) in map.iter_mut() {
+            if k == "loc" {
+                continue;
+            }
+            match v {
+                Value::Object(_) if v.get("type").is_some_and(Value::is_string) => {
+                    if strip_trailing_as(v, target_end) {
+                        return true;
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        if item.get("type").is_some_and(Value::is_string) && strip_trailing_as(item, target_end) {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// The first of `keywords` (as a whole word) at or after `from`
-fn find_keyword(source: &str, from: usize, keywords: &[&str]) -> Option<usize> {
-    let bytes = source.as_bytes();
+fn find_keyword(source: Src, from: usize, keywords: &[&str]) -> Option<usize> {
+    let bytes = source.text.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-    let mut i = from;
+    let mut i = from.checked_sub(source.base)?;
     while i < bytes.len() {
         for kw in keywords {
             if bytes[i..].starts_with(kw.as_bytes())
                 && (i == 0 || !is_word(bytes[i - 1]))
                 && !bytes.get(i + kw.len()).copied().is_some_and(is_word)
             {
-                return Some(i);
+                return Some(i + source.base);
             }
         }
         i += 1;
@@ -432,14 +639,14 @@ fn find_keyword(source: &str, from: usize, keywords: &[&str]) -> Option<usize> {
 const ACORN_ACCEPTS: &[&str] = &["A parameter cannot have a question mark and an initializer."];
 
 /// `x?: T = 1`: oxc rejects it and loses the `?`, acorn-typescript marks `x` optional
-fn mark_optional_defaults(node: &mut Value, text: &str) {
+fn mark_optional_defaults(node: &mut Value, text: Src) {
     match node {
         Value::Object(map) => {
             if map.get("type").and_then(Value::as_str) == Some("AssignmentPattern") {
                 if let Some(Value::Object(left)) = map.get_mut("left") {
                     let name_end = left.get("start").and_then(Value::as_u64).unwrap_or(0) as usize
                         + left.get("name").and_then(Value::as_str).map_or(0, str::len);
-                    if left.get("type").and_then(Value::as_str) == Some("Identifier") && text.as_bytes().get(name_end) == Some(&b'?') {
+                    if left.get("type").and_then(Value::as_str) == Some("Identifier") && text.byte(name_end) == Some(b'?') {
                         left.insert("optional".into(), true.into());
                         map.shift_remove("optional");
                     }
@@ -448,24 +655,6 @@ fn mark_optional_defaults(node: &mut Value, text: &str) {
             map.values_mut().for_each(|v| mark_optional_defaults(v, text));
         }
         Value::Array(items) => items.iter_mut().for_each(|i| mark_optional_defaults(i, text)),
-        _ => {}
-    }
-}
-
-fn shift_positions(node: &mut Value, delta: i64) {
-    match node {
-        Value::Object(map) => {
-            for (k, v) in map.iter_mut() {
-                match v {
-                    Value::Number(n) if k == "start" || k == "end" => {
-                        *v = (n.as_i64().unwrap_or(0) + delta).into();
-                    }
-                    Value::Object(_) | Value::Array(_) => shift_positions(v, delta),
-                    _ => {}
-                }
-            }
-        }
-        Value::Array(items) => items.iter_mut().for_each(|i| shift_positions(i, delta)),
         _ => {}
     }
 }
@@ -537,7 +726,7 @@ fn scan_comments(text: &str, from: usize, to: usize) -> Vec<(usize, usize, bool)
 /// Port of `add_comments` from `get_comment_handlers`.
 /// `comments` is the template-wide list; like the JS code, every comment at or after
 /// `index` is a candidate (including ones from earlier parses).
-fn add_comments(ast: &mut Value, source: &str, all: &[JsComment], index: usize) {
+fn add_comments(ast: &mut Value, source: Src, all: &[JsComment], index: usize) {
     if all.is_empty() {
         return;
     }
@@ -547,7 +736,7 @@ fn add_comments(ast: &mut Value, source: &str, all: &[JsComment], index: usize) 
         return;
     }
 
-    fn visit(node: &mut Value, parent: Option<(&str, usize, Option<usize>, Option<usize>)>, source: &str, queue: &mut std::collections::VecDeque<Value>) {
+    fn visit(node: &mut Value, parent: Option<(&str, usize, Option<usize>, Option<usize>)>, source: Src, queue: &mut std::collections::VecDeque<Value>) {
         // parent: (type, end, index of node in parent's list, length of that list)
         let start = node_start(node);
         while let Some(c) = queue.front() {
@@ -610,7 +799,8 @@ fn add_comments(ast: &mut Value, source: &str, all: &[JsComment], index: usize) 
                     push_comment(node, "trailingComments", c);
                 }
             } else if end <= first_start {
-                let slice = &source[end.min(source.len())..first_start.min(source.len())];
+                let clamp = |i: usize| i.clamp(source.base, source.len());
+                let slice = source.slice(clamp(end), clamp(first_start).max(clamp(end)));
                 if slice.bytes().all(|b| matches!(b, b',' | b')' | b' ' | b'\t')) {
                     let c = queue.pop_front().unwrap();
                     if let Value::Object(m) = node {
@@ -824,5 +1014,3 @@ fn fix_shape(map: &mut Map<String, Value>, ts: bool) {
     }
 }
 
-/// Exposed for diagnostics
-pub fn _unused(_: CompileError) {}

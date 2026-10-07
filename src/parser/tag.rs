@@ -1,13 +1,15 @@
 //! Port of `phases/1-parse/state/tag.js`.
 
-use serde_json::{json, Value};
+use oxc_ast::ast::{ChainElement, Expression, Statement, TSAsExpression, VariableDeclarationKind};
+use oxc_ast_visit::Visit;
+use oxc_span::GetSpan;
 
 use super::utils::*;
-use super::{node_end, node_start, node_type, Open, Parser};
-use crate::ast::Node;
+use super::{Open, Parser};
+use crate::ast::{DebugArgs, Declaration, Expr, IdentLoc, Node};
 use crate::error::Result;
 use crate::errors as e;
-use crate::js::remove_parens;
+use crate::js::ExprFix;
 
 fn is_word_boundary_after(template: &str, i: usize) -> bool {
     // `\b` after a word char: the next char is not a word char
@@ -45,7 +47,7 @@ pub fn tag(parser: &mut Parser) -> Result<()> {
     Ok(())
 }
 
-fn read_declaration(parser: &mut Parser) -> Result<Option<Value>> {
+fn read_declaration<'a>(parser: &mut Parser<'a>) -> Result<Option<Declaration<'a>>> {
     let start = parser.index;
     let t = parser.template;
 
@@ -63,7 +65,7 @@ fn read_declaration(parser: &mut Parser) -> Result<Option<Value>> {
 
     let initial_comment_count = parser.root.comments.len();
 
-    let declaration = match parser.js.parse_statement_at(t, start, &mut parser.root.comments) {
+    let statement = match parser.js.parse_statement_at(crate::js::Src::new(t, 0), start, &mut parser.root.comments) {
         Ok(d) => d,
         Err(error) => {
             if !parser.loose {
@@ -74,42 +76,32 @@ fn read_declaration(parser: &mut Parser) -> Result<Option<Value>> {
             };
             parser.index = end;
             let kind = if t[start..].starts_with("const") { "const" } else { "let" };
-            json!({
-                "type": "VariableDeclaration",
-                "kind": kind,
-                "declarations": [{
-                    "type": "VariableDeclarator",
-                    "id": { "type": "Identifier", "name": "", "start": end, "end": end },
-                    "init": null,
-                    "start": end,
-                    "end": end
-                }],
-                "start": start,
-                "end": end
-            })
+            parser.allow_whitespace();
+            parser.expect("}")?;
+            return Ok(Some(Declaration::Loose { kind, start, end }));
         }
     };
 
-    if node_type(&declaration) != "VariableDeclaration" {
-        if node_type(&declaration) == "ExpressionStatement" {
-            parser.root.comments.truncate(initial_comment_count);
+    let end = match &statement.stmt {
+        Statement::VariableDeclaration(decl) => {
+            // TODO support using
+            if !matches!(decl.kind, VariableDeclarationKind::Let | VariableDeclarationKind::Const) {
+                return Err(e::declaration_tag_invalid_type((decl.span.start as usize, decl.span.end as usize)));
+            }
+            decl.span.end as usize
+        }
+        Statement::ExpressionStatement(_) => {
+            parser.root.comments.truncate(initial_comment_count); // else they show up duplicated
             return Ok(None);
         }
         // a TSTypeAliasDeclaration
-        let s = declaration.get("start").and_then(Value::as_u64).map_or(start, |v| v as usize);
-        let e_ = declaration.get("end").and_then(Value::as_u64).map_or(parser.index, |v| v as usize);
-        return Err(e::declaration_tag_invalid_type((s, e_)));
-    }
+        other => return Err(e::declaration_tag_invalid_type((other.span().start as usize, other.span().end as usize))),
+    };
 
-    let kind = declaration["kind"].as_str().unwrap_or("");
-    if kind != "let" && kind != "const" {
-        return Err(e::declaration_tag_invalid_type((node_start(&declaration), node_end(&declaration))));
-    }
-
-    parser.index = node_end(&declaration);
+    parser.index = end;
     parser.allow_whitespace();
     parser.expect("}")?;
-    Ok(Some(declaration))
+    Ok(Some(Declaration::Js(statement)))
 }
 
 fn open(parser: &mut Parser) -> Result<()> {
@@ -178,8 +170,8 @@ fn open(parser: &mut Parser) -> Result<()> {
                 let pattern = parser.read_pattern()?;
                 parser.expect("}")?;
                 if let Node::AwaitBlock { expression, value, then, pending, .. } = &mut parser.ast.nodes[id] {
-                    let expr_start = node_start(expression);
-                    *expression = json!({ "type": "Identifier", "name": "", "start": expr_start, "end": i - 6 });
+                    let expr_start = expression.start();
+                    *expression = Expr::Ident { name: String::new(), start: expr_start, end: i - 6, loc: IdentLoc::None };
                     *value = Some(pattern);
                     *then = pending.take();
                 }
@@ -187,8 +179,8 @@ fn open(parser: &mut Parser) -> Result<()> {
                 let pattern = parser.read_pattern()?;
                 parser.expect("}")?;
                 if let Node::AwaitBlock { expression, error, catch, pending, .. } = &mut parser.ast.nodes[id] {
-                    let expr_start = node_start(expression);
-                    *expression = json!({ "type": "Identifier", "name": "", "start": expr_start, "end": i - 7 });
+                    let expr_start = expression.start();
+                    *expression = Expr::Ident { name: String::new(), start: expr_start, end: i - 7, loc: IdentLoc::None };
                     *error = Some(pattern);
                     *catch = pending.take();
                 }
@@ -216,7 +208,7 @@ fn open(parser: &mut Parser) -> Result<()> {
     if parser.eat("snippet") {
         parser.require_whitespace()?;
         let id = parser.read_identifier()?;
-        if id["name"] == "" && !parser.loose {
+        if id.name.is_empty() && !parser.loose {
             return Err(e::expected_identifier(parser.index));
         }
         parser.allow_whitespace();
@@ -248,21 +240,19 @@ fn open(parser: &mut Parser) -> Result<()> {
         }
 
         let parameters = if matched {
-            let source = format!("{} => {{}}", &parser.template[..parser.index]);
-            let function = parser.parse_expression_at(&source, params_start)?;
-            match function.get("params") {
-                Some(Value::Array(params)) => params.clone(),
-                _ => Vec::new(),
-            }
+            let source = parser.js.alloc_str(&format!("{} => {{}}", &parser.template[params_start..parser.index]));
+            let mut arrow = parser.parse_expression_at(crate::js::Src::new(source, params_start), params_start)?;
+            arrow.remove_parens = false;
+            Some(arrow)
         } else {
-            Vec::new()
+            None
         };
 
         parser.allow_whitespace();
         parser.expect("}")?;
 
         let body = parser.ast.new_fragment(false);
-        let id = parser.append(Node::SnippetBlock { start, end: None, expression: id, type_params, parameters, body });
+        let id = parser.append(Node::SnippetBlock { start, end: None, expression: id.expr(), type_params, parameters, body });
         parser.stack.push(Open::Node(id));
         parser.push_fragment(body);
         return Ok(());
@@ -282,35 +272,23 @@ fn matches_ws_closing_brace(parser: &Parser) -> bool {
     parser.byte(i) == Some(b'}')
 }
 
-/// Remove a trailing `as T` that the TS parser read into the each expression
-fn strip_trailing_as(node: &mut Value, target_end: usize, assertion: &mut Option<Value>) {
-    if node_type(node) == "TSAsExpression" && node_end(node) == target_end {
-        let inner = node["expression"].clone();
-        *assertion = Some(std::mem::replace(node, inner));
-        return;
-    }
-    match node {
-        Value::Object(map) => {
-            for (k, v) in map.iter_mut() {
-                if k == "loc" {
-                    continue;
-                }
-                match v {
-                    Value::Object(_) if v.get("type").is_some_and(Value::is_string) => {
-                        strip_trailing_as(v, target_end, assertion)
-                    }
-                    Value::Array(items) => {
-                        for item in items {
-                            if item.get("type").is_some_and(Value::is_string) {
-                                strip_trailing_as(item, target_end, assertion);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+/// The outermost TSAsExpression ending at `end` (what Svelte's `walk` replaces)
+struct FindAs {
+    end: u32,
+    found: Option<(u32, u32)>,
+}
+
+impl<'a> Visit<'a> for FindAs {
+    fn visit_ts_as_expression(&mut self, it: &TSAsExpression<'a>) {
+        if self.found.is_some() {
+            return;
         }
-        _ => {}
+        if it.span.end == self.end {
+            // (end of the expression inside, start of the type)
+            self.found = Some((it.expression.without_parentheses().span().end, it.type_annotation.span().start));
+            return;
+        }
+        oxc_ast_visit::walk::walk_ts_as_expression(self, it);
     }
 }
 
@@ -350,25 +328,30 @@ fn open_each(parser: &mut Parser, start: usize) -> Result<()> {
     // {#each} blocks must declare a context – {#each list as item}
     if !parser.match_str("as") {
         // this could be a TypeScript assertion that was erroneously eaten.
-        if node_type(&expression) == "SequenceExpression" {
-            expression = expression["expressions"][0].take();
-        }
-
-        let mut assertion = None;
-        let expression_end = node_end(&expression);
-        let mut end = expression_end;
-        strip_trailing_as(&mut expression, expression_end, &mut assertion);
-        if let Some(a) = &assertion {
-            end = node_end(&a["expression"]);
-        }
-        expression["end"] = end.into();
-
-        if let Some(a) = &assertion {
-            let mut end = node_start(&a["typeAnnotation"]).saturating_sub(2);
-            while parser.template.get(end..end + 2) != Some("as") {
-                end -= 1;
+        if let Expr::Js(js) = &mut expression {
+            let mut fix = ExprFix::default();
+            let mut root = js.inner();
+            if let Expression::SequenceExpression(seq) = root {
+                fix.seq_first = true;
+                root = seq.expressions[0].without_parentheses();
             }
-            parser.index = end;
+            let root_end = root.span().end;
+            let mut finder = FindAs { end: root_end, found: None };
+            finder.visit_expression(root);
+            let mut end = root_end;
+            if let Some((inner_end, type_start)) = finder.found {
+                fix.strip_as_end = Some(root_end);
+                end = inner_end;
+                // we can't reset `parser.index` to the end of the expression because it would
+                // ignore any parentheses — find the `as` instead
+                let mut i = (type_start as usize).saturating_sub(2);
+                while parser.template.get(i..i + 2) != Some("as") {
+                    i -= 1;
+                }
+                parser.index = i;
+            }
+            fix.set_end = Some(end);
+            js.fix = Some(Box::new(fix));
         }
     }
 
@@ -381,7 +364,7 @@ fn open_each(parser: &mut Parser, start: usize) -> Result<()> {
         context = Some(parser.read_pattern()?);
     } else {
         // {#each Array.from({ length: 10 }), i} was read as a sequence expression
-        parser.index = node_end(&expression);
+        parser.index = expression.end();
     }
 
     parser.allow_whitespace();
@@ -389,11 +372,10 @@ fn open_each(parser: &mut Parser, start: usize) -> Result<()> {
     if parser.eat(",") {
         parser.allow_whitespace();
         let id = parser.read_identifier()?;
-        let name = id["name"].as_str().unwrap_or("").to_string();
-        if name.is_empty() {
+        if id.name.is_empty() {
             return Err(e::expected_identifier(parser.index));
         }
-        index = Some(name);
+        index = Some(id.name.to_string());
         parser.allow_whitespace();
     }
 
@@ -412,8 +394,8 @@ fn open_each(parser: &mut Parser, start: usize) -> Result<()> {
         if i >= 4 && parser.template.get(i - 4..i) == Some(" as ") {
             context = Some(parser.read_pattern()?);
             parser.expect("}")?;
-            let expr_start = node_start(&expression);
-            expression = json!({ "type": "Identifier", "name": "", "start": expr_start, "end": i - 4 });
+            let expr_start = expression.start();
+            expression = Expr::Ident { name: String::new(), start: expr_start, end: i - 4, loc: IdentLoc::None };
         } else {
             parser.expect("}")?;
         }
@@ -612,28 +594,39 @@ fn special(parser: &mut Parser) -> Result<()> {
     }
 
     if parser.eat("debug") {
-        let identifiers;
         // `{@debug}` means "debug all"
         let save = parser.index;
         parser.allow_whitespace();
-        if parser.eat("}") {
-            identifiers = Vec::new();
+        let identifiers = if parser.eat("}") {
+            DebugArgs::All
         } else {
             parser.index = save;
             let expression = parser.read_expression()?;
-            identifiers = if node_type(&expression) == "SequenceExpression" {
-                expression["expressions"].as_array().cloned().unwrap_or_default()
-            } else {
-                vec![expression]
+            let sequence = match &expression {
+                Expr::Js(js) => match js.inner() {
+                    Expression::SequenceExpression(seq) => {
+                        for e in &seq.expressions {
+                            let e = e.without_parentheses();
+                            if !matches!(e, Expression::Identifier(_)) {
+                                return Err(e::debug_tag_invalid_arguments(e.span().start as usize));
+                            }
+                        }
+                        true
+                    }
+                    Expression::Identifier(_) => false,
+                    other => return Err(e::debug_tag_invalid_arguments(other.span().start as usize)),
+                },
+                Expr::Ident { .. } => false,
+                Expr::Literal { start, .. } => return Err(e::debug_tag_invalid_arguments(*start)),
             };
-            for node in &identifiers {
-                if node_type(node) != "Identifier" {
-                    return Err(e::debug_tag_invalid_arguments(node_start(node)));
-                }
-            }
             parser.allow_whitespace();
             parser.expect("}")?;
-        }
+            if sequence {
+                DebugArgs::Sequence(expression)
+            } else {
+                DebugArgs::One(expression)
+            }
+        };
         parser.append(Node::DebugTag { start, end: parser.index, identifiers });
         return Ok(());
     }
@@ -649,34 +642,31 @@ fn special(parser: &mut Parser) -> Result<()> {
         let init = parser.read_expression()?;
         // parser is past wrapping parens, but `init.end` is not — use the parser position
         let declarator_end = parser.index;
-        if node_type(&init) == "SequenceExpression"
-            && !parser.template[expression_start..node_start(&init).max(expression_start)].contains('(')
-        {
-            return Err(e::const_tag_invalid_expression((node_start(&init), node_end(&init))));
+        let is_sequence = matches!(&init, Expr::Js(js) if matches!(js.inner(), Expression::SequenceExpression(_)));
+        if is_sequence && !parser.template[expression_start..init.start().max(expression_start)].contains('(') {
+            // const a = (b, c) is allowed but a = b, c = d is not;
+            return Err(e::const_tag_invalid_expression((init.start(), init.end())));
         }
         parser.allow_whitespace();
         parser.expect("}")?;
 
-        let id_start = node_start(&id);
-        let declaration = json!({
-            "type": "VariableDeclaration",
-            "kind": "const",
-            "declarations": [{ "type": "VariableDeclarator", "id": id, "init": init, "start": id_start, "end": declarator_end }],
-            "start": start + 2,
-            "end": parser.index - 1
-        });
-        parser.append(Node::ConstTag { start, end: parser.index, declaration });
+        parser.append(Node::ConstTag { start, end: parser.index, id, init, declarator_end });
         return Ok(());
     }
 
     if parser.eat("render") {
         parser.require_whitespace()?;
         let expression = parser.read_expression()?;
-        let ty = node_type(&expression);
-        let is_call = ty == "CallExpression"
-            || (ty == "ChainExpression" && node_type(&expression["expression"]) == "CallExpression");
+        let is_call = match &expression {
+            Expr::Js(js) => match js.inner() {
+                Expression::CallExpression(_) => true,
+                Expression::ChainExpression(chain) => matches!(chain.expression, ChainElement::CallExpression(_)),
+                _ => false,
+            },
+            _ => false,
+        };
         if !is_call {
-            return Err(e::render_tag_invalid_expression((node_start(&expression), node_end(&expression))));
+            return Err(e::render_tag_invalid_expression((expression.start(), expression.end())));
         }
         parser.allow_whitespace();
         parser.expect("}")?;
@@ -684,6 +674,5 @@ fn special(parser: &mut Parser) -> Result<()> {
         return Ok(());
     }
 
-    let _ = remove_parens;
     Err(e::expected_tag(parser.index))
 }

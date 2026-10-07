@@ -333,9 +333,9 @@ fn named(rest: &[u8], is_attribute_value: bool) -> Option<(usize, u32)> {
 }
 
 /// `decode_character_references`
-pub fn decode_character_references(html: &str, is_attribute_value: bool) -> String {
+pub fn decode_character_references(html: &str, is_attribute_value: bool) -> std::borrow::Cow<'_, str> {
     if !html.contains('&') {
-        return html.to_string();
+        return std::borrow::Cow::Borrowed(html);
     }
     let bytes = html.as_bytes();
     let mut out = String::with_capacity(html.len());
@@ -359,5 +359,5 @@ pub fn decode_character_references(html: &str, is_attribute_value: bool) -> Stri
         }
     }
     out.push_str(&html[last..]);
-    out
+    std::borrow::Cow::Owned(out)
 }

@@ -9,8 +9,10 @@ components is parsed with [oxc](https://oxc.rs).
 - Output matches the JS parser exactly on all 4,567 `.svelte` files in Svelte's test suite
   (ASTs, or error code + message). For 3 files with invalid JS, the error position differs
   from acorn's.
-- Currently ~2× slower than the JS parser: JS subtrees are stored as `serde_json::Value`.
-  Next step is keeping them as oxc's typed AST.
+- Parsing to the Rust AST takes ~19 ms for the whole corpus (1.1 MB), vs ~157 ms for
+  `svelte/compiler`'s `parse` on Node — about 8× faster. JS stays as oxc's typed AST; the
+  acorn-compatible JSON is only produced on request (`Component::to_json`, `parse_modern`),
+  which is slow (~260 ms) and meant for compatibility testing.
 
 ## Setup
 
@@ -36,7 +38,9 @@ cargo run --release --bin bench -- svelte-upstream/packages/svelte/tests oracle/
 ## Layout
 
 - `src/parser/` — port of `phases/1-parse` (template, tags, elements, CSS, options)
-- `src/js.rs` — oxc integration: acorn-style `parseExpressionAt`, comment attachment,
-  and normalization of oxc's ESTree output to acorn's shape
+- `src/js.rs` — oxc integration: acorn-style `parseExpressionAt`, and `ToJson`, which
+  replays Svelte's comment attachment and rewrites and normalizes oxc's ESTree output to
+  acorn's shape
 - `src/ast.rs` — the Svelte template AST and its JSON serialization
+- `src/css.rs` — the CSS AST
 - `src/errors.rs` — generated from Svelte's `errors.js` by `tools/gen_errors.mjs`
