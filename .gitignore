@@ -1,0 +1,6 @@
+/target
+/oracle/node_modules
+/oracle/package-lock.json
+/oracle/expected
+# upstream Svelte checkout used as the test corpus (see README)
+/svelte-upstream
