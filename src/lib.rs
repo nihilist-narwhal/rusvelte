@@ -8,6 +8,7 @@ pub mod errors;
 pub mod js;
 pub mod legacy;
 pub mod locator;
+pub mod magic_string;
 pub mod parser;
 #[allow(clippy::all)]
 mod warning_codes;
