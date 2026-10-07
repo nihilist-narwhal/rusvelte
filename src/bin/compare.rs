@@ -13,6 +13,7 @@ fn main() {
     let expected_dir = Path::new(&args[2]);
     let filter = args.get(3).cloned();
     let verbose = std::env::var("VERBOSE").is_ok();
+    let legacy = std::env::var("LEGACY").is_ok();
 
     let manifest: Vec<Value> = serde_json::from_str(&fs::read_to_string(expected_dir.join("manifest.json")).unwrap()).unwrap();
     let (mut pass, mut fail, mut soft) = (0, 0, 0);
@@ -30,7 +31,13 @@ fn main() {
         let source = fs::read_to_string(corpus.join(rel)).unwrap();
         let expected: Value = serde_json::from_str(&fs::read_to_string(expected_dir.join(format!("{id}.json"))).unwrap()).unwrap();
 
-        let actual = std::panic::catch_unwind(|| svelte_rs::parse_modern(&source, loose));
+        let actual = std::panic::catch_unwind(|| {
+            if legacy {
+                svelte_rs::parse_legacy(&source, loose)
+            } else {
+                svelte_rs::parse_modern(&source, loose)
+            }
+        });
         let reason = match (actual, &expected) {
             (Err(_), _) => Some("panic".to_string()),
             (Ok(Ok(ast)), Value::Object(m)) if m.contains_key("ok") => {

@@ -4,7 +4,8 @@ import { parse } from 'svelte/compiler';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const [corpus, out] = process.argv.slice(2);
+const [corpus, out, mode = 'modern'] = process.argv.slice(2);
+const legacy = mode === 'legacy';
 const files = fs.globSync('**/*.svelte', { cwd: corpus }).sort();
 fs.mkdirSync(out, { recursive: true });
 const manifest = [];
@@ -13,7 +14,9 @@ for (const rel of files) {
 	const loose = path.basename(path.dirname(rel)).startsWith('loose-');
 	let result;
 	try {
-		result = { ok: JSON.parse(JSON.stringify(parse(source, { modern: true, loose }), (k, v) => (typeof v === "bigint" || v instanceof RegExp ? null : v))) };
+		const ast = legacy ? parse(source, { loose }) : parse(source, { modern: true, loose });
+		const kept = legacy ? { html: ast.html, _comments: ast._comments } : ast;
+		result = { ok: JSON.parse(JSON.stringify(kept, (k, v) => (typeof v === "bigint" || v instanceof RegExp ? null : v))) };
 	} catch (e) {
 		if (!e.code) throw e;
 		result = { error: { code: e.code, message: e.message.split('\n')[0], position: e.position } };

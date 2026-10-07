@@ -6,8 +6,11 @@ pub mod error;
 #[allow(clippy::all)]
 pub mod errors;
 pub mod js;
+pub mod legacy;
 pub mod locator;
 pub mod parser;
+#[allow(clippy::all)]
+mod warning_codes;
 
 use oxc_allocator::Allocator;
 use serde_json::Value;
@@ -38,6 +41,21 @@ impl Component<'_> {
     }
 }
 
+/// `{ html, _comments }` of `svelte/compiler`'s legacy `parse(source, { loose })`, as JSON.
+/// Offsets are UTF-16 offsets, like the JS version.
+pub fn parse_legacy(source: &str, loose: bool) -> Result<Value, CompileError> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let alloc = Allocator::default();
+    let component = parse(&alloc, source, loose).map_err(|err| error_to_utf16(err, source))?;
+    let legacy = legacy::convert(&component.ast, &component.root, source);
+    let cx = js::ToJson { ts: component.root.ts, loc: &component.locator, comments: &component.root.comments };
+    let mut json = legacy.to_json(&component.ast, &component.root, &cx);
+    if !source.is_ascii() {
+        to_utf16(&mut json, &component.locator);
+    }
+    Ok(json)
+}
+
 /// `svelte/compiler`'s `parse(source, { modern: true, loose })`, as JSON.
 /// Offsets in the result (and in errors) are UTF-16 offsets, like the JS version.
 pub fn parse_modern(source: &str, loose: bool) -> Result<Value, CompileError> {
@@ -51,14 +69,16 @@ pub fn parse_modern(source: &str, loose: bool) -> Result<Value, CompileError> {
             }
             Ok(json)
         }
-        Err(mut err) => {
-            if let (Some((s, e)), false) = (err.position, source.is_ascii()) {
-                let loc = Locator::new(source);
-                err.position = Some((loc.utf16(s), loc.utf16(e)));
-            }
-            Err(err)
-        }
+        Err(err) => Err(error_to_utf16(err, source)),
     }
+}
+
+fn error_to_utf16(mut err: CompileError, source: &str) -> CompileError {
+    if let (Some((s, e)), false) = (err.position, source.is_ascii()) {
+        let loc = Locator::new(source);
+        err.position = Some((loc.utf16(s), loc.utf16(e)));
+    }
+    err
 }
 
 /// Convert every `start`/`end` offset from bytes to UTF-16 units

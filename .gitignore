@@ -5,3 +5,4 @@
 # upstream Svelte checkout used as the test corpus (see README)
 /svelte-upstream
 /experiments
+/language-tools-upstream
