@@ -1309,3 +1309,74 @@ impl<'l> Converter<'l> {
         }
     }
 }
+
+/// The comments of a JS file as Svelte's `onComment` (`phases/1-parse/acorn.js`) collects
+/// them: in source order, block comments spanning several lines de-indented by the
+/// indentation of their first line. A hashbang is a line comment, as in acorn.
+pub fn collect_comments(program: &ox::Program, locator: &Locator) -> Vec<Comment> {
+    let source = locator.source();
+    let mut out = Vec::with_capacity(program.comments.len() + 1);
+    let mut push = |kind: CommentKind, value: &str, s: u32, e: u32| {
+        let span = oxc_span::Span::new(s, e);
+        let (l1, c1) = locator.acorn_line_column(s as usize);
+        let (l2, c2) = locator.acorn_line_column(e as usize);
+        out.push(Comment {
+            kind,
+            value: Atom::from(value),
+            span: Some(Span::new(span.start, span.end)),
+            loc: Some(SourceLocation {
+                start: Position::new(l1 as u32, c1 as u32),
+                end: Position::new(l2 as u32, c2 as u32),
+            }),
+        });
+    };
+    if let Some(h) = &program.hashbang {
+        push(CommentKind::Line, h.value.as_str(), h.span.start, h.span.end);
+    }
+    for c in &program.comments {
+        let (s, e) = (c.span.start as usize, c.span.end as usize);
+        if c.is_line() {
+            push(CommentKind::Line, &source[s + 2..e], c.span.start, c.span.end);
+        } else {
+            let value = &source[s + 2..e - 2];
+            if value.contains('\n') {
+                let bytes = source.as_bytes();
+                let mut a = s;
+                while a > 0 && bytes[a - 1] != b'\n' {
+                    a -= 1;
+                }
+                let mut b = a;
+                while b < bytes.len() && (bytes[b] == b' ' || bytes[b] == b'\t') {
+                    b += 1;
+                }
+                let dedented = dedent(value, &source[a..b]);
+                push(CommentKind::Block, &dedented, c.span.start, c.span.end);
+            } else {
+                push(CommentKind::Block, value, c.span.start, c.span.end);
+            }
+        }
+    }
+    out
+}
+
+/// `value.replace(new RegExp(`^${indentation}`, 'gm'), '')`
+pub fn dedent(value: &str, indentation: &str) -> String {
+    if indentation.is_empty() {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    let mut at_line_start = true;
+    while !rest.is_empty() {
+        if at_line_start {
+            if let Some(r) = rest.strip_prefix(indentation) {
+                rest = r;
+            }
+        }
+        let Some(c) = rest.chars().next() else { break };
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+        at_line_start = matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}');
+    }
+    out
+}
