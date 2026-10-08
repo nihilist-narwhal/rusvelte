@@ -687,6 +687,16 @@ pub fn reword_parse_error(err: CompileError, source: &str) -> CompileError {
         ("Unexpected token".to_string(), pos + skipped)
     } else if message.starts_with("Expected `") && message.contains("` but found `") && !message.contains("` or `") {
         ("Unexpected token".to_string(), pos)
+    } else if message == "Missing initializer in const declaration" {
+        // acorn stops at the token after the binding (e.g. the `:` of a type annotation)
+        match binding_end(source, pos) {
+            Some(end) => {
+                let rest = &source[end..];
+                let skipped = rest.len() - rest.trim_start_matches(super::utils::is_js_whitespace).len();
+                ("Unexpected token".to_string(), end + skipped)
+            }
+            None => return err,
+        }
     } else if message == "Cannot assign to this expression" {
         ("Assigning to rvalue".to_string(), pos)
     } else if let Some(c) = message.strip_prefix("Invalid Character `").and_then(|m| m.strip_suffix('`')) {
@@ -701,6 +711,25 @@ pub fn reword_parse_error(err: CompileError, source: &str) -> CompileError {
         return err;
     };
     e::js_parse_error(pos, &message)
+}
+
+/// The end of the binding (identifier or bracketed pattern) starting at `pos`
+fn binding_end(source: &str, pos: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    match bytes.get(pos)? {
+        b'{' | b'[' => {
+            let close = crate::parser::utils::find_matching_bracket(&source[pos..], 0, bytes[pos])?;
+            Some(pos + close + 1)
+        }
+        _ => {
+            let rest = &source[pos..];
+            let len = rest
+                .char_indices()
+                .find(|&(_, c)| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                .map_or(rest.len(), |(i, _)| i);
+            (len > 0).then_some(pos + len)
+        }
+    }
 }
 
 /// The first error acorn would raise while parsing `program` that oxc's parser didn't.
