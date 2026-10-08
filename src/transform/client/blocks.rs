@@ -384,7 +384,7 @@ impl<'a, 's> Client<'a, 's> {
                 for &d in &each_meta.transitive_deps {
                     if !seen_bindings.contains(&d) {
                         seen_bindings.push(d);
-                        transitive.push(b::id(self.binding(d).node.name));
+                        transitive.push(self.id_copy(self.binding(d).node));
                     }
                 }
             }
@@ -402,7 +402,7 @@ impl<'a, 's> Client<'a, 's> {
                 for d in deps {
                     if !seen_bindings.contains(&d) {
                         seen_bindings.push(d);
-                        transitive.push(b::id(self.binding(d).node.name));
+                        transitive.push(self.id_copy(self.binding(d).node));
                     }
                 }
             }

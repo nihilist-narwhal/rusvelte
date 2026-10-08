@@ -306,7 +306,7 @@ impl<'a, 's> Client<'a, 's> {
             if !indirect.is_empty() {
                 let mut stmts = Vec::new();
                 for ib in indirect {
-                    let id = b::id(self.binding(ib).node.name);
+                    let id = self.id_copy(self.binding(ib).node);
                     stmts.push(b::stmt(self.build_getter(&id, st)));
                 }
                 mutation = b::sequence(vec![mutation, b::call("$.invalidate_inner_signals", vec![b::arrow(vec![], b::block(stmts))])]);

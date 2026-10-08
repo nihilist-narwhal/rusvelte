@@ -994,9 +994,18 @@ impl<'a, 's> Client<'a, 's> {
         let mut n = b::id(id.name);
         if let Some((start, end)) = id.span {
             n.span = Some(crate::estree::Span::new(start, end));
-            n.loc = Some(self.conv.location(oxc_span::Span::new(start, end)));
+            if id.has_loc() {
+                n.loc = Some(self.conv.location(oxc_span::Span::new(start, end)));
+            }
         }
         n.origin = Some(id.key);
+        n
+    }
+
+    /// `{ ...binding.node }`: a copy of an analysis identifier (its position, not its identity)
+    pub fn id_copy(&self, id: crate::analyze::scope::Id) -> Node {
+        let mut n = self.id_node(id);
+        n.origin = None;
         n
     }
 }

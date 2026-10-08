@@ -57,7 +57,9 @@ impl<'a, 's> Server<'a, 's> {
         let mut n = b::id(id.name);
         if let Some((start, end)) = id.span {
             n.span = Some(crate::estree::Span::new(start, end));
-            n.loc = Some(self.conv.location(oxc_span::Span::new(start, end)));
+            if id.has_loc() {
+                n.loc = Some(self.conv.location(oxc_span::Span::new(start, end)));
+            }
         }
         n.origin = Some(id.key);
         n

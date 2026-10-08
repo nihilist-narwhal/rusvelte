@@ -24,6 +24,12 @@ pub struct Id<'s> {
 }
 
 impl<'s> Id<'s> {
+    /// Whether the node has a `loc`: identifiers Svelte builds itself (synthetic keys, e.g. a
+    /// `let:x` directive's `{ name, type, start, end }`) have none even with a position
+    pub fn has_loc(&self) -> bool {
+        self.span.is_some() && self.key & 1 == 0
+    }
+
     pub fn loc(&self) -> Option<(usize, usize)> {
         self.span.map(|(s, e)| (s as usize, e as usize))
     }
