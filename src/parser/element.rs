@@ -540,7 +540,8 @@ fn read_static_attribute<'a>(parser: &mut Parser<'a>) -> Result<Option<Attr<'a>>
 
         let quoted = raw.starts_with('"') || raw.starts_with('\'');
         if quoted {
-            raw = &raw[1..raw.len() - 1];
+            // `raw.slice(1, -1)` (a lone quote gives '')
+            raw = if raw.len() >= 2 { &raw[1..raw.len() - 1] } else { "" };
         }
 
         value = AttrValue::Sequence(vec![Chunk::Text {

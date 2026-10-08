@@ -1,0 +1,199 @@
+//! A port of Svelte's code generation (`phases/3-transform`). So far: the CSS output
+//! (`css/index.js`), through [`compile_css`].
+
+pub mod css;
+
+use oxc_allocator::Allocator;
+
+use crate::analyze::{self, Warning};
+use crate::error::CompileError;
+
+/// The `css` compile option
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CssMode {
+    /// `'external'`: the CSS goes to `result.css`
+    #[default]
+    External,
+    /// `'injected'`: the CSS is embedded in the JS (`result.css` is `null`)
+    Injected,
+}
+
+/// What a custom `cssHash` function receives (`hash` is [`hash`])
+#[derive(Debug, Clone, Copy)]
+pub struct CssHashInput<'a> {
+    /// The content of the `<style>` element
+    pub css: &'a str,
+    /// The normalized filename (backslashes turned into slashes, relative to `rootDir`)
+    pub filename: &'a str,
+    /// The component name derived from the filename
+    pub name: &'a str,
+}
+
+/// The compile options that affect the CSS output
+#[derive(Default)]
+pub struct CssOptions {
+    /// `dev`: keeps empty rules
+    pub dev: bool,
+    /// `css`, unless `<svelte:options css>` overrides it
+    pub css: CssMode,
+    /// `cssHash`; `None` is the default, `svelte-${hash(filename)}`
+    pub css_hash: Option<Box<dyn Fn(&CssHashInput) -> String>>,
+    /// `rootDir`: the hash uses the filename relative to it
+    pub root_dir: Option<String>,
+    /// `customElement` (custom elements inject their styles)
+    pub custom_element: bool,
+    /// `runes` (`None` to infer it)
+    pub runes: Option<bool>,
+    /// `experimental.async`
+    pub experimental_async: bool,
+}
+
+/// `result.css` of `compile`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CssOutput {
+    pub code: String,
+    pub has_global: bool,
+}
+
+/// The stylesheet a component injects at runtime (`css: 'injected'` or custom elements):
+/// the `hash` and `code` of the `$$css` object in the generated JS
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectedCss {
+    pub hash: String,
+    pub code: String,
+}
+
+/// The CSS side of compiling a component
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CssResult {
+    /// `result.css` (`None` without `<style>` or when the styles are injected)
+    pub css: Option<CssOutput>,
+    /// The styles embedded in the JS, when they're injected
+    pub injected: Option<InjectedCss>,
+}
+
+/// `hash(str)` from `compiler/utils.js`: djb2 (xor variant) over the UTF-16 code units,
+/// from the end, ignoring `\r`, in base 36
+pub fn hash(s: &str) -> String {
+    let units: Vec<u16> = s.encode_utf16().filter(|&c| c != u16::from(b'\r')).collect();
+    let mut h: i32 = 5381;
+    for &c in units.iter().rev() {
+        // `((hash << 5) - hash) ^ c` with JS number semantics
+        let shifted = h.wrapping_shl(5) as i64;
+        let diff = (shifted - h as i64) as i32; // ToInt32 wraps modulo 2^32
+        h = diff ^ c as i32;
+    }
+    to_base36(h as u32)
+}
+
+fn to_base36(mut n: u32) -> String {
+    if n == 0 {
+        return "0".into();
+    }
+    let mut digits = Vec::new();
+    while n > 0 {
+        digits.push(std::char::from_digit(n % 36, 36).unwrap());
+        n /= 36;
+    }
+    digits.iter().rev().collect()
+}
+
+/// The CSS output of `compile(source, { filename, ...options })`: `result.css` (`code` and
+/// `hasGlobal`), or the error `compile` throws. Pass `"(unknown)"` as `filename` when there is
+/// none. Source maps aren't produced yet.
+pub fn compile_css(source: &str, filename: &str, options: &CssOptions) -> Result<Option<CssOutput>, CompileError> {
+    Ok(compile_styles(source, filename, options)?.css)
+}
+
+/// Like [`compile_css`], also returning the styles injected into the JS when the component
+/// injects them (`css: 'injected'`, custom elements)
+pub fn compile_styles(source: &str, filename: &str, options: &CssOptions) -> Result<CssResult, CompileError> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let alloc = Allocator::default();
+    let mut warnings: Vec<Warning> = Vec::new();
+    let component = crate::parse_with_warnings(&alloc, source, &mut warnings)
+        .map_err(|err| analyze::acorn::reword_parse_error(err, source))?;
+    let root = &component.root;
+    let mut scripts: Vec<&crate::ast::Script> = [&root.instance, &root.module].into_iter().flatten().collect();
+    scripts.sort_by_key(|s| s.start);
+    if let Some(err) = scripts.iter().find_map(|s| analyze::acorn::check(&s.content.program, source, root.ts)) {
+        return Err(err);
+    }
+    let analyze_options = analyze::CompileOptions {
+        runes: options.runes,
+        custom_element: options.custom_element,
+        experimental_async: options.experimental_async,
+    };
+    let analysis = analyze::analyze_component(&alloc, &component, source, filename, &analyze_options, &mut warnings)?;
+
+    let (Some(sheet), Some(meta)) = (&root.css, &analysis.css) else {
+        return Ok(CssResult::default());
+    };
+
+    // `css: 'css' in parsed_options ? parsed_options.css ?? 'external' : options.css`
+    let css_mode = match root.options.as_ref().and_then(|o| o.values.get("css")) {
+        Some(v) => match v.as_str() {
+            Some("injected") => CssMode::Injected,
+            _ => CssMode::External,
+        },
+        None => options.css,
+    };
+    let inject_styles = css_mode == CssMode::Injected || analysis.custom_element;
+
+    // `state.filename`: backslashes replaced, made relative to `rootDir`
+    let mut state_filename = filename.replace('\\', "/");
+    if let Some(root_dir) = &options.root_dir {
+        let root_dir = root_dir.replace('\\', "/");
+        if state_filename.starts_with(&root_dir) {
+            let rest = state_filename.replacen(&root_dir, "", 1);
+            state_filename = rest.strip_prefix(['/', '\\']).unwrap_or(&rest).to_string();
+        }
+    }
+    let styles = &source[sheet.css.content_start..sheet.css.content_end];
+    let css_hash = match &options.css_hash {
+        Some(f) => f(&CssHashInput { css: styles, filename: &state_filename, name: &analysis.component_name }),
+        None => format!("svelte-{}", hash(if state_filename == "(unknown)" { styles } else { &state_filename })),
+    };
+
+    let render = |minify: bool| {
+        css::render_stylesheet(source, &sheet.css, meta, &css::RenderOptions { hash: &css_hash, minify, dev: options.dev })
+            .map_err(|e| CompileError { code: "magic_string", message: e.0, position: None })
+    };
+    if inject_styles {
+        let code = render(!options.dev)?;
+        Ok(CssResult { css: None, injected: Some(InjectedCss { hash: css_hash.clone(), code }) })
+    } else {
+        let code = render(false)?;
+        Ok(CssResult { css: Some(CssOutput { code, has_global: analysis.css_has_global }), injected: None })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_matches_js() {
+        assert_eq!(hash("main.svelte"), "70s021");
+        assert_eq!(hash(""), "45h");
+        assert_eq!(hash("a\r\nb"), "2nhu6q");
+        assert_eq!(hash("ünïcödé 😀 .foo { color: red }"), "yvms2h");
+        assert_eq!(hash(&"x".repeat(1000)), "615edh");
+    }
+
+    #[test]
+    fn compile_css_scopes_and_prunes() {
+        let source = "<div class=\"a\">x</div><style>.a { color: red; } .b { color: blue; } @keyframes k {} .a { animation: k 1s; }</style>";
+        let out = compile_css(source, "A.svelte", &CssOptions::default()).unwrap().unwrap();
+        let h = format!("svelte-{}", hash("A.svelte"));
+        assert_eq!(
+            out.code,
+            format!(".a.{h} {{ color: red; }} /* (unused) .b {{ color: blue; }}*/ @keyframes {h}-k {{}} .a.{h} {{ animation: {h}-k 1s; }}")
+        );
+        assert!(!out.has_global);
+        // (checked against svelte 5.57.2)
+        let injected = compile_styles(source, "A.svelte", &CssOptions { css: CssMode::Injected, ..Default::default() }).unwrap();
+        assert!(injected.css.is_none());
+        assert_eq!(injected.injected.unwrap().code, format!(".a.{h} {{color:red;}} @keyframes {h}-k {{}}.a.{h} {{ animation: {h}-k 1s;}}"));
+    }
+}
