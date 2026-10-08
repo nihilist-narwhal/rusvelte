@@ -59,12 +59,14 @@ pub struct Warning {
 pub fn compile_diagnostics(source: &str, filename: &str) -> std::result::Result<Vec<Diagnostic>, Diagnostic> {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let alloc = Allocator::default();
-    let locator = Locator::new(source);
     let mut warnings = Vec::new();
-    let result = (|| -> Result<()> {
-        let component = crate::parse_with_warnings(&alloc, source, &mut warnings)?;
-        analyze_component(&alloc, &component, source, filename, &mut warnings)
-    })();
+    let (result, locator) = match crate::parse_with_warnings(&alloc, source, &mut warnings) {
+        Ok(component) => {
+            let result = analyze_component(&alloc, &component, source, filename, &mut warnings);
+            (result, component.locator.clone())
+        }
+        Err(err) => (Err(err), std::rc::Rc::new(Locator::new(source))),
+    };
     let pos = |b: usize| {
         let (line, column, character) = locator.line_column(b);
         Position { line, column, character }
@@ -176,7 +178,8 @@ pub(crate) struct Analyzer<'s> {
     pub snippet_sites: FxHashMap<NodeId, Vec<NodeId>>,
     pub elements: Vec<NodeId>,
     /// `node.metadata.path` of elements, render tags and components
-    pub node_paths: FxHashMap<NodeId, Vec<P<'s>>>,
+    pub node_paths: FxHashMap<NodeId, (u32, u32)>,
+    pub path_store: Vec<P<'s>>,
     pub props_id: Option<Id<'s>>,
     pub has_props_rune: bool,
     pub metas: Vec<ExprMeta>,
@@ -192,6 +195,10 @@ pub(crate) struct Analyzer<'s> {
     /// `leadingComments` (start, value) of JS nodes, for svelte-ignore
     pub leading_comments: FxHashMap<usize, Vec<(usize, &'s str)>>,
     pub filename: &'s str,
+    /// index of the node being visited in its fragment (set by `next`)
+    pub child_index: usize,
+    /// whether there are any HTML or JS comments (svelte-ignore)
+    pub has_comments: bool,
 }
 
 impl<'s> Analyzer<'s> {
@@ -284,6 +291,20 @@ impl<'s> Analyzer<'s> {
         range
     }
 
+    /// `node.metadata.path = [...context.path]`
+    pub fn save_path(&mut self, n: NodeId) {
+        let start = self.path_store.len() as u32;
+        self.path_store.extend_from_slice(&self.path);
+        self.node_paths.insert(n, (start, self.path.len() as u32));
+    }
+
+    pub fn saved_path(&self, n: NodeId) -> &[P<'s>] {
+        match self.node_paths.get(&n) {
+            Some(&(start, len)) => &self.path_store[start as usize..(start + len) as usize],
+            None => &[],
+        }
+    }
+
     pub fn element(&self, n: NodeId) -> Option<&'s crate::ast::Element<'s>> {
         match &self.ast.nodes[n] {
             Node::Element(el) => Some(el),
@@ -371,6 +392,7 @@ fn analyze_component<'s>(
         snippet_sites: FxHashMap::default(),
         elements: Vec::new(),
         node_paths: FxHashMap::default(),
+        path_store: Vec::new(),
         props_id: None,
         has_props_rune: false,
         metas: Vec::new(),
@@ -382,6 +404,8 @@ fn analyze_component<'s>(
         textarea_values: FxHashSet::default(),
         leading_comments: FxHashMap::default(),
         filename,
+        child_index: 0,
+        has_comments: !root.comments.is_empty() || ast.nodes.iter().any(|n| matches!(n, Node::Comment { .. })),
     };
 
     comments::attach_all(&mut an);

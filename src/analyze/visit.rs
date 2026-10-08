@@ -48,10 +48,18 @@ impl<'s> Analyzer<'s> {
                 let n = self.slot_fragments[i as usize].1.len();
                 for k in 0..n {
                     let child = self.slot_fragments[i as usize].1[k];
+                    self.child_index = k;
                     self.visit(P::Node(child), state)?;
                 }
             }
             P::Fragment(f) if self.emptied_fragment == Some(f) => {}
+            P::Fragment(f) => {
+                let nodes = &self.ast.fragments[f].nodes;
+                for (k, &child) in nodes.iter().enumerate() {
+                    self.child_index = k;
+                    self.visit(P::Node(child), state)?;
+                }
+            }
             _ => nodes::each_child(p, self.ast, self, &mut |me: &mut Self, c| me.visit(c, state))?,
         }
         self.path.pop();
@@ -68,6 +76,9 @@ impl<'s> Analyzer<'s> {
 
     fn collect_ignores(&mut self, p: P<'s>) -> Vec<&'s str> {
         let mut ignores = Vec::new();
+        if !self.has_comments {
+            return ignores;
+        }
         let parent = self.path.last().copied();
         let is_text_or_comment = matches!(
             p,
@@ -80,7 +91,13 @@ impl<'s> Analyzer<'s> {
                     P::SlotFragment(i) => &self.slot_fragments[i as usize].1,
                     _ => unreachable!(),
                 };
-                let Some(idx) = siblings.iter().position(|&s| s == n) else { return ignores };
+                // `parent.nodes.indexOf(node)`: `next` records the index
+                let idx = if siblings.get(self.child_index) == Some(&n) {
+                    self.child_index
+                } else {
+                    let Some(idx) = siblings.iter().position(|&s| s == n) else { return ignores };
+                    idx
+                };
                 let mut comments = Vec::new();
                 for &prev in siblings[..idx].iter().rev() {
                     match &self.ast.nodes[prev] {
@@ -1350,7 +1367,11 @@ fn dummy_id<'s>() -> Id<'s> {
 }
 
 pub fn has_bidi(s: &str) -> bool {
-    s.chars().any(is_bidi)
+    let b = s.as_bytes();
+    b.contains(&0xE2)
+        && b.windows(3).any(|w| {
+            w[0] == 0xE2 && ((w[1] == 0x80 && (0xAA..=0xAE).contains(&w[2])) || (w[1] == 0x81 && (0xA6..=0xA9).contains(&w[2])))
+        })
 }
 
 fn is_bidi(c: char) -> bool {
@@ -1793,7 +1814,7 @@ impl<'s> Analyzer<'s> {
 
     fn render_tag(&mut self, p: P<'s>, n: NodeId, expression: &'s Expr<'s>, st: &State<'s>) -> Res {
         self.validate_opening_tag(n, '@')?;
-        self.node_paths.insert(n, self.path.clone());
+        self.save_path(n);
         let mut call = nodes::template_expr(expression);
         if let P::Js(AstKind::ChainExpression(c)) = call {
             call = nodes::chain_element(&c.expression);
@@ -2010,7 +2031,7 @@ impl<'s> Analyzer<'s> {
         self.validate_element(n, st)?;
         super::a11y::check_element(self, n)?;
 
-        self.node_paths.insert(n, self.path.clone());
+        self.save_path(n);
         self.elements.push(n);
 
         let frag_nodes = &self.ast.fragments[el.fragment].nodes;
@@ -2100,7 +2121,7 @@ impl<'s> Analyzer<'s> {
         let el = self.element(n).unwrap();
         self.validate_element(n, st)?;
         super::a11y::check_element(self, n)?;
-        self.node_paths.insert(n, self.path.clone());
+        self.save_path(n);
         self.elements.push(n);
 
         if let Some(tag) = &el.tag {
@@ -2380,7 +2401,7 @@ impl<'s> Analyzer<'s> {
 
     fn visit_component(&mut self, p: P<'s>, n: NodeId, st: &State<'s>) -> Res {
         let el = self.element(n).unwrap();
-        self.node_paths.insert(n, self.path.clone());
+        self.save_path(n);
 
         // which snippets this component might render
         let mut resolved = true;

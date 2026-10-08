@@ -208,17 +208,41 @@ fn match_schema(schema: &Schema, tag_name: &str, map: &AttrMap) -> bool {
     })
 }
 
+/// The schemas of a list, grouped by element name (in list order)
+type SchemaIndex = rustc_hash::FxHashMap<&'static str, Vec<&'static Schema>>;
+
+fn index(list: &'static [Schema]) -> SchemaIndex {
+    let mut m: SchemaIndex = Default::default();
+    for s in list {
+        m.entry(s.name).or_default().push(s);
+    }
+    m
+}
+
+fn schemas(which: usize, tag_name: &str) -> &'static [&'static Schema] {
+    static INDEXES: std::sync::OnceLock<[SchemaIndex; 4]> = std::sync::OnceLock::new();
+    let indexes = INDEXES.get_or_init(|| {
+        [
+            index(data::INTERACTIVE_ELEMENT_ROLE_SCHEMAS),
+            index(data::NON_INTERACTIVE_ELEMENT_ROLE_SCHEMAS),
+            index(data::INTERACTIVE_ELEMENT_AX_OBJECT_SCHEMAS),
+            index(data::NON_INTERACTIVE_ELEMENT_AX_OBJECT_SCHEMAS),
+        ]
+    });
+    indexes[which].get(tag_name).map_or(&[], |v| v.as_slice())
+}
+
 fn element_interactivity(tag_name: &str, map: &AttrMap) -> Interactivity {
-    if data::INTERACTIVE_ELEMENT_ROLE_SCHEMAS.iter().any(|s| match_schema(s, tag_name, map)) {
+    if schemas(0, tag_name).iter().any(|s| match_schema(s, tag_name, map)) {
         return Interactivity::Interactive;
     }
-    if tag_name != "header" && data::NON_INTERACTIVE_ELEMENT_ROLE_SCHEMAS.iter().any(|s| match_schema(s, tag_name, map)) {
+    if tag_name != "header" && schemas(1, tag_name).iter().any(|s| match_schema(s, tag_name, map)) {
         return Interactivity::NonInteractive;
     }
-    if data::INTERACTIVE_ELEMENT_AX_OBJECT_SCHEMAS.iter().any(|s| match_schema(s, tag_name, map)) {
+    if schemas(2, tag_name).iter().any(|s| match_schema(s, tag_name, map)) {
         return Interactivity::Interactive;
     }
-    if data::NON_INTERACTIVE_ELEMENT_AX_OBJECT_SCHEMAS.iter().any(|s| match_schema(s, tag_name, map)) {
+    if schemas(3, tag_name).iter().any(|s| match_schema(s, tag_name, map)) {
         return Interactivity::NonInteractive;
     }
     Interactivity::Static

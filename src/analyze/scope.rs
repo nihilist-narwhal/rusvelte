@@ -104,7 +104,13 @@ pub struct Scope<'s> {
     pub porous: bool,
     pub function_depth: u32,
     pub declarations: FxIndexMap<&'s str, BindingId>,
+    /// Only kept for the scopes whose references the analysis looks at (the module scope,
+    /// `$:` statements and snippets), see `track_references`
     pub references: FxIndexMap<&'s str, Vec<RefId>>,
+    pub track_refs: bool,
+    /// The parent to continue a lookup with: `parent`, skipping scopes that can never
+    /// declare anything or record references (computed by `create_scopes`)
+    pub lookup_parent: Option<ScopeId>,
 }
 
 /// All scopes and bindings of a component (Svelte's `ScopeRoot` plus the per-AST `scopes` maps)
@@ -134,6 +140,8 @@ impl<'s> Scopes<'s> {
             function_depth,
             declarations: FxIndexMap::default(),
             references: FxIndexMap::default(),
+            track_refs: parent.is_none(),
+            lookup_parent: parent,
         });
         (self.scopes.len() - 1) as ScopeId
     }
@@ -165,7 +173,7 @@ impl<'s> Scopes<'s> {
             if let Some(&b) = s.declarations.get(name) {
                 return Some(b);
             }
-            scope = s.parent?;
+            scope = s.lookup_parent?;
         }
     }
 
@@ -175,7 +183,21 @@ impl<'s> Scopes<'s> {
             if s.declarations.contains_key(name) {
                 return Some(scope);
             }
-            scope = s.parent?;
+            scope = s.lookup_parent?;
+        }
+    }
+
+    /// Let lookups skip the scopes created after `from` (except `root`) that declare nothing
+    fn compute_lookup_parents(&mut self, from: usize, root: ScopeId) {
+        for s in from..self.scopes.len() {
+            let parent = self.scopes[s].parent;
+            self.scopes[s].lookup_parent = match parent {
+                Some(p) if p != root && p as usize >= from => {
+                    let ps = &self.scopes[p as usize];
+                    if ps.declarations.is_empty() && !ps.track_refs { ps.lookup_parent } else { Some(p) }
+                }
+                other => other,
+            };
         }
     }
 
@@ -241,12 +263,14 @@ impl<'s> Scopes<'s> {
     fn add_reference(&mut self, mut scope: ScopeId, name: &'s str, r: RefId) {
         loop {
             let s = &mut self.scopes[scope as usize];
-            s.references.entry(name).or_default().push(r);
+            if s.track_refs {
+                s.references.entry(name).or_default().push(r);
+            }
             if let Some(&b) = s.declarations.get(name) {
                 self.bindings[b as usize].references.push(r);
                 return;
             }
-            match s.parent {
+            match s.lookup_parent {
                 Some(p) => scope = p,
                 None => {
                     self.conflicts.insert(name);
@@ -581,6 +605,7 @@ pub fn create_scopes<'s>(
     parent: Option<ScopeId>,
 ) -> crate::error::Result<Created> {
     let scope = scopes.new_scope(parent, false);
+    let first_scope = scopes.scopes.len();
     let mut b = ScopeBuilder {
         scopes,
         ast,
@@ -597,6 +622,8 @@ pub fn create_scopes<'s>(
         b.scopes.map.insert(root.key(), scope);
         b.visit(root, scope)?;
     }
+
+    b.scopes.compute_lookup_parents(first_scope, scope);
 
     for id in std::mem::take(&mut b.possible_implicit_declarations) {
         if b.scopes.get(scope, id.name).is_some() {
@@ -717,6 +744,7 @@ impl<'s> ScopeBuilder<'s, '_> {
                         return self.next(p, scope);
                     }
                     let s = self.scopes.child(self.top, false);
+                    self.scopes.scopes[s as usize].track_refs = true;
                     self.scopes.map.insert(p.key(), s);
                     if let Statement::ExpressionStatement(es) = &l.body {
                         if let Expression::AssignmentExpression(a) = nodes::strip(&es.expression) {
@@ -985,6 +1013,7 @@ impl<'s> ScopeBuilder<'s, '_> {
                 let id = ident(nodes::template_expr(expression)).unwrap();
                 self.scopes.declare(scope, id, Kind::Normal, DeclKind::Function, Some(p))?;
                 let child = self.scopes.child(scope, false);
+                self.scopes.scopes[child as usize].track_refs = true;
                 self.scopes.map.insert(p.key(), child);
                 for param in nodes::snippet_params(parameters) {
                     for id in extract_identifiers(param) {

@@ -55,7 +55,8 @@ pub fn analyze<'s>(an: &mut Analyzer<'s>, sheet: &'s StyleSheet<'s>) -> Result<(
     // prune
     let elements = an.elements.clone();
     {
-        let mut pruner = Pruner { an, meta: &mut meta, elements: &elements };
+        let mut pruner = Pruner { an, meta: &mut meta, elements: &elements, in_head: Vec::new() };
+        pruner.in_head = elements.iter().map(|&e| pruner.is_inside_svelte_head(e)).collect();
         for child in &css.children {
             pruner.prune_child(child);
         }
@@ -646,6 +647,8 @@ struct Pruner<'a, 's, 'm, 'c> {
     an: &'a mut Analyzer<'s>,
     meta: &'m mut Meta<'c>,
     elements: &'a [NodeId],
+    /// whether each element is inside `<svelte:head>`
+    in_head: Vec<bool>,
 }
 
 impl<'s, 'c> Pruner<'_, 's, '_, 'c>
@@ -683,14 +686,14 @@ where
         }
         for i in 0..self.elements.len() {
             let element = self.elements[i];
-            if !self.is_inside_svelte_head(element) && self.apply_selector(&selectors, rule, element, BACKWARD, 0, selectors.len()) {
+            if !self.in_head[i] && self.apply_selector(&selectors, rule, element, BACKWARD, 0, selectors.len()) {
                 self.meta.used.insert(addr(node));
             }
         }
     }
 
     fn element_path(&self, n: NodeId) -> &[P<'s>] {
-        self.an.node_paths.get(&n).map(|v| v.as_slice()).unwrap_or(&[])
+        self.an.saved_path(n)
     }
 
     fn is_inside_svelte_head(&self, n: NodeId) -> bool {
@@ -851,8 +854,7 @@ where
     fn relative_selector_might_apply_to_node(&mut self, relative: &Rel<'c>, rule: Option<&'c Rule>, element: NodeId, direction: bool) -> bool {
         let mut include_self: Option<bool> = None;
         let el = self.an.element(element).unwrap();
-        let selectors: Vec<Sel<'c>> = relative.iter().collect();
-        for selector in selectors {
+        for selector in relative.iter() {
             if let Sel::Real(SimpleSelector::PseudoClass { name, args: Some(args), .. }) = selector {
                 if name == "has" {
                     if include_self.is_none() {
@@ -977,11 +979,11 @@ where
                     let Sel::Real(SimpleSelector::Attribute { name: attr_name, value, matcher, flags, .. }) = selector else {
                         unreachable!()
                     };
-                    let el_lower = el.name.to_lowercase();
-                    let whitelisted = matches!(el_lower.as_str(), "details" | "dialog") && attr_name.to_lowercase() == "open";
+                    let whitelisted =
+                        (lower_eq(el.name, "details") || lower_eq(el.name, "dialog")) && lower_eq(attr_name, "open");
                     let case_insensitive = flags.as_ref().is_some_and(|f| f.contains('i'))
                         || (!flags.as_ref().is_some_and(|f| f.contains('s'))
-                            && CASE_INSENSITIVE_ATTRIBUTES.contains(&attr_name.to_lowercase().as_str()));
+                            && CASE_INSENSITIVE_ATTRIBUTES.iter().any(|a| lower_eq(attr_name, a)));
                     let expected = value.as_ref().map(|v| unquote(v));
                     if !whitelisted
                         && !self.attribute_matches(element, attr_name, expected.as_deref(), matcher.as_deref(), case_insensitive)
@@ -1000,7 +1002,7 @@ where
                     }
                 }
                 "type" => {
-                    if el.name.to_lowercase() != name.to_lowercase() && name != "*" && el.kind != "SvelteElement" {
+                    if !lower_eq_both(el.name, name) && name != "*" && el.kind != "SvelteElement" {
                         return false;
                     }
                 }
@@ -1040,7 +1042,9 @@ where
     }
 
     fn attribute_matches(&self, n: NodeId, name: &str, expected: Option<&str>, operator: Option<&str>, case_insensitive: bool) -> bool {
-        let name_lower = name.to_lowercase();
+        let name_lower: std::borrow::Cow<str> =
+            if name.bytes().any(|b| b.is_ascii_uppercase()) || !name.is_ascii() { name.to_lowercase().into() } else { name.into() };
+        let name_lower: &str = &name_lower;
         let el = self.an.element(n).unwrap();
         let textarea_value = if self.an.textarea_values.contains(&n) { Some(()) } else { None };
         let attrs = el.attributes.iter().map(AttrView::Attr).chain(textarea_value.map(|_| AttrView::TextareaValue(n)));
@@ -1064,7 +1068,7 @@ where
                             _ => None,
                         })
                         .collect();
-                    match self.chunks_match(&chunks, &name_lower, expected.unwrap(), operator, case_insensitive) {
+                    match self.chunks_match(&chunks, name_lower, expected.unwrap(), operator, case_insensitive) {
                         Some(true) => return true,
                         _ => continue,
                     }
@@ -1086,7 +1090,7 @@ where
                 _ => {}
             }
             let Attr::Attribute { name: attr_name, value, .. } = a else { continue };
-            if attr_name.to_lowercase() != name_lower {
+            if !lower_eq(attr_name, name_lower) {
                 continue;
             }
             if matches!(value, AttrValue::True) {
@@ -1107,7 +1111,7 @@ where
                     Chunk::Expression { expression, .. } => ChunkView::Expr(expression),
                 })
                 .collect();
-            if let Some(true) = self.chunks_match(&chunks, &name_lower, expected, operator, case_insensitive) {
+            if let Some(true) = self.chunks_match(&chunks, name_lower, expected, operator, case_insensitive) {
                 return true;
             }
         }
@@ -1606,20 +1610,32 @@ fn unquote(s: &str) -> String {
 }
 
 fn test_attribute(operator: Option<&str>, expected: &str, case_insensitive: bool, value: &str) -> bool {
-    let (expected, value) = if case_insensitive {
-        (expected.to_lowercase(), value.to_lowercase())
-    } else {
-        (expected.to_string(), value.to_string())
-    };
+    if !case_insensitive {
+        return test_attribute_exact(operator, expected, value);
+    }
+    test_attribute_exact(operator, &expected.to_lowercase(), &value.to_lowercase())
+}
+
+fn test_attribute_exact(operator: Option<&str>, expected: &str, value: &str) -> bool {
     match operator {
         Some("=") => value == expected,
         Some("~=") => value.split(is_js_whitespace).any(|v| v == expected),
         Some("|=") => format!("{value}-").starts_with(&format!("{expected}-")),
-        Some("^=") => value.starts_with(&expected),
-        Some("$=") => value.ends_with(&expected),
-        Some("*=") => value.contains(&expected),
+        Some("^=") => value.starts_with(expected),
+        Some("$=") => value.ends_with(expected),
+        Some("*=") => value.contains(expected),
         _ => false,
     }
+}
+
+/// `a.toLowerCase() === lower` (`lower` already lowercase)
+fn lower_eq(a: &str, lower: &str) -> bool {
+    if a.is_ascii() { a.eq_ignore_ascii_case(lower) } else { a.to_lowercase() == lower }
+}
+
+/// `a.toLowerCase() === b.toLowerCase()`
+fn lower_eq_both(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() { a.eq_ignore_ascii_case(b) } else { a.to_lowercase() == b.to_lowercase() }
 }
 
 const CASE_INSENSITIVE_ATTRIBUTES: &[&str] = &[

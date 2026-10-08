@@ -22,7 +22,10 @@ pub struct Locator<'s> {
 
 impl<'s> Locator<'s> {
     pub fn new(source: &'s str) -> Self {
-        let lf_only = !source.as_bytes().contains(&b'\r') && !source.contains(['\u{2028}', '\u{2029}']);
+        let bytes = source.as_bytes();
+        // ` `/` ` start with 0xE2: only search for them when that byte occurs
+        let lf_only = !bytes.contains(&b'\r')
+            && !bytes.windows(3).any(|w| w[0] == 0xE2 && w[1] == 0x80 && (w[2] == 0xA8 || w[2] == 0xA9));
         Locator {
             source,
             lf_only,

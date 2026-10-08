@@ -453,14 +453,14 @@ pub fn is_tag_valid_with_parent(child_tag: &str, parent_tag: &str) -> Option<Str
     if parent_tag == "template" {
         return None;
     }
-    let child = format!("`<{child_tag}>`");
-    let parent = format!("`<{parent_tag}>`");
+    let child = || format!("`<{child_tag}>`");
+    let parent = || format!("`<{parent_tag}>`");
     match disallowed_children(parent_tag) {
         Some(Disallowed::Direct(list)) if list.contains(&child_tag) => {
-            return Some(format!("{child} cannot be a direct child of {parent}"));
+            return Some(format!("{} cannot be a direct child of {}", child(), parent()));
         }
         Some(Disallowed::Descendant(list, _)) if list.contains(&child_tag) => {
-            return Some(format!("{child} cannot be a child of {parent}"));
+            return Some(format!("{} cannot be a child of {}", child(), parent()));
         }
         Some(Disallowed::Only(list)) => {
             if list.contains(&child_tag) {
@@ -468,7 +468,9 @@ pub fn is_tag_valid_with_parent(child_tag: &str, parent_tag: &str) -> Option<Str
             }
             let only: Vec<String> = list.iter().map(|d| format!("`<{d}>`")).collect();
             return Some(format!(
-                "{child} cannot be a child of {parent}. `<{parent_tag}>` only allows these children: {}",
+                "{} cannot be a child of {}. `<{parent_tag}>` only allows these children: {}",
+                child(),
+                parent(),
                 only.join(", ")
             ));
         }
@@ -476,11 +478,11 @@ pub fn is_tag_valid_with_parent(child_tag: &str, parent_tag: &str) -> Option<Str
     }
     match child_tag {
         "body" | "caption" | "col" | "colgroup" | "frameset" | "frame" | "head" | "html" => {
-            Some(format!("{child} cannot be a child of {parent}"))
+            Some(format!("{} cannot be a child of {}", child(), parent()))
         }
-        "thead" | "tbody" | "tfoot" => Some(format!("{child} must be the child of a `<table>`, not a {parent}")),
-        "td" | "th" => Some(format!("{child} must be the child of a `<tr>`, not a {parent}")),
-        "tr" => Some(format!("`<tr>` must be the child of a `<thead>`, `<tbody>`, or `<tfoot>`, not a {parent}")),
+        "thead" | "tbody" | "tfoot" => Some(format!("{} must be the child of a `<table>`, not a {}", child(), parent())),
+        "td" | "th" => Some(format!("{} must be the child of a `<tr>`, not a {}", child(), parent())),
+        "tr" => Some(format!("`<tr>` must be the child of a `<thead>`, `<tbody>`, or `<tfoot>`, not a {}", parent())),
         _ => None,
     }
 }
