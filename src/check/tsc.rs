@@ -92,7 +92,24 @@ pub fn start(exe: &Path, tsconfig: &Path, cwd: &Path, build_info: Option<&Path>)
 pub fn finish(child: std::process::Child, cwd: &Path) -> Result<Vec<CliDiagnostic>, String> {
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    Ok(parse_diagnostics(&text, cwd))
+    let diagnostics = parse_diagnostics(&text, cwd);
+    // A non-zero exit can also mean there are diagnostics, so it's only an error when nothing
+    // was parsed. A signal always is: the run didn't finish.
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&out.status);
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    if signal.is_some() || (!out.status.success() && diagnostics.is_empty()) {
+        let reason = match signal {
+            Some(s) => format!("was killed by signal {s}"),
+            None => format!("exited with code {} without a parseable diagnostic", out.status.code().unwrap_or(-1)),
+        };
+        let detail = strip_ansi(&text);
+        let detail = detail.trim();
+        let detail: String = detail.chars().take(2000).collect();
+        return Err(format!("The TypeScript compiler process {reason}.{}", if detail.is_empty() { String::new() } else { format!("\n{detail}") }));
+    }
+    Ok(diagnostics)
 }
 
 fn strip_ansi(s: &str) -> String {
