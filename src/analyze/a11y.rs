@@ -167,7 +167,7 @@ fn static_value<'a>(a: Option<&'a Attr<'a>>) -> Static<'a> {
 }
 
 struct AttrMap<'a> {
-    entries: Vec<(&'a str, &'a Attr<'a>)>,
+    entries: smallvec::SmallVec<[(&'a str, &'a Attr<'a>); 8]>,
 }
 
 impl<'a> AttrMap<'a> {
@@ -427,15 +427,15 @@ fn has_input_child(an: &Analyzer, p: P) -> bool {
 pub fn check_element<'s>(an: &mut Analyzer<'s>, n: NodeId) -> Result<()> {
     let el = an.element(n).unwrap();
     let node = P::Node(n);
-    let mut attribute_map = AttrMap { entries: Vec::new() };
-    let mut handlers: Vec<&'s str> = Vec::new();
-    let mut attributes: Vec<&'s Attr<'s>> = Vec::new();
+    let mut attribute_map = AttrMap { entries: smallvec::SmallVec::new() };
+    let mut handlers: smallvec::SmallVec<[&'s str; 4]> = smallvec::SmallVec::new();
+    let mut attributes: smallvec::SmallVec<[&'s Attr<'s>; 8]> = smallvec::SmallVec::new();
     let is_dynamic_element = el.kind == "SvelteElement";
     let mut has_spread = false;
     let mut has_contenteditable_attr = false;
     let mut has_contenteditable_binding = false;
 
-    let add_handler = |handlers: &mut Vec<&'s str>, h: &'s str| {
+    let add_handler = |handlers: &mut smallvec::SmallVec<[&'s str; 4]>, h: &'s str| {
         if !handlers.contains(&h) {
             handlers.push(h);
         }

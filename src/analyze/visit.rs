@@ -2061,15 +2061,17 @@ impl<'s> Analyzer<'s> {
         if let Some(parent_element) = st.parent_element {
             let mut past_parent = false;
             let mut only_warn = false;
-            let mut ancestors: Vec<&str> = vec![parent_element];
+            let mut ancestors: smallvec::SmallVec<[&str; 8]> = smallvec::smallvec![parent_element];
             for i in (0..self.path.len()).rev() {
                 let ancestor = self.path[i];
-                let ty = self.ty(ancestor);
-                if matches!(ty, "IfBlock" | "EachBlock" | "AwaitBlock" | "KeyBlock") {
+                // only template nodes matter here
+                let Some(an) = ancestor.node() else { continue };
+                let ty = self.ast.nodes[an].type_name();
+                if matches!(self.ast.nodes[an], Node::IfBlock { .. } | Node::EachBlock { .. } | Node::AwaitBlock { .. } | Node::KeyBlock { .. }) {
                     only_warn = true;
                 }
                 if !past_parent {
-                    if ty == "RegularElement" && ancestor.node().and_then(|a| self.element(a)).is_some_and(|a| a.name == parent_element) {
+                    if ty == "RegularElement" && self.element(an).is_some_and(|a| a.name == parent_element) {
                         if let Some(message) = utils::is_tag_valid_with_parent(el.name, parent_element) {
                             if only_warn {
                                 self.warn(Some(p), w::node_invalid_placement_ssr(&message));
