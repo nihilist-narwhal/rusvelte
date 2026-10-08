@@ -5,6 +5,7 @@ import { parse } from 'acorn';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripTypeScriptTypes } from 'node:module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tests = path.join(here, '../svelte-upstream/packages/svelte/tests');
@@ -97,10 +98,10 @@ if (suites.includes(target)) {
 		}
 	}
 } else {
-	for (const file of fs.globSync('**/*.{svelte,svelte.js}', { cwd: target }).sort()) {
+	for (const file of fs.globSync('**/*.{svelte,svelte.js,svelte.ts}', { cwd: target }).sort()) {
 		if (file.includes('node_modules')) continue;
 		for (const generate of ['client', 'server']) {
-			jobs.push({ sample: '', file, cwd: target, config: {}, generate, module: file.endsWith('.svelte.js') });
+			jobs.push({ sample: '', file, cwd: target, config: {}, generate, module: !file.endsWith('.svelte') });
 		}
 	}
 }
@@ -108,7 +109,19 @@ if (suites.includes(target)) {
 const result = [];
 for (const job of jobs) {
 	const filename = path.join(job.cwd, job.file);
-	const text = fs.readFileSync(filename, 'utf-8').replace(/\r\n/g, '\n');
+	let text = fs.readFileSync(filename, 'utf-8').replace(/\r\n/g, '\n');
+	// `compileModule` takes JavaScript: a `.svelte.ts` module is compiled with its types
+	// stripped, as the bundler does before vite-plugin-svelte sees it
+	let stripped = false;
+	if (filename.endsWith('.ts')) {
+		stripped = true;
+		try {
+			text = stripTypeScriptTypes(text);
+		} catch (e) {
+			// enums, parameter properties etc. need a real TypeScript transform
+			stripped = { error: String(e.message).split('\n')[0] };
+		}
+	}
 	let options;
 	if (job.module) {
 		const o = suites.includes(target) ? suite_options(target, job.config, job.generate) : {};
@@ -124,7 +137,7 @@ for (const job of jobs) {
 	const record = { sample: job.sample, file: job.file, generate: job.generate, module: job.module, options: serialisable(options) };
 	if (job.config.unsupported) record.unsupported_config = job.config.unsupported;
 	const id = [job.sample, job.file.replaceAll('/', '__'), job.generate].filter(Boolean).join('__');
-	result.push({ id, filename, text, module: job.module, options, record });
+	result.push({ id, filename, text, stripped, module: job.module, options, record });
 }
 return result;
 }

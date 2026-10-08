@@ -22,6 +22,7 @@ let errors = 0;
 for (const job of jobs) {
 	const record = job.record;
 	try {
+		if (job.stripped?.error) throw new Error(`TypeScript not strippable: ${job.stripped.error}`);
 		const r = job.module ? compileModule(job.text, job.options) : compile(job.text, job.options);
 		record.js = r.js.code;
 		if (r.css) {
@@ -33,7 +34,14 @@ for (const job of jobs) {
 		record.error = e.code ? { code: e.code, message: e.message } : { crash: String(e.message).split('\n')[0] };
 	}
 	fs.writeFileSync(path.join(out, job.id + '.json'), JSON.stringify(record));
-	manifest.push({ id: job.id, source: job.filename });
+	let source = job.filename;
+	if (job.stripped) {
+		// the stripped text, as that's what was compiled
+		source = path.resolve(out, '_src', job.id + '.js');
+		fs.mkdirSync(path.dirname(source), { recursive: true });
+		fs.writeFileSync(source, job.text);
+	}
+	manifest.push({ id: job.id, source });
 }
 fs.writeFileSync(path.join(out, 'manifest.json'), JSON.stringify(manifest));
 console.log(`${jobs.length} compilations, ${errors} errors`);
