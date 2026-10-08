@@ -45,7 +45,7 @@ fn main() {
             continue;
         }
         let source_path = entry["source"].as_str().unwrap();
-        let source = std::fs::read_to_string(source_path).unwrap().replace("\r\n", "\n");
+        let source = std::fs::read_to_string(oracle_cwd.join(source_path)).unwrap().replace("\r\n", "\n");
         let mut options = CompileOptions::from_json(&record["options"]);
         if options.root_dir.is_none() {
             options.root_dir = Some(oracle_cwd.to_string_lossy().into_owned());

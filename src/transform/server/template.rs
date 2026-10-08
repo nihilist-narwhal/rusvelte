@@ -7,7 +7,7 @@ use crate::estree::builders as b;
 use crate::estree::Node;
 
 use super::super::js::PathNode;
-use super::utils::{build_template, PromiseOptimiser, EMPTY_COMMENT};
+use super::utils::{build_template, create_child_block, prepend_block_marker, PromiseOptimiser, BLOCK_CLOSE, BLOCK_OPEN, BLOCK_OPEN_ELSE, EMPTY_COMMENT};
 use super::{shared, Server, State};
 
 /// A node of a cleaned fragment: a template node, or a text node whose whitespace
@@ -418,16 +418,354 @@ impl<'a, 's> Server<'a, 's> {
         }
     }
 
-    /// `context.visit(node, state)` for a template node
+    /// `context.visit(node, state)` for a template node (with `set_scope`)
     pub fn visit_node(&mut self, n: NodeId, st: &State) {
+        let scoped;
+        let st = match self.scope_of_key(P::Node(n).key()) {
+            Some(scope) if scope != st.scope => {
+                scoped = State { scope, ..st.clone() };
+                &scoped
+            }
+            _ => st,
+        };
         let ast = self.ast();
+        self.path.push(PathNode::Tpl(P::Node(n)));
         match &ast.nodes[n] {
             TNode::Element(el) => match el.kind {
-                "RegularElement" => self.regular_element(n, st),
+                "RegularElement" => {
+                    self.path.pop();
+                    self.regular_element(n, st);
+                    return;
+                }
+                "TitleElement" => self.title_element(n, st),
+                "SvelteHead" => self.svelte_head(n, st),
                 _ => {}
             },
+            TNode::IfBlock { .. } => self.if_block(n, st),
+            TNode::EachBlock { .. } => self.each_block(n, st),
+            TNode::HtmlTag { expression, .. } => self.html_tag(n, expression, st),
+            TNode::KeyBlock { fragment, .. } => {
+                let meta = self.meta_of_node(n);
+                let is_async = self.meta_is_async(meta);
+                if is_async {
+                    st.template.borrow_mut().push(b::literal(BLOCK_OPEN));
+                }
+                let block = self.fragment(*fragment, Parent::Node(n), st);
+                st.template.borrow_mut().extend([b::literal(EMPTY_COMMENT), block, b::literal(EMPTY_COMMENT)]);
+                if is_async {
+                    st.template.borrow_mut().push(b::literal(BLOCK_CLOSE));
+                }
+            }
+            TNode::AwaitBlock { .. } => self.await_block(n, st),
+            TNode::SnippetBlock { .. } => self.snippet_block(n, st),
+            TNode::RenderTag { expression, .. } => self.render_tag(n, expression, st),
+            TNode::ConstTag { id, init, .. } => {
+                let id = self.convert_pattern(id);
+                let id = self.visit_js(&id, st);
+                let init = self.convert_expr(init);
+                let init = self.visit_js(&init, st);
+                // TODO: async `{@const}` (`metadata.promises_id`)
+                st.init.borrow_mut().push(b::r#const(id, init));
+            }
+            TNode::DebugTag { identifiers, .. } => self.debug_tag(identifiers, st),
             _ => {}
         }
+        self.path.pop();
+    }
+
+    /// A template pattern (`{#each}` context, `{:then}` value, `{@const}` id) as ESTree
+    pub fn convert_pattern(&self, p: &'s crate::ast::Pattern<'s>) -> Node {
+        match p {
+            crate::ast::Pattern::Ident { name, start, end, .. } => {
+                let mut id = b::id(name.as_str());
+                id.span = Some(crate::estree::Span::new(*start as u32, *end as u32));
+                id.origin = Some(P::PatIdent(p).key());
+                id
+            }
+            crate::ast::Pattern::Destructure { assign, .. } => match assign.inner() {
+                oxc_ast::ast::Expression::AssignmentExpression(a) => self.conv.assignment_target(&a.left),
+                other => self.conv.expression(other),
+            },
+        }
+    }
+
+    fn if_block(&mut self, n: NodeId, st: &State) {
+        let ast = self.ast();
+        let TNode::IfBlock { test, consequent, alternate, .. } = &ast.nodes[n] else { return };
+        let mut consequent_block = self.fragment(*consequent, Parent::Node(n), st);
+        prepend_block_marker(&mut consequent_block, "<!--[0-->");
+        let test = self.visit_template_expr_here(test, st);
+        let mut branches = vec![(test, consequent_block)];
+        let mut index = 1;
+        let mut alt = *alternate;
+        let flattened = self.an.node_meta.get(&n).and_then(|m| m.flattened.clone()).unwrap_or_default();
+        for elseif in flattened {
+            let TNode::IfBlock { test, consequent, alternate, .. } = &ast.nodes[elseif] else { continue };
+            self.path.push(PathNode::Tpl(P::Node(elseif)));
+            let mut branch = self.fragment(*consequent, Parent::Node(elseif), st);
+            prepend_block_marker(&mut branch, &format!("<!--[{index}-->"));
+            index += 1;
+            let t = self.visit_template_expr_here(test, st);
+            self.path.pop();
+            branches.push((t, branch));
+            alt = *alternate;
+        }
+        let mut final_alternate = match alt {
+            Some(f) => self.fragment(f, Parent::Node(n), st),
+            None => b::block(vec![]),
+        };
+        prepend_block_marker(&mut final_alternate, "<!--[-1-->");
+        let mut statement = final_alternate;
+        let mut first = true;
+        for (test, block) in branches.into_iter().rev() {
+            statement = b::r#if(test, block, Some(statement));
+            first = false;
+        }
+        let _ = first;
+        let meta = self.meta_of_node(n);
+        let blockers = self.meta_blockers_array(meta);
+        let has_await = self.an.metas[meta as usize].has_await;
+        let mut t = st.template.borrow_mut();
+        t.extend(create_child_block(vec![statement], blockers, has_await));
+        t.push(b::literal(BLOCK_CLOSE));
+    }
+
+    /// `context.visit(expression)` with the current template node on the path
+    pub fn visit_template_expr_here(&mut self, e: &Expr<'s>, st: &State) -> Node {
+        let node = self.convert_expr(e);
+        self.visit_js(&node, st)
+    }
+
+    fn each_block(&mut self, n: NodeId, st: &State) {
+        let ast = self.ast();
+        let TNode::EachBlock { expression, context, body, fallback, index, .. } = &ast.nodes[n] else { return };
+        let meta = self.an.node_meta.get(&n).cloned().unwrap_or_default();
+        // the collection is evaluated in the parent scope (the block's scope is the body's)
+        let collection = self.visit_template_expr_here(expression, st);
+        let index_id = if meta.contains_group_binding || index.is_none() {
+            b::id(self.an.sc.each_index.get(&n).cloned().unwrap_or_else(|| "$$index".into()).as_str())
+        } else {
+            b::id(index.as_deref().unwrap())
+        };
+        let array_id = self.an.sc.unique("each_array");
+        let mut statements = vec![b::r#const(b::id(array_id.as_str()), b::call("$.ensure_array_like", vec![collection]))];
+        let mut each = Vec::new();
+        if let Some(c) = context {
+            let pattern = self.convert_pattern(c);
+            each.push(b::r#let(pattern, b::member_with(b::id(array_id.as_str()), index_id.clone(), true, false)));
+        }
+        let index_name = super::super::js::ident(&index_id).map(str::to_string);
+        if let Some(i) = index {
+            if index_name.as_deref() != Some(i.as_str()) {
+                each.push(b::r#let(b::id(i.as_str()), index_id.clone()));
+            }
+        }
+        let body_scope = self.an.sc.each_scope.get(&n).copied().unwrap_or(st.scope);
+        let body_state = State { scope: body_scope, ..st.clone() };
+        let new_body = self.fragment(*body, Parent::Node(n), &body_state);
+        if let crate::estree::NodeKind::BlockStatement(bl) = new_body.kind {
+            each.extend(bl.body);
+        }
+        let for_loop = b::r#for(
+            Some(b::declaration(
+                "let",
+                vec![b::declarator(index_id.clone(), b::literal(0.0)), b::declarator(b::id("$$length"), b::member(b::id(array_id.as_str()), "length"))],
+            )),
+            Some(b::binary("<", index_id.clone(), b::id("$$length"))),
+            Some(b::update_with("++", index_id, false)),
+            b::block(each),
+        );
+        if let Some(f) = fallback {
+            let open = b::stmt(b::call(b::id("$$renderer.push"), vec![b::literal(BLOCK_OPEN)]));
+            let mut fallback_block = self.fragment(*f, Parent::Node(n), st);
+            prepend_block_marker(&mut fallback_block, BLOCK_OPEN_ELSE);
+            statements.push(b::r#if(
+                b::binary("!==", b::member(b::id(array_id.as_str()), "length"), b::literal(0.0)),
+                b::block(vec![open, for_loop]),
+                Some(fallback_block),
+            ));
+        } else {
+            st.template.borrow_mut().push(b::literal(BLOCK_OPEN));
+            statements.push(for_loop);
+        }
+        let em = self.meta_of_node(n);
+        let blockers = self.meta_blockers_array(em);
+        let has_await = self.an.metas[em as usize].has_await;
+        let mut t = st.template.borrow_mut();
+        t.extend(create_child_block(statements, blockers, has_await));
+        t.push(b::literal(BLOCK_CLOSE));
+    }
+
+    fn html_tag(&mut self, n: NodeId, expression: &'s Expr<'s>, st: &State) {
+        let e = self.visit_template_expr_here(expression, st);
+        let expression = b::call("$.html", vec![e]);
+        let meta = self.meta_of_node(n);
+        if self.meta_is_async(meta) {
+            let blockers = self.meta_blockers_array(meta);
+            let has_await = self.an.metas[meta as usize].has_await;
+            st.template.borrow_mut().extend(create_child_block(vec![b::stmt(b::call("$$renderer.push", vec![expression]))], blockers, has_await));
+        } else {
+            st.template.borrow_mut().push(expression);
+        }
+    }
+
+    fn await_block(&mut self, n: NodeId, st: &State) {
+        let ast = self.ast();
+        let TNode::AwaitBlock { expression, value, pending, then, .. } = &ast.nodes[n] else { return };
+        let meta = self.meta_of_node(n);
+        let mut expression = self.visit_template_expr_here(expression, st);
+        let has_await = self.an.metas[meta as usize].has_await;
+        if has_await {
+            expression = b::call(b::arrow_with(vec![], expression, true), ());
+        }
+        let pending_block = match pending {
+            Some(f) => self.fragment(*f, Parent::Node(n), st),
+            None => b::block(vec![]),
+        };
+        let params = match value {
+            Some(v) => {
+                let p = self.convert_pattern(v);
+                vec![self.visit_js(&p, st)]
+            }
+            None => vec![],
+        };
+        let then_block = match then {
+            Some(f) => self.fragment(*f, Parent::Node(n), st),
+            None => b::block(vec![]),
+        };
+        let statement = b::stmt(b::call(
+            "$.await",
+            vec![b::id("$$renderer"), expression, b::thunk(pending_block), b::arrow(params, then_block)],
+        ));
+        let blockers = self.meta_blockers_array(meta);
+        let mut t = st.template.borrow_mut();
+        t.extend(create_child_block(vec![statement], blockers, has_await));
+        t.push(b::literal(BLOCK_CLOSE));
+    }
+
+    fn snippet_block(&mut self, n: NodeId, st: &State) {
+        let ast = self.ast();
+        let TNode::SnippetBlock { expression, parameters, body, .. } = &ast.nodes[n] else { return };
+        let name = self.convert_expr(expression);
+        let mut params = vec![b::id("$$renderer")];
+        if let Some(arrow) = parameters {
+            let mut conv = crate::estree::convert::Converter::new(self.locator, self.an.root.ts);
+            conv.preserve_parens = true;
+            let converted = conv.expression(&arrow.expr);
+            if let crate::estree::NodeKind::ArrowFunctionExpression(a) = converted.kind {
+                params.extend(a.params);
+            }
+        }
+        let body_scope = self.scope_of_key(P::Fragment(*body).key()).unwrap_or(st.scope);
+        let body_block = self.fragment(*body, Parent::Node(n), &State { scope: body_scope, ..st.clone() });
+        let mut f = b::function_declaration(name.clone(), params, body_block);
+        let can_hoist = self.an.node_meta.get(&n).is_some_and(|m| m.can_hoist);
+        let mut out = Vec::new();
+        if self.dev {
+            if let crate::estree::NodeKind::FunctionDeclaration(fd) = &mut f.kind {
+                if let crate::estree::NodeKind::BlockStatement(bl) = &mut fd.body.kind {
+                    bl.body.insert(0, b::stmt(b::call("$.validate_snippet_args", vec![b::id("$$renderer")])));
+                }
+            }
+            out.push(b::stmt(b::call("$.prevent_snippet_stringification", vec![name])));
+        }
+        out.push(f);
+        if can_hoist {
+            self.hoisted.extend(out);
+        } else {
+            st.init.borrow_mut().extend(out);
+        }
+    }
+
+    fn render_tag(&mut self, n: NodeId, expression: &'s Expr<'s>, st: &State) {
+        let mut opt = PromiseOptimiser::default();
+        let call = self.convert_expr(expression);
+        let is_optional = matches!(call.kind, crate::estree::NodeKind::ChainExpression(_));
+        let inner = super::super::js::unwrap_optional(&call);
+        let crate::estree::NodeKind::CallExpression(c) = &inner.kind else { return };
+        let callee = self.visit_js(&c.callee, st);
+        let meta = self.meta_of_node(n);
+        let snippet_function = opt.transform(self, callee, meta);
+        let mut args = vec![b::id("$$renderer")];
+        // the argument metadata is keyed by the oxc arguments
+        let arg_metas: Vec<u32> = match expression {
+            Expr::Js(js) => {
+                let e = match js.inner() {
+                    oxc_ast::ast::Expression::ChainExpression(ch) => match &ch.expression {
+                        oxc_ast::ast::ChainElement::CallExpression(c) => Some(&**c),
+                        _ => None,
+                    },
+                    oxc_ast::ast::Expression::CallExpression(c) => Some(&**c),
+                    _ => None,
+                };
+                e.map(|c| c.arguments.iter().map(|a| self.an.meta_of.get(&crate::analyze::nodes::argument(a).key()).copied().unwrap_or(0)).collect()).unwrap_or_default()
+            }
+            _ => vec![],
+        };
+        for (i, a) in c.arguments.iter().enumerate() {
+            let v = self.visit_js(a, st);
+            let m = arg_metas.get(i).copied().unwrap_or(0);
+            args.push(opt.transform(self, v, m));
+        }
+        let statement = b::stmt(if is_optional { b::maybe_call(snippet_function, args) } else { b::call(snippet_function, args) });
+        st.template.borrow_mut().extend(opt.render_block(vec![statement]));
+        if !opt.is_async() && !st.is_standalone {
+            st.template.borrow_mut().push(b::literal(EMPTY_COMMENT));
+        }
+    }
+
+    fn debug_tag(&mut self, identifiers: &'s crate::ast::DebugArgs<'s>, st: &State) {
+        let ids: Vec<Node> = match identifiers {
+            crate::ast::DebugArgs::All => vec![],
+            crate::ast::DebugArgs::One(e) => vec![self.convert_expr(e)],
+            crate::ast::DebugArgs::Sequence(e) => match self.convert_expr(e).kind {
+                crate::estree::NodeKind::SequenceExpression(s) => s.expressions,
+                kind => vec![Node::new(kind)],
+            },
+        };
+        let mut blockers = Vec::new();
+        for id in &ids {
+            if let Some(name) = super::super::js::ident(id) {
+                if let Some(bl) = self.get(st.scope, name).and_then(|b| self.binding(b).blocker) {
+                    blockers.push(super::utils::blocker_expression(bl));
+                }
+            }
+        }
+        let mut props = Vec::new();
+        for id in &ids {
+            let v = self.visit_js(id, st);
+            props.push(b::prop("init", id.clone(), v));
+        }
+        st.template.borrow_mut().extend(create_child_block(
+            vec![b::stmt(b::call("console.log", vec![b::object(props)])), b::debugger()],
+            b::array(blockers),
+            false,
+        ));
+    }
+
+    fn title_element(&mut self, n: NodeId, st: &State) {
+        let ast = self.ast();
+        let TNode::Element(el) = &ast.nodes[n] else { return };
+        let children: Vec<Child<'s>> = ast.fragments[el.fragment].nodes.iter().map(|&c| Child::Node(c)).collect();
+        let inner = State { template: shared(), ..st.clone() };
+        inner.template.borrow_mut().push(b::literal("<title>"));
+        self.process_children(&children, &inner);
+        inner.template.borrow_mut().push(b::literal("</title>"));
+        let template = std::mem::take(&mut *inner.template.borrow_mut());
+        st.init.borrow_mut().push(b::stmt(b::call(
+            "$$renderer.title",
+            vec![b::arrow(vec![b::id("$$renderer")], b::block(build_template(template)))],
+        )));
+    }
+
+    fn svelte_head(&mut self, n: NodeId, st: &State) {
+        let ast = self.ast();
+        let TNode::Element(el) = &ast.nodes[n] else { return };
+        let block = self.fragment(el.fragment, Parent::Node(n), st);
+        st.template.borrow_mut().push(b::stmt(b::call(
+            "$.head",
+            vec![b::literal(super::super::hash(&self.filename).as_str()), b::id("$$renderer"), b::arrow(vec![b::id("$$renderer")], block)],
+        )));
     }
 
     // -----------------------------------------------------------------------------------

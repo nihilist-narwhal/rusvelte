@@ -341,6 +341,7 @@ impl<'s> Analyzer<'s> {
                 {
                     self.warn(Some(p), w::perf_avoid_inline_class());
                 }
+                self.needs_context = true;
                 self.next(p, st)
             }
             K::Class(c) if !c.is_expression() => {
@@ -705,11 +706,16 @@ impl<'s> Analyzer<'s> {
         let nargs = c.arguments.len();
 
         match rune {
-            None => {}
+            None => {
+                if !self.is_safe_identifier(nodes::expr(&c.callee), st.scope) {
+                    self.needs_context = true;
+                }
+            }
             Some("$bindable") => {
                 if nargs > 1 {
                     return Err(e::rune_invalid_arguments_length(loc, "$bindable", "zero or one arguments"));
                 }
+                self.needs_context = true;
                 let n = self.path.len();
                 let at = |i: usize| if n >= i { Some(self.path[n - i]) } else { None };
                 let ok = self.ty(parent) == "AssignmentPattern"
@@ -792,6 +798,7 @@ impl<'s> Analyzer<'s> {
                 if nargs != 1 {
                     return Err(e::rune_invalid_arguments_length(loc, r, "exactly one argument"));
                 }
+                self.needs_context = true;
             }
             Some("$effect.tracking") => {
                 if nargs != 0 {
