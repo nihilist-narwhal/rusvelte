@@ -2,16 +2,20 @@
 // (`phases/1-parse/acorn.js`: module, locations, comments collected with `onComment` and
 // block comments de-indented), print them with esrap's `ts({ comments })` language as
 // `phases/3-transform/index.js` does, and record the code and the source map's mappings.
-//   node gen_esrap.mjs <dir | @file-list> <out.json> [base dir for relative paths in the list]
-// A directory is searched for `**/*.js` and `**/*.mjs`. Minified files and files acorn can't
-// parse as a module are skipped (and listed with the reason).
+//   node gen_esrap.mjs [--keep-minified] <dir | @file-list> <out.json> [base dir for relative paths in the list]
+// A directory is searched for `**/*.js` and `**/*.mjs`. Minified files (unless
+// `--keep-minified`, e.g. for compiler output with long template strings) and files acorn
+// can't parse as a module are skipped (and listed with the reason).
 import { parse } from 'acorn';
 import { print } from 'esrap';
 import ts from 'esrap/languages/ts';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const [target, out, base_arg] = process.argv.slice(2);
+const args = process.argv.slice(2);
+const keep_minified = args[0] === '--keep-minified';
+if (keep_minified) args.shift();
+const [target, out, base_arg] = args;
 
 let base;
 let files;
@@ -71,7 +75,7 @@ for (const rel of files) {
 		continue;
 	}
 	if (source.charCodeAt(0) === 0xfeff) source = source.slice(1);
-	if (is_minified(source)) {
+	if (!keep_minified && is_minified(source)) {
 		skipped.push({ path: rel, reason: 'minified' });
 		continue;
 	}
