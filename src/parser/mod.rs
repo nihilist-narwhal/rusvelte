@@ -56,6 +56,14 @@ pub struct Parser<'a> {
     pub loc: Rc<Locator<'a>>,
     pub js: JsParser<'a>,
     pub builder: AstBuilder<'a>,
+    /// Warnings the parser emits (`w.*` calls in `phases/1-parse`)
+    pub warnings: Vec<crate::analyze::Warning>,
+}
+
+impl Parser<'_> {
+    pub fn warn(&mut self, start: usize, end: usize, w: crate::analyze::warnings::W) {
+        self.warnings.push(crate::analyze::Warning { code: w.code, message: w.message, position: Some((start, end)) });
+    }
 }
 
 /// An identifier read by `read_identifier` (the name may be empty)
@@ -86,7 +94,7 @@ fn script_lang(source: &str) -> Option<&str> {
                 continue;
             }
         } else if bytes[i..].starts_with(b"<script") && bytes.get(i + 7).is_some_and(|b| is_js_space(*b)) {
-            if let Some(lang) = lang_in_tag(&source[i + 7..]) {
+            if let Some(lang) = lang_in_tag(&source[i + 7..]).or_else(|| lang_after_attributes(&source[i + 7..])) {
                 return Some(lang);
             }
         }
@@ -105,6 +113,70 @@ fn is_js_space(b: u8) -> bool {
 
 /// `lang=(["'])?([^"' >]+)\1[^>]*>` somewhere inside the tag. With a greedy `[^>]*` before it,
 /// the regex prefers the last `lang=` in the tag that fits.
+/// The regex's second alternative, `(?:[^=>'"/]+=(?:"[^"]*"|'[^']*'|[^>\s]+)\s+)*lang=...`:
+/// attributes whose quoted values may contain `>` before `lang`
+fn lang_after_attributes(rest: &str) -> Option<&str> {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && is_js_space(bytes[i]) {
+        i += 1;
+    }
+    loop {
+        if rest[i..].starts_with("lang=") {
+            let after = &rest[i + 5..];
+            let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'');
+            let value_start = quote.map_or(0, |_| 1);
+            let value_len = after[value_start..].find(|c| matches!(c, '"' | '\'' | ' ' | '>')).unwrap_or(after.len() - value_start);
+            if value_len == 0 {
+                return None;
+            }
+            let value_end = value_start + value_len;
+            let closes = match quote {
+                Some(q) => after[value_end..].starts_with(q),
+                None => true,
+            };
+            // `[^>]*>`: the tag must end
+            if closes && after[value_end..].contains('>') {
+                return Some(&after[value_start..value_end]);
+            }
+            return None;
+        }
+        // name
+        let name_start = i;
+        while i < bytes.len() && !matches!(bytes[i], b'=' | b'>' | b'\'' | b'"' | b'/') {
+            i += 1;
+        }
+        if i == name_start || bytes.get(i) != Some(&b'=') {
+            return None;
+        }
+        i += 1;
+        // value
+        match bytes.get(i) {
+            Some(&q @ (b'"' | b'\'')) => {
+                let end = rest[i + 1..].find(q as char)?;
+                i += 1 + end + 1;
+            }
+            _ => {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'>' && !is_js_space(bytes[i]) {
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+            }
+        }
+        // whitespace
+        let ws_start = i;
+        while i < bytes.len() && is_js_space(bytes[i]) {
+            i += 1;
+        }
+        if i == ws_start {
+            return None;
+        }
+    }
+}
+
 fn lang_in_tag(rest: &str) -> Option<&str> {
     let tag_end = rest.find('>')?;
     let tag = &rest[..tag_end];
@@ -131,6 +203,35 @@ fn lang_in_tag(rest: &str) -> Option<&str> {
 
 /// Parse a component. `source` must already have its BOM removed.
 pub fn parse<'a>(alloc: &'a Allocator, source: &'a str, loc: Rc<Locator<'a>>, loose: bool) -> Result<(Ast<'a>, Root<'a>)> {
+    parse_collecting(alloc, source, loc, loose, None)
+}
+
+/// [`parse`], appending the parser's warnings to `warnings`
+pub fn parse_collecting<'a>(
+    alloc: &'a Allocator,
+    source: &'a str,
+    loc: Rc<Locator<'a>>,
+    loose: bool,
+    warnings: Option<&mut Vec<crate::analyze::Warning>>,
+) -> Result<(Ast<'a>, Root<'a>)> {
+    let result = parse_inner(alloc, source, loc, loose);
+    match result {
+        Ok((ast, root, w)) => {
+            if let Some(warnings) = warnings {
+                warnings.extend(w);
+            }
+            Ok((ast, root))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn parse_inner<'a>(
+    alloc: &'a Allocator,
+    source: &'a str,
+    loc: Rc<Locator<'a>>,
+    loose: bool,
+) -> Result<(Ast<'a>, Root<'a>, Vec<crate::analyze::Warning>)> {
     let template = js_trim_end(source);
 
     let ts = script_lang(source) == Some("ts");
@@ -165,6 +266,7 @@ pub fn parse<'a>(alloc: &'a Allocator, source: &'a str, loc: Rc<Locator<'a>>, lo
         js: JsParser::new(ts, loc.clone(), alloc),
         loc,
         builder: AstBuilder::new(alloc),
+        warnings: Vec::new(),
     };
 
     while parser.index < parser.template.len() {
@@ -219,7 +321,7 @@ pub fn parse<'a>(alloc: &'a Allocator, source: &'a str, loc: Rc<Locator<'a>>, lo
         }
     }
 
-    Ok((parser.ast, parser.root))
+    Ok((parser.ast, parser.root, parser.warnings))
 }
 
 impl<'a> Parser<'a> {

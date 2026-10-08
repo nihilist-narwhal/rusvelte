@@ -20,9 +20,24 @@ pub struct Locator<'s> {
     utf16: OnceCell<Vec<u32>>,
 }
 
+/// Whether the source contains `\u2028` or `\u2029` (E2 80 A8 / E2 80 A9)
+fn has_line_separator(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(p) = bytes[i..].iter().position(|&b| b == 0xE2) {
+        let j = i + p;
+        if bytes.get(j + 1) == Some(&0x80) && matches!(bytes.get(j + 2), Some(0xA8 | 0xA9)) {
+            return true;
+        }
+        i = j + 1;
+    }
+    false
+}
+
 impl<'s> Locator<'s> {
     pub fn new(source: &'s str) -> Self {
-        let lf_only = !source.as_bytes().contains(&b'\r') && !source.contains(['\u{2028}', '\u{2029}']);
+        let bytes = source.as_bytes();
+        // ` `/` ` start with 0xE2: only search for them when that byte occurs
+        let lf_only = !bytes.contains(&b'\r') && !has_line_separator(bytes);
         Locator {
             source,
             lf_only,
@@ -112,6 +127,12 @@ impl<'s> Locator<'s> {
         };
         let col = self.utf16(byte) - self.utf16(lines[line]);
         (line + 1, col)
+    }
+
+    /// Svelte's locator as numbers: (line, column, character)
+    pub fn line_column(&self, byte: usize) -> (usize, usize, usize) {
+        let (line, column) = self.line_col(self.lf_lines(), byte);
+        (line, column, self.utf16(byte))
     }
 
     /// Svelte's locator: `{ line, column, character }`

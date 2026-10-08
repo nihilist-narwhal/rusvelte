@@ -709,7 +709,9 @@ dependencies = [
  "oxc_span",
  "oxc_syntax",
  "regex",
+ "rustc-hash",
  "serde_json",
+ "smallvec",
  "unicode-id-start",
 ]
 
