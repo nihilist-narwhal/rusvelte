@@ -8,8 +8,8 @@ mod a11y;
 mod a11y_data;
 mod comments;
 mod css;
+mod acorn;
 mod nodes;
-mod redeclare;
 mod scope;
 mod ts;
 mod utils;
@@ -67,7 +67,7 @@ pub fn compile_diagnostics(source: &str, filename: &str) -> std::result::Result<
             let mut scripts: Vec<&crate::ast::Script> =
                 [&component.root.instance, &component.root.module].into_iter().flatten().collect();
             scripts.sort_by_key(|s| s.start);
-            let parse_error = scripts.iter().find_map(|s| redeclare::check(&s.content.program, component.root.ts));
+            let parse_error = scripts.iter().find_map(|s| acorn::check(&s.content.program, source, component.root.ts));
             let result = match parse_error {
                 Some(err) => Err(err),
                 None => analyze_component(&alloc, &component, source, filename, &mut warnings),
