@@ -192,11 +192,21 @@ pub struct PromiseOptimiser {
     pub has_await: bool,
     /// blocker objects, deduplicated by identity
     blockers: Vec<crate::analyze::blockers::Blocker>,
+    /// `(expression) => expression` in place of `optimiser.transform`
+    pub identity: bool,
 }
 
 impl PromiseOptimiser {
+    /// A transform that returns expressions unchanged
+    pub fn identity() -> Self {
+        PromiseOptimiser { identity: true, ..Default::default() }
+    }
+
     /// `transform(expression, metadata)`
     pub fn transform(&mut self, s: &Server, expression: Node, meta: u32) -> Node {
+        if self.identity {
+            return expression;
+        }
         self.check_blockers(s, meta);
         if s.an.metas[meta as usize].has_await {
             self.has_await = true;

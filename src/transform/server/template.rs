@@ -361,16 +361,24 @@ impl<'a, 's> Server<'a, 's> {
     }
 
     /// The ESTree form of a template expression
-    pub fn convert_expr(&self, e: &Expr<'s>) -> Node {
+    pub fn convert_expr(&self, e: &'s Expr<'s>) -> Node {
         match e {
             Expr::Js(js) => self.conv.expression(js.effective_root()),
-            Expr::Ident { name, .. } => b::id(name.as_str()),
+            Expr::Ident { name, start, end, loc } => {
+                let mut id = b::id(name.as_str());
+                id.span = Some(crate::estree::Span::new(*start as u32, *end as u32));
+                if matches!(loc, crate::ast::IdentLoc::Svelte) {
+                    id.loc = Some(self.conv.location(oxc_span::Span::new(*start as u32, *end as u32)));
+                }
+                id.origin = Some(P::TplExpr(e).key());
+                id
+            }
             Expr::Literal { value, .. } => b::literal(value.as_str()),
         }
     }
 
     /// `context.visit(expression)` for an expression of template node `n`
-    pub fn visit_template_expr(&mut self, n: NodeId, e: &Expr<'s>, st: &State) -> Node {
+    pub fn visit_template_expr(&mut self, n: NodeId, e: &'s Expr<'s>, st: &State) -> Node {
         let node = self.convert_expr(e);
         self.path.push(PathNode::Tpl(P::Node(n)));
         let out = self.visit_js(&node, st);
@@ -456,6 +464,21 @@ impl<'a, 's> Server<'a, 's> {
                     return;
                 }
                 "TitleElement" => self.title_element(n, st),
+                "SvelteElement" => self.svelte_element(n, st),
+                "SvelteBoundary" => self.svelte_boundary(n, st),
+                "SlotElement" => self.slot_element(n, st),
+                "SvelteFragment" => {
+                    let block = self.fragment(el.fragment, Parent::Node(n), st);
+                    st.template.borrow_mut().push(block);
+                }
+                "SvelteComponent" => {
+                    let e = el.expression.as_ref().map(|e| self.visit_template_expr_here(e, st)).unwrap_or_else(b::void0);
+                    self.build_inline_component(n, e, st);
+                }
+                "SvelteSelf" => {
+                    let name = self.an.name.clone();
+                    self.build_inline_component(n, b::id(name.as_str()), st);
+                }
                 "Component" => {
                     let expression = self.component_expression(el.name, st);
                     self.build_inline_component(n, expression, st);
@@ -553,7 +576,7 @@ impl<'a, 's> Server<'a, 's> {
     }
 
     /// `context.visit(expression)` with the current template node on the path
-    pub fn visit_template_expr_here(&mut self, e: &Expr<'s>, st: &State) -> Node {
+    pub fn visit_template_expr_here(&mut self, e: &'s Expr<'s>, st: &State) -> Node {
         let node = self.convert_expr(e);
         self.visit_js(&node, st)
     }
@@ -959,6 +982,180 @@ impl<'a, 's> Server<'a, 's> {
             st.init.borrow_mut().extend(init);
             st.template.borrow_mut().extend(template);
         }
+    }
+
+    fn svelte_element(&mut self, n: NodeId, st: &State) {
+        let ast = self.ast();
+        let TNode::Element(el) = &ast.nodes[n] else { return };
+        let mut tag = match &el.tag {
+            Some(t) => self.visit_template_expr_here(t, st),
+            None => b::void0(),
+        };
+        if self.dev {
+            if !matches!(tag.kind, crate::estree::NodeKind::Identifier(_)) {
+                let tag_id = self.an.sc.generate(st.scope, "$$tag");
+                st.init.borrow_mut().push(b::r#const(b::id(tag_id.as_str()), tag));
+                tag = b::id(tag_id.as_str());
+            }
+            st.init.borrow_mut().push(b::stmt(b::call("$.validate_dynamic_element_tag", vec![b::thunk(tag.clone())])));
+            if !ast.fragments[el.fragment].nodes.is_empty() {
+                st.init.borrow_mut().push(b::stmt(b::call("$.validate_void_dynamic_element", vec![b::thunk(tag.clone())])));
+            }
+        }
+        let meta = self.an.node_meta.get(&n).cloned().unwrap_or_default();
+        let namespace = if el.name == "foreignObject" { "html" } else if meta.svg { "svg" } else if meta.mathml { "mathml" } else { "html" };
+        let state = State { namespace, template: shared(), init: shared(), ..st.clone() };
+        let mut opt = PromiseOptimiser::default();
+        let mut statements = Vec::new();
+        self.build_element_attributes(n, &state, &mut opt);
+        if self.dev {
+            let (line, column) = self.locate(el.start);
+            statements.push(b::stmt(b::call("$.push_element", vec![b::id("$$renderer"), tag.clone(), b::literal(line as f64), b::literal(column as f64)])));
+        }
+        let mut attributes = std::mem::take(&mut *state.init.borrow_mut());
+        attributes.extend(build_template(std::mem::take(&mut *state.template.borrow_mut())));
+        let children = self.fragment(el.fragment, Parent::Node(n), &state);
+        let children_empty = matches!(&children.kind, crate::estree::NodeKind::BlockStatement(bl) if bl.body.is_empty());
+        let args = vec![
+            Some(b::id("$$renderer")),
+            Some(tag),
+            (!attributes.is_empty()).then(|| b::thunk(b::block(attributes))),
+            (!children_empty).then(|| b::thunk(children)),
+        ];
+        statements.extend(opt.render(vec![b::stmt(b::call("$.element", args))]));
+        if self.dev {
+            statements.push(b::stmt(b::call("$.pop_element", ())));
+        }
+        let em = self.meta_of_node(n);
+        let blockers = self.meta_blockers_array(em);
+        let has_await = self.an.metas[em as usize].has_await;
+        st.template.borrow_mut().extend(create_child_block(statements, blockers, has_await));
+    }
+
+    fn svelte_boundary(&mut self, n: NodeId, st: &State) {
+        use crate::ast::Attr;
+        let ast = self.ast();
+        let TNode::Element(el) = &ast.nodes[n] else { return };
+        let frag_nodes = &ast.fragments[el.fragment].nodes;
+        let snippet_named = |name: &str| {
+            frag_nodes.iter().copied().find(|&c| matches!(&ast.nodes[c], TNode::SnippetBlock { expression, .. } if crate::analyze::scope::ident(crate::analyze::nodes::template_expr(expression)).is_some_and(|i| i.name == name)))
+        };
+        let failed_snippet = snippet_named("failed");
+        let pending_snippet = snippet_named("pending");
+        let attr_named = |name: &str| el.attributes.iter().find(|a| matches!(a, Attr::Attribute { name: n, .. } if *n == name));
+        let failed_attribute = attr_named("failed");
+        let pending_attribute = attr_named("pending");
+        let is_pending_attr_nullish = match pending_attribute {
+            Some(Attr::Attribute { value: crate::ast::AttrValue::Expression(c), .. }) => match c.as_ref() {
+                crate::ast::Chunk::Expression { expression, .. } => !self.evaluate_expr(expression, st.scope).is_defined,
+                _ => false,
+            },
+            _ => false,
+        };
+        let children_nodes: Vec<NodeId> = frag_nodes.iter().copied().filter(|&c| Some(c) != failed_snippet && Some(c) != pending_snippet).collect();
+        let scope = self.scope_of_key(P::Fragment(el.fragment).key()).unwrap_or(st.scope);
+        let children_block = self.fragment_nodes(el.fragment, &children_nodes, Parent::Node(n), &State { scope, ..st.clone() });
+
+        let pending_attribute_block = |s: &mut Self, a: &'s Attr<'s>| -> (Node, Node) {
+            let Attr::Attribute { value, .. } = a else { unreachable!() };
+            let callee = s.build_attribute_value(value, st, &mut PromiseOptimiser::identity(), false, true, false);
+            let pending = b::call(callee.clone(), vec![b::id("$$renderer")]);
+            (callee, b::block(build_template(vec![b::literal(BLOCK_OPEN_ELSE), b::stmt(pending), b::literal(BLOCK_CLOSE)])))
+        };
+
+        let children_body = if pending_attribute.is_some() || pending_snippet.is_some() {
+            if pending_attribute.is_some() && is_pending_attr_nullish && pending_snippet.is_none() {
+                let (callee, pending_block) = pending_attribute_block(self, pending_attribute.unwrap());
+                b::block(vec![b::r#if(
+                    callee,
+                    pending_block,
+                    Some(b::block(build_template(vec![b::literal(BLOCK_OPEN), children_block, b::literal(BLOCK_CLOSE)]))),
+                )])
+            } else if let Some(a) = pending_attribute {
+                pending_attribute_block(self, a).1
+            } else {
+                let TNode::SnippetBlock { body, .. } = &ast.nodes[pending_snippet.unwrap()] else { unreachable!() };
+                self.path.push(PathNode::Tpl(P::Node(pending_snippet.unwrap())));
+                let block = self.fragment(*body, Parent::Node(pending_snippet.unwrap()), st);
+                self.path.pop();
+                b::block(build_template(vec![b::literal(BLOCK_OPEN_ELSE), block, b::literal(BLOCK_CLOSE)]))
+            }
+        } else {
+            b::block(build_template(vec![b::literal(BLOCK_OPEN), children_block, b::literal(BLOCK_CLOSE)]))
+        };
+
+        if failed_snippet.is_none() && failed_attribute.is_none() {
+            if let crate::estree::NodeKind::BlockStatement(bl) = children_body.kind {
+                st.template.borrow_mut().extend(bl.body);
+            }
+            return;
+        }
+        let mut props = Vec::new();
+        let init = shared();
+        if let (Some(Attr::Attribute { value, .. }), None) = (failed_attribute, failed_snippet) {
+            let callee = self.build_attribute_value(value, st, &mut PromiseOptimiser::identity(), false, true, false);
+            props.push(b::init("failed", callee));
+        } else if let Some(fs) = failed_snippet {
+            self.visit_node(fs, &State { init: init.clone(), ..st.clone() });
+            let TNode::SnippetBlock { expression, .. } = &ast.nodes[fs] else { unreachable!() };
+            props.push(b::init("failed", self.convert_expr(expression)));
+        }
+        let boundary = b::stmt(b::call("$$renderer.boundary", vec![b::object(props), b::arrow(vec![b::id("$$renderer")], children_body)]));
+        let init = std::mem::take(&mut *init.borrow_mut());
+        st.template.borrow_mut().push(if init.is_empty() {
+            boundary
+        } else {
+            let mut body = init;
+            body.push(boundary);
+            b::block(body)
+        });
+    }
+
+    fn slot_element(&mut self, n: NodeId, st: &State) {
+        use crate::ast::Attr;
+        let ast = self.ast();
+        let TNode::Element(el) = &ast.nodes[n] else { return };
+        let mut props = Vec::new();
+        let mut spreads = Vec::new();
+        let mut opt = PromiseOptimiser::default();
+        let mut name = b::literal("default");
+        for a in &el.attributes {
+            match a {
+                Attr::Spread { expression, .. } => {
+                    self.path.push(PathNode::Tpl(P::Attr(a)));
+                    let e = self.visit_template_expr_here(expression, st);
+                    self.path.pop();
+                    let meta = self.an.meta_of.get(&P::Attr(a).key()).copied().unwrap_or(0);
+                    spreads.push(opt.transform(self, e, meta));
+                }
+                Attr::Attribute { name: attr_name, value, .. } => {
+                    let v = self.build_attribute_value(value, st, &mut opt, false, true, false);
+                    if *attr_name == "name" {
+                        name = v;
+                    } else if *attr_name != "slot" {
+                        props.push(b::init(attr_name, v));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let props_expression = if spreads.is_empty() {
+            b::object(props)
+        } else {
+            let mut all = vec![b::object(props)];
+            all.extend(spreads);
+            b::call("$.spread_props", vec![b::array(all)])
+        };
+        let fallback = if ast.fragments[el.fragment].nodes.is_empty() {
+            b::null()
+        } else {
+            b::thunk(self.fragment(el.fragment, Parent::Node(n), st))
+        };
+        let slot = b::call("$.slot", vec![b::id("$$renderer"), b::id("$$props"), name, props_expression, fallback]);
+        let mut t = st.template.borrow_mut();
+        t.push(b::literal(BLOCK_OPEN));
+        t.extend(opt.render_block(vec![b::stmt(slot)]));
+        t.push(b::literal(BLOCK_CLOSE));
     }
 
     /// `is_customizable_select_element(node)`

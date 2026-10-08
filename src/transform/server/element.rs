@@ -48,7 +48,7 @@ fn starts_with_newline(s: &str) -> bool {
 
 impl<'a, 's> Server<'a, 's> {
     /// `context.visit(expression)` from an element visitor (the element is on the path)
-    pub fn visit_expr_here(&mut self, e: &Expr<'s>, st: &State) -> Node {
+    pub fn visit_expr_here(&mut self, e: &'s Expr<'s>, st: &State) -> Node {
         let node = self.convert_expr(e);
         self.visit_js(&node, st)
     }
