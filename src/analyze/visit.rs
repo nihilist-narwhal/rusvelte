@@ -200,6 +200,8 @@ impl<'s> Analyzer<'s> {
                 Ok(())
             }
             P::Chunk(Chunk::Expression { .. }) => {
+                // the `ExpressionTag` visitor
+                self.mark_subtree_dynamic();
                 let meta = self.new_meta(p);
                 self.next(p, &State { expression: Some(meta), ..*st })
             }
@@ -2493,7 +2495,33 @@ impl<'s> Analyzer<'s> {
             }
         }
 
-        // TODO: `<select bind:value>` in legacy mode records `legacy_indirect_bindings`
+        // `<select bind:value={foo}><option>{bar}</option>`: `bar` is invalidated when `foo` is mutated
+        if el.name == "select" && !self.runes {
+            for a in &el.attributes {
+                let Attr::Directive { kind: "BindDirective", name: "value", expression: Some(e), .. } = a else { continue };
+                let ep = nodes::template_expr(e);
+                if matches!(ep, P::Js(AstKind::SequenceExpression(_))) {
+                    continue;
+                }
+                let binding = scope::object(ep).and_then(|id| self.get(st.scope, id.name));
+                if let Some(b) = binding {
+                    let own = self.binding(b).node.name;
+                    let names: Vec<&'s str> = self.sc.scope(st.scope).ref_names.iter().copied().collect();
+                    for name in names {
+                        if name == own {
+                            continue;
+                        }
+                        if let Some(indirect) = self.get(st.scope, name) {
+                            let list = self.legacy_indirect_bindings.entry(b).or_default();
+                            if !list.contains(&indirect) {
+                                list.push(indirect);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
 
         // `<option>{expr}</option>`: the expression tag becomes its value
         if el.name == "option"
@@ -3763,7 +3791,7 @@ pub fn export_let_unused(an: &mut Analyzer) {
 }
 
 /// `order_reactive_statements`: only the cycle check matters for diagnostics
-pub fn order_reactive_statements(an: &Analyzer) -> Res {
+pub fn order_reactive_statements(an: &mut Analyzer) -> Res {
     let mut lookup: Vec<(&str, Vec<usize>)> = Vec::new();
     for (i, rs) in an.reactive_statements.iter().enumerate() {
         for &b in &rs.assignments {
@@ -3791,6 +3819,34 @@ pub fn order_reactive_statements(an: &Analyzer) -> Res {
             return Err(e::reactive_declaration_cycle((rs.node_start, rs.node_end), &cycle.join(" → ")));
         }
     }
+
+    // topological order: each statement after the statements assigning its dependencies
+    fn add_declaration(an: &Analyzer, i: usize, lookup: &[(&str, Vec<usize>)], sorted: &mut Vec<usize>) {
+        if sorted.contains(&i) {
+            return;
+        }
+        let rs = &an.reactive_statements[i];
+        for &d in &rs.dependencies {
+            if rs.assignments.contains(&d) {
+                continue;
+            }
+            let name = an.binding(d).node.name;
+            if let Some((_, earlier)) = lookup.iter().find(|(k, _)| *k == name) {
+                for &e in earlier {
+                    add_declaration(an, e, lookup, sorted);
+                }
+            }
+        }
+        if !sorted.contains(&i) {
+            sorted.push(i);
+        }
+    }
+    let mut sorted: Vec<usize> = Vec::new();
+    for i in 0..an.reactive_statements.len() {
+        add_declaration(an, i, &lookup, &mut sorted);
+    }
+    let mut old: Vec<Option<super::ReactiveStatement>> = std::mem::take(&mut an.reactive_statements).into_iter().map(Some).collect();
+    an.reactive_statements = sorted.into_iter().map(|i| old[i].take().unwrap()).collect();
     Ok(())
 }
 

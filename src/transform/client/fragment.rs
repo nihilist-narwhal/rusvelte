@@ -116,6 +116,16 @@ pub fn is_text_attribute(value: &AttrValue) -> bool {
 }
 
 thread_local! {
+    /// The `value` attribute the analysis makes out of a `<textarea>`'s dynamic children (its
+    /// value is filled in from the textarea's fragment)
+    pub static TEXTAREA_VALUE: &'static Attr<'static> = Box::leak(Box::new(Attr::Attribute {
+        start: usize::MAX,
+        end: usize::MAX,
+        name: "value",
+        name_loc: None,
+        value: AttrValue::Sequence(vec![]),
+    }));
+
     /// The `class=""`/`style=""` attributes the analysis appends (`create_attribute`)
     static SYNTHETIC: (&'static Attr<'static>, &'static Attr<'static>) = {
         let make = |name: &'static str| -> &'static Attr<'static> {
@@ -136,6 +146,9 @@ impl<'a, 's> Client<'a, 's> {
     pub fn element_attributes(&self, n: NodeId) -> Vec<&'s Attr<'s>> {
         let TNode::Element(el) = &self.ast().nodes[n] else { return vec![] };
         let mut out: Vec<&'s Attr<'s>> = el.attributes.iter().collect();
+        if self.an.textarea_values.contains(&n) {
+            out.push(TEXTAREA_VALUE.with(|a| *a));
+        }
         if self.synthetic_class.contains(&n) {
             out.push(SYNTHETIC.with(|s| s.0));
         }

@@ -4,11 +4,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::analyze::nodes::P;
+use super::super::js::PathNode;
 use crate::ast::{Attr, AttrValue, Chunk, Node as TNode, NodeId};
 use crate::estree::builders as b;
 use crate::estree::{LiteralValue, Node, NodeKind};
 
-use super::super::js::PathNode;
 use super::fragment::{is_text_attribute, Initial};
 use super::template::{escape_html, Template};
 use super::utils::{ChunkRef, Memoize};
@@ -17,6 +17,9 @@ use super::{shared, Client, Memoizer, State, TEMPLATE_FRAGMENT};
 impl<'a, 's> Client<'a, 's> {
     /// `build_attribute_value(value, context, memoize)`
     pub fn build_attribute_value(&mut self, value: &'s AttrValue<'s>, st: &State, how: Memoize, local: &mut Option<Memoizer>) -> (Node, bool) {
+        if let Some(n) = self.textarea_value_owner(value) {
+            return self.build_textarea_value(n, st, how, local);
+        }
         let chunks: &'s [Chunk<'s>] = match value {
             AttrValue::True => return (b::r#true(), false),
             AttrValue::Expression(c) => std::slice::from_ref(&**c),
@@ -42,6 +45,51 @@ impl<'a, 's> Client<'a, 's> {
             })
             .collect();
         self.build_template_chunk(&values, &[], st, how, local)
+    }
+
+    /// The `<textarea>` whose children make up this (synthetic) `value` attribute
+    fn textarea_value_owner(&self, value: &AttrValue) -> Option<NodeId> {
+        let is_synthetic = super::fragment::TEXTAREA_VALUE.with(|a| match a {
+            Attr::Attribute { value: v, .. } => std::ptr::eq(v as *const AttrValue, value as *const AttrValue),
+            _ => false,
+        });
+        if !is_synthetic {
+            return None;
+        }
+        self.path.iter().rev().find_map(|p| match p {
+            PathNode::Tpl(P::Node(n)) if self.an.textarea_values.contains(n) => Some(*n),
+            _ => None,
+        })
+    }
+
+    /// `build_attribute_value` of the `value` made of a `<textarea>`'s children
+    fn build_textarea_value(&mut self, n: NodeId, st: &State, how: Memoize, local: &mut Option<Memoizer>) -> (Node, bool) {
+        let ast = self.ast();
+        let TNode::Element(el) = &ast.nodes[n] else { return (b::r#true(), false) };
+        let nodes = &ast.fragments[el.fragment].nodes;
+        let mut texts = Vec::new();
+        let mut values = Vec::new();
+        for (i, &c) in nodes.iter().enumerate() {
+            match &ast.nodes[c] {
+                TNode::Text { data, .. } => {
+                    let d = if i == 0 { data.strip_prefix("\r\n").or_else(|| data.strip_prefix('\n')).unwrap_or(data) } else { data };
+                    texts.push(d.to_string());
+                    values.push(ChunkRef::OwnedText(texts.len() - 1));
+                }
+                TNode::ExpressionTag { expression, .. } => values.push(ChunkRef::Expr(expression, P::Node(c).key())),
+                _ => {}
+            }
+        }
+        if values.len() == 1 {
+            if let ChunkRef::Expr(expression, key) = values[0] {
+                let meta = self.meta_of_key(key);
+                let e = self.build_expression(expression, meta, st);
+                let has_state = self.an.metas[meta as usize].has_state || self.meta_is_async(meta);
+                let v = self.memoize(how, e, meta, st, local);
+                return (v, has_state);
+            }
+        }
+        self.build_template_chunk(&values, &texts, st, how, local)
     }
 
     /// `get_attribute_name(element, attribute)`
@@ -569,7 +617,8 @@ impl<'a, 's> Client<'a, 's> {
             preserve_whitespace: st.preserve_whitespace || name == "pre" || name == "textarea",
             ..st.clone()
         };
-        let frag_nodes = ast.fragments[el.fragment].nodes.clone();
+        // a `<textarea>`'s dynamic children were moved into its `value`
+        let frag_nodes = if self.an.textarea_values.contains(&n) { vec![] } else { ast.fragments[el.fragment].nodes.clone() };
         let cleaned = self.clean_nodes(
             super::fragment::Parent::Node(n),
             &frag_nodes,
@@ -648,7 +697,7 @@ impl<'a, 's> Client<'a, 's> {
             }
         }
 
-        let has_snippet = ast.fragments[el.fragment].nodes.iter().any(|&c| matches!(ast.nodes[c], TNode::SnippetBlock { .. }));
+        let has_snippet = frag_nodes.iter().any(|&c| matches!(ast.nodes[c], TNode::SnippetBlock { .. }));
         if has_snippet || has_declarations {
             if let Some(ac) = child_state.async_consts.borrow().as_ref() {
                 if !ac.thunks.is_empty() {
@@ -707,7 +756,7 @@ impl<'a, 's> Client<'a, 's> {
 
         if !has_spread && name == "select" {
             let default_value = attributes.iter().copied().find(|a| matches!(a, Attr::Attribute { name, .. } if self.get_attribute_name(n, name) == "defaultValue"));
-            if let Some(dv @ Attr::Attribute { value, .. }) = default_value {
+            if let Some(Attr::Attribute { value, .. }) = default_value {
                 let mut none = None;
                 let (v, has_state) = self.build_attribute_value(value, st, Memoize::State, &mut none);
                 if has_state { st.update.borrow_mut() } else { st.init.borrow_mut() }
@@ -742,7 +791,7 @@ impl<'a, 's> Client<'a, 's> {
         }
         if name == "defaultValue"
             && (attributes.iter().any(|a| matches!(a, Attr::Attribute { name: "value", value, .. } if is_text_attribute(value)))
-                || (el.name == "textarea" && !self.ast().fragments[el.fragment].nodes.is_empty()))
+                || (el.name == "textarea" && !self.ast().fragments[el.fragment].nodes.is_empty() && !self.an.textarea_values.contains(&n)))
         {
             return b::call("$.set_default_value", vec![node_id.clone(), value]);
         }

@@ -837,7 +837,7 @@ pub(crate) fn analyze_component<'s>(
         visit::non_reactive_updates(&mut an);
     } else {
         visit::export_let_unused(&mut an);
-        visit::order_reactive_statements(&an)?;
+        visit::order_reactive_statements(&mut an)?;
     }
 
     visit::module_exports(&an)?;
