@@ -43,6 +43,7 @@ pub struct CheckOptions {
     pub timings: bool,
     /// keep generated files, tsgo's build info and compiler warnings between runs
     pub incremental: bool,
+    pub watch: writer::WatchOutput,
 }
 
 const SHIMS: [(&str, &str); 2] = [
@@ -334,7 +335,7 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
         }
     }
 
-    let summary = writer::write(out, opts.format, opts.threshold, &workspace, &by_file, opts.colors).map_err(|e| e.to_string())?;
+    let summary = writer::write(out, opts.format, opts.threshold, &workspace, &by_file, opts.colors, opts.watch).map_err(|e| e.to_string())?;
     Ok(summary)
 }
 
@@ -937,6 +938,64 @@ fn map_compiler_diagnostics(path: &Path, result: CompilerResult, settings: &Hash
                 message,
                 position_unknown: false,
             }]
+        }
+    }
+}
+
+// --- watch mode -----------------------------------------------------------------------------
+
+/// The files a change to which triggers a new run (svelte-check's watcher filter)
+fn watched_files(dir: &Path, cache: &Path, out: &mut Vec<(PathBuf, std::time::SystemTime, u64)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let path = e.path();
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let Ok(meta) = e.metadata() else { continue };
+        if meta.is_dir() {
+            if name == "node_modules" || name == ".git" || path == cache {
+                continue;
+            }
+            watched_files(&path, cache, out);
+        } else {
+            static ENDING: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| regex::Regex::new(r"\.(svelte|d\.ts|ts|js|jsx|tsx|mjs|cjs|mts|cts)$").unwrap());
+            static VITE_TIMESTAMP: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| regex::Regex::new(r"vite\.config\.(js|ts)\.timestamp-").unwrap());
+            if ENDING.is_match(&name) && !VITE_TIMESTAMP.is_match(&name) {
+                out.push((path, meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len()));
+            }
+        }
+    }
+}
+
+/// `--watch`: run, then run again a second after files stop changing
+pub fn watch(opts: &CheckOptions, out: &mut impl std::io::Write) -> ! {
+    let workspace = normalize(&opts.workspace);
+    let cache = cache_dir(&workspace);
+    let snapshot = || {
+        let mut files = Vec::new();
+        watched_files(&workspace, &cache, &mut files);
+        files.sort();
+        files
+    };
+    let mut last = snapshot();
+    loop {
+        if let Err(e) = run(opts, out) {
+            let _ = writeln!(out, "{e}");
+        }
+        let _ = out.flush();
+        // wait for a change, then for a quiet second
+        let mut changed_at: Option<std::time::Instant> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let now = snapshot();
+            if now != last {
+                last = now;
+                changed_at = Some(std::time::Instant::now());
+            } else if changed_at.is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+                break;
+            }
         }
     }
 }

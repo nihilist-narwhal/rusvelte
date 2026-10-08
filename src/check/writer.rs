@@ -71,13 +71,24 @@ fn position_json(p: Position) -> Value {
 }
 
 /// `writeDiagnostics`: write everything, return the counts
-pub fn write(out: &mut impl Write, format: Format, threshold: Option<Threshold>, workspace: &std::path::Path, files: &[FileDiagnostics], colors: bool) -> std::io::Result<Summary> {
+/// How the human writer behaves in watch mode
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WatchOutput {
+    pub watching: bool,
+    /// clear the screen before each run (not with `--preserveWatchOutput`, and only on a terminal)
+    pub clear_screen: bool,
+}
+
+pub fn write(out: &mut impl Write, format: Format, threshold: Option<Threshold>, workspace: &std::path::Path, files: &[FileDiagnostics], colors: bool, watch: WatchOutput) -> std::io::Result<Summary> {
     let c = Colors(colors);
     let ws = workspace.to_string_lossy();
     let keep = |d: &Diagnostic| match threshold {
         Some(Threshold::Error) => d.severity == Severity::Error,
         _ => true,
     };
+    if matches!(format, Format::Human | Format::HumanVerbose) && watch.watching && watch.clear_screen {
+        write!(out, "\x1b[2J\x1b[H")?;
+    }
     match format {
         Format::Human => {}
         Format::HumanVerbose => {
@@ -177,6 +188,9 @@ pub fn write(out: &mut impl Write, format: Format, threshold: Option<Threshold>,
                 c.green(&message)
             };
             write!(out, "{colored}")?;
+            if watch.watching {
+                write!(out, "Watching for file changes...")?;
+            }
         }
         Format::Machine | Format::MachineVerbose => writeln!(
             out,

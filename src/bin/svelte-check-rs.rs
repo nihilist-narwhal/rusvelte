@@ -22,6 +22,8 @@ fn main() {
     let mut compiler_warnings = HashMap::new();
     let mut timings = false;
     let mut incremental = false;
+    let mut watch = false;
+    let mut preserve_watch_output = false;
     let mut colors = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     while let Some(a) = args.next() {
         let (flag, inline) = match a.split_once('=') {
@@ -62,6 +64,8 @@ fn main() {
             "--no-color" => colors = false,
             "--timings" => timings = true,
             "--incremental" => incremental = true,
+            "--watch" => watch = true,
+            "--preserveWatchOutput" => preserve_watch_output = true,
             "--tsgo" => {}
             other => fail(&format!("unknown option {other}")),
         }
@@ -83,7 +87,16 @@ fn main() {
         threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
         timings,
         incremental,
+        watch: svelte_rs::check::writer::WatchOutput {
+            watching: watch,
+            clear_screen: !preserve_watch_output && std::io::stdout().is_terminal(),
+        },
     };
+    if watch {
+        let stdout = std::io::stdout();
+        let mut out = LineFlush(stdout.lock());
+        svelte_rs::check::watch(&opts, &mut out);
+    }
     let start = std::time::Instant::now();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
@@ -107,4 +120,18 @@ fn main() {
 fn fail(msg: &str) -> ! {
     eprintln!("{msg}");
     std::process::exit(1)
+}
+
+/// Flushes after every write, so watch output shows up right away
+struct LineFlush<W: std::io::Write>(W);
+
+impl<W: std::io::Write> std::io::Write for LineFlush<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.0.write(buf)?;
+        self.0.flush()?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
