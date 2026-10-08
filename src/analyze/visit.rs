@@ -6,7 +6,7 @@ use oxc_ast::ast::*;
 
 use super::nodes::{self, P, Res};
 use super::scope::{self, BindingId, DeclKind, Id, Kind, get_rune, ident, is_member, is_reference, object};
-use super::utils::{self, chunks, is_event_attribute, is_expression_value, text_value, value_expression};
+use super::utils::{self, is_event_attribute, is_expression_value, text_value, value_expression};
 use super::{Analyzer, AstType, ReactiveStatement, State, StateField, warnings as w};
 use crate::ast::{Attr, AttrValue, Chunk, Expr, Node, NodeId, Pattern};
 use crate::errors as e;
@@ -298,9 +298,11 @@ impl<'s> Analyzer<'s> {
                     _ => unreachable!(),
                 };
                 if let (Some(o), Some(pr)) = (ident(obj), ident(prop)) {
-                    if let Some(b) = self.get(st.scope, o.name) {
-                        if self.binding(b).kind == Kind::RestProp && pr.name.starts_with("$$") {
-                            return Err(e::props_illegal_name(self.loc(prop)));
+                    if pr.name.starts_with("$$") {
+                        if let Some(b) = self.get(st.scope, o.name) {
+                            if self.binding(b).kind == Kind::RestProp {
+                                return Err(e::props_illegal_name(self.loc(prop)));
+                            }
                         }
                     }
                 }
@@ -739,7 +741,7 @@ impl<'s> Analyzer<'s> {
             let depth = st.function_depth + 1;
             self.next(
                 p,
-                &State { function_depth: depth, derived_function_depth: depth as i32, expression: Some(meta), ..*st },
+                &State { function_depth: depth, expression: Some(meta), ..*st },
             )?;
             if st.in_declaration_tag && self.metas[meta as usize].has_await {
                 if let Some(m) = self.meta(st.expression) {
@@ -921,7 +923,7 @@ impl<'s> Analyzer<'s> {
         let mut fields: Vec<(String, Vec<&'static str>)> = Vec::new();
         let mut constructor: Option<&'s MethodDefinition<'s>> = None;
 
-        let mut handle = |an: &Self,
+        let handle = |an: &Self,
                           state_fields: &mut Vec<StateField>,
                           fields: &Vec<(String, Vec<&'static str>)>,
                           node: P<'s>,
@@ -1781,7 +1783,7 @@ impl<'s> Analyzer<'s> {
         self.visit_child(
             p,
             nodes::template_expr(init),
-            &State { expression: Some(meta), function_depth: depth, derived_function_depth: depth as i32, ..*st },
+            &State { expression: Some(meta), function_depth: depth, ..*st },
         )
     }
 
@@ -2852,7 +2854,12 @@ fn illegal_attribute_character(name: &str) -> bool {
     if name.as_bytes().first().is_some_and(|b| b.is_ascii_digit() || *b == b'-' || *b == b'.') {
         return true;
     }
-    name.bytes().any(|b| b"^$@%&#?!|()[]{}*+~;".contains(&b))
+    name.bytes().any(|b| {
+        matches!(
+            b,
+            b'^' | b'$' | b'@' | b'%' | b'&' | b'#' | b'?' | b'!' | b'|' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'*' | b'+' | b'~' | b';'
+        )
+    })
 }
 
 /// `/^[ \t\n\r\f]+$/`

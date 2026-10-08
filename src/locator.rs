@@ -20,12 +20,24 @@ pub struct Locator<'s> {
     utf16: OnceCell<Vec<u32>>,
 }
 
+/// Whether the source contains `\u2028` or `\u2029` (E2 80 A8 / E2 80 A9)
+fn has_line_separator(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(p) = bytes[i..].iter().position(|&b| b == 0xE2) {
+        let j = i + p;
+        if bytes.get(j + 1) == Some(&0x80) && matches!(bytes.get(j + 2), Some(0xA8 | 0xA9)) {
+            return true;
+        }
+        i = j + 1;
+    }
+    false
+}
+
 impl<'s> Locator<'s> {
     pub fn new(source: &'s str) -> Self {
         let bytes = source.as_bytes();
         // ` `/` ` start with 0xE2: only search for them when that byte occurs
-        let lf_only = !bytes.contains(&b'\r')
-            && !bytes.windows(3).any(|w| w[0] == 0xE2 && w[1] == 0x80 && (w[2] == 0xA8 || w[2] == 0xA9));
+        let lf_only = !bytes.contains(&b'\r') && !has_line_separator(bytes);
         Locator {
             source,
             lf_only,

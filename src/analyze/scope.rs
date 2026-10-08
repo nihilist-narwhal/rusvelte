@@ -125,14 +125,38 @@ impl Scope<'_> {
 #[derive(Debug, Default)]
 pub struct DeclMap<'s> {
     entries: smallvec::SmallVec<[(&'s str, BindingId); 2]>,
+    /// a cheap hash of each name, for scanning
+    hashes: smallvec::SmallVec<[u32; 2]>,
     index: Option<Box<FxHashMap<&'s str, usize>>>,
+}
+
+/// A cheap hash of a name (length and first/last bytes), to skip most string comparisons
+#[inline]
+pub fn name_hash(name: &str) -> u32 {
+    let b = name.as_bytes();
+    match b.len() {
+        0 => 0,
+        n => (n as u32) << 16 | (b[0] as u32) << 8 | b[n - 1] as u32,
+    }
 }
 
 impl<'s> DeclMap<'s> {
     pub fn get(&self, name: &str) -> Option<&BindingId> {
+        self.get_hashed(name, name_hash(name))
+    }
+
+    #[inline]
+    pub fn get_hashed(&self, name: &str, hash: u32) -> Option<&BindingId> {
         match &self.index {
             Some(index) => index.get(name).map(|&i| &self.entries[i].1),
-            None => self.entries.iter().find(|(k, _)| *k == name).map(|(_, b)| b),
+            None => {
+                for (i, &h) in self.hashes.iter().enumerate() {
+                    if h == hash && self.entries[i].0 == name {
+                        return Some(&self.entries[i].1);
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -150,6 +174,7 @@ impl<'s> DeclMap<'s> {
             Some(i) => self.entries[i].1 = b,
             None => {
                 self.entries.push((name, b));
+                self.hashes.push(name_hash(name));
                 let i = self.entries.len() - 1;
                 match &mut self.index {
                     Some(index) => {
@@ -162,10 +187,6 @@ impl<'s> DeclMap<'s> {
                 }
             }
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -236,9 +257,10 @@ impl<'s> Scopes<'s> {
     }
 
     pub fn get(&self, mut scope: ScopeId, name: &str) -> Option<BindingId> {
+        let hash = name_hash(name);
         loop {
             let s = &self.scopes[scope as usize];
-            if let Some(b) = s.declared(name) {
+            if let Some(&b) = s.declarations.get_hashed(name, hash) {
                 return Some(b);
             }
             scope = s.lookup_parent?;
@@ -329,12 +351,13 @@ impl<'s> Scopes<'s> {
     }
 
     fn add_reference(&mut self, mut scope: ScopeId, name: &'s str, r: RefId) {
+        let hash = name_hash(name);
         loop {
             let s = &mut self.scopes[scope as usize];
             if s.track_refs {
                 s.references.entry(name).or_default().push(r);
             }
-            if let Some(b) = s.declared(name) {
+            if let Some(&b) = s.declarations.get_hashed(name, hash) {
                 self.bindings[b as usize].references.push(r);
                 return;
             }

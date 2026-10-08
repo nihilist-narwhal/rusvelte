@@ -110,36 +110,24 @@ fn is_unscoped_pseudo_class(s: &SimpleSelector) -> bool {
         || args.as_ref().is_some_and(|a| a.children.iter().all(|c| c.children.iter().all(is_global_relative)))
 }
 
-fn is_outer_global(r: &Rel) -> bool {
-    let mut sels = r.iter();
-    match sels.next() {
-        Some(Sel::Real(SimpleSelector::PseudoClass { name, args, .. })) if name == "global" => {
-            args.is_none()
-                || r.iter().all(|s| {
-                    matches!(s, Sel::Real(SimpleSelector::PseudoClass { .. } | SimpleSelector::PseudoElement { .. }))
-                })
-        }
-        _ => false,
-    }
-}
 
 // ---------------------------------------------------------------------------------------
 // css-analyze.js
 
-enum CssP<'c> {
-    Rule(&'c Rule),
+/// The kinds of node in a CSS path (only `PseudoClass` is ever looked at)
+enum CssP {
+    Rule,
     Atrule,
     Block,
     SelectorList,
     Complex,
     Relative,
     PseudoClass,
-    Other,
 }
 
 struct AnalyzeWalker<'m, 'c> {
     meta: &'m mut Meta<'c>,
-    path: Vec<CssP<'c>>,
+    path: Vec<CssP>,
 }
 
 fn is_global_block_selector(s: &SimpleSelector) -> bool {
@@ -221,7 +209,7 @@ impl<'m, 'c> AnalyzeWalker<'m, 'c> {
             }
         }
 
-        self.path.push(CssP::Rule(node));
+        self.path.push(CssP::Rule);
         self.selector_list(&node.prelude, Some(node))?;
         for complex in &node.prelude.children {
             if self.meta.complex_is_global.contains(&addr(complex)) {
@@ -1047,11 +1035,11 @@ where
         let name_lower: &str = &name_lower;
         let el = self.an.element(n).unwrap();
         let textarea_value = if self.an.textarea_values.contains(&n) { Some(()) } else { None };
-        let attrs = el.attributes.iter().map(AttrView::Attr).chain(textarea_value.map(|_| AttrView::TextareaValue(n)));
+        let attrs = el.attributes.iter().map(AttrView::Attr).chain(textarea_value.map(|_| AttrView::TextareaValue));
         for attribute in attrs {
             let a = match attribute {
                 AttrView::Attr(a) => a,
-                AttrView::TextareaValue(_) => {
+                AttrView::TextareaValue => {
                     if name_lower != "value" {
                         continue;
                     }
@@ -1619,7 +1607,16 @@ fn test_attribute(operator: Option<&str>, expected: &str, case_insensitive: bool
 fn test_attribute_exact(operator: Option<&str>, expected: &str, value: &str) -> bool {
     match operator {
         Some("=") => value == expected,
-        Some("~=") => value.split(is_js_whitespace).any(|v| v == expected),
+        Some("~=") => {
+            if value.is_ascii() {
+                value
+                    .as_bytes()
+                    .split(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+                    .any(|v| v == expected.as_bytes())
+            } else {
+                value.split(is_js_whitespace).any(|v| v == expected)
+            }
+        }
         Some("|=") => format!("{value}-").starts_with(&format!("{expected}-")),
         Some("^=") => value.starts_with(expected),
         Some("$=") => value.ends_with(expected),
@@ -1647,7 +1644,8 @@ const CASE_INSENSITIVE_ATTRIBUTES: &[&str] = &[
 
 enum AttrView<'s> {
     Attr(&'s Attr<'s>),
-    TextareaValue(NodeId),
+    /// the `value` attribute made of a `<textarea>`'s children
+    TextareaValue,
 }
 
 enum ChunkView<'a, 's> {

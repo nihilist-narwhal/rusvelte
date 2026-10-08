@@ -9,6 +9,7 @@ mod a11y_data;
 mod comments;
 mod css;
 mod nodes;
+mod redeclare;
 mod scope;
 mod ts;
 mod utils;
@@ -21,7 +22,7 @@ use oxc_ast::AstKind;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ast::{Ast, Attr, FragId, Node, NodeId, Root};
-use crate::error::{CompileError, Loc, Result};
+use crate::error::{Loc, Result};
 use crate::errors as e;
 use crate::locator::Locator;
 use nodes::P;
@@ -62,7 +63,15 @@ pub fn compile_diagnostics(source: &str, filename: &str) -> std::result::Result<
     let mut warnings = Vec::new();
     let (result, locator) = match crate::parse_with_warnings(&alloc, source, &mut warnings) {
         Ok(component) => {
-            let result = analyze_component(&alloc, &component, source, filename, &mut warnings);
+            // acorn's scope checks happen while parsing each script
+            let mut scripts: Vec<&crate::ast::Script> =
+                [&component.root.instance, &component.root.module].into_iter().flatten().collect();
+            scripts.sort_by_key(|s| s.start);
+            let parse_error = scripts.iter().find_map(|s| redeclare::check(&s.content.program, component.root.ts));
+            let result = match parse_error {
+                Some(err) => Err(err),
+                None => analyze_component(&alloc, &component, source, filename, &mut warnings),
+            };
             (result, component.locator.clone())
         }
         Err(err) => (Err(err), std::rc::Rc::new(Locator::new(source))),
@@ -122,7 +131,6 @@ pub(crate) struct State<'s> {
     pub function_depth: u32,
     /// index into `Analyzer::reactive_statements`
     pub reactive_statement: Option<u32>,
-    pub derived_function_depth: i32,
 }
 
 pub(crate) struct ReactiveStatement {
@@ -163,7 +171,6 @@ pub(crate) struct Analyzer<'s> {
     pub name: String,
     pub module_scope: ScopeId,
     pub instance_scope: ScopeId,
-    pub template_scope: ScopeId,
     pub module_program: Option<P<'s>>,
     pub instance_program: Option<P<'s>>,
     pub uses_slots: bool,
@@ -380,7 +387,6 @@ fn analyze_component<'s>(
         name: String::new(),
         module_scope: module.scope,
         instance_scope: instance.scope,
-        template_scope: template.scope,
         module_program,
         instance_program,
         uses_slots: false,
@@ -579,7 +585,6 @@ fn analyze_component<'s>(
             state_fields: 0,
             function_depth: an.sc.scope(scope).function_depth,
             reactive_statement: None,
-            derived_function_depth: -1,
         };
         an.has_props_rune = false;
         an.component_slots.push(FxHashSet::default());

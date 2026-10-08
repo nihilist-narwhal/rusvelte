@@ -98,13 +98,6 @@ impl<'s> P<'s> {
         }
     }
 
-    pub fn js(&self) -> Option<AstKind<'s>> {
-        match *self {
-            P::Js(k) => Some(k),
-            _ => None,
-        }
-    }
-
     /// `start`, if the node has one
     pub fn start(&self, ast: &Ast) -> Option<usize> {
         self.span(ast).map(|s| s.0)
