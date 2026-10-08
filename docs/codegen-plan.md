@@ -1,7 +1,7 @@
 # Plan: a Rust Svelte compiler (phase 3, code generation)
 
 Goal: `compile(source, options)` producing the same `js.code` and `css.code` as Svelte 5.57.2
-(`svelte-upstream` at 707c281), byte for byte, verified by diffing against the JS compiler
+(`svelte-upstream` at 707c281), with identical output, verified by diffing against the JS compiler
 over large corpora, as every earlier layer was.
 
 What exists: parser, legacy AST, analysis diagnostics (`src/analyze/`), CSS pruning,

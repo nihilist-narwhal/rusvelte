@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rusvelte</title>
-<meta name="description" content="An experimental Rust port of the Svelte 5 compiler and svelte-check, verified byte-for-byte against the official tools.">
+<meta name="description" content="An experimental Rust port of the Svelte 5 compiler and svelte-check, checked for identical output against the official tools.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ff3e00'/%3E%3Cpath d='M9 22V10h7a4 4 0 0 1 0 8h-7m7 0 5 4' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
 :root {
@@ -148,8 +148,8 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
   <main>
     <div class="hero">
       <span class="tag">Experimental · not affiliated with the Svelte team</span>
-      <h1>The Svelte 5 compiler, in Rust.<br><em>Byte for byte.</em></h1>
-      <p class="lede">rusvelte is a port of the Svelte 5 compiler and svelte-check to Rust. Every layer is checked against the official JavaScript tools: on four real-world codebases its compiled output is identical, character for character, to Svelte 5.57.2's.</p>
+      <h1>The Svelte 5 compiler, in Rust.<br><em>Identical output.</em></h1>
+      <p class="lede">rusvelte is a port of the Svelte 5 compiler and svelte-check to Rust. Every layer is checked against the official JavaScript tools: on four real-world codebases its compiled output is identical to Svelte 5.57.2's.</p>
       <div class="cta">
         <a class="btn primary repo-link" href="#">View the source</a>
         <a class="btn ghost" href="#parity">See the numbers</a>
@@ -157,7 +157,7 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
     </div>
 
     <div class="stats">
-      <div class="stat"><b>5,786 / 5,786</b><span>real-world compilations byte-identical (client and server)</span></div>
+      <div class="stat"><b>5,786 / 5,786</b><span>real-world compilations identical to the official compiler's (client and server)</span></div>
       <div class="stat"><b>3.8× – 5.9×</b><span>faster compile than the official compiler, single-threaded</span></div>
       <div class="stat"><b>7.9×</b><span>faster full <code>svelte-check</code> on a 1,982-component app</span></div>
     </div>
@@ -192,8 +192,8 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
           <tbody>
             <tr><td>Parser (modern and legacy AST)</td><td>4,567 / 4,567 Svelte test files</td></tr>
             <tr><td>Compiler warnings and errors</td><td>4,564 / 4,567 Svelte test files; all of Immich and bits-ui; svelte-check's warnings on Windmill</td></tr>
-            <tr><td>CSS output (<code>css.code</code>)</td><td>byte-identical on every compilation above</td></tr>
-            <tr><td>JS printer (port of esrap)</td><td>byte-identical code and source map mappings on 16,470 JS files</td></tr>
+            <tr><td>CSS output (<code>css.code</code>)</td><td>identical on every compilation above</td></tr>
+            <tr><td>JS printer (port of esrap)</td><td>identical code and source map mappings on 16,470 JS files</td></tr>
             <tr><td>svelte2tsx</td><td>Windmill 1,982 / 1,982; Svelte tests 4,566 / 4,567</td></tr>
             <tr><td>svelte-check-rs diagnostics</td><td>identical to <code>svelte-check --tsgo</code> on Windmill (7,922 diagnostics)</td></tr>
           </tbody>
@@ -231,7 +231,7 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
       <p class="sub">The port follows the official source function by function, and nothing counts as done until it matches.</p>
       <div class="cards">
         <div class="card"><h3>An oracle for every layer</h3><p>Node scripts run the official tool over a corpus and record its exact output, options included: ASTs, warnings, generated JS and CSS, TypeScript overlays, diagnostics.</p></div>
-        <div class="card"><h3>Diff, group, fix</h3><p>A Rust binary per layer reruns the same inputs, compares byte for byte and groups mismatches by their first differing line, so the biggest gap is always next.</p></div>
+        <div class="card"><h3>Diff, group, fix</h3><p>A Rust binary per layer reruns the same inputs, compares the output exactly and groups mismatches by their first differing line, so the biggest gap is always next.</p></div>
         <div class="card"><h3>Real code, not just tests</h3><p>Svelte's own suites cover the edge cases. Windmill, Immich and bits-ui cover what people actually write: legacy components, runes classes, snippets, async.</p></div>
         <div class="card"><h3>Variants for coverage</h3><p>Corpora are recompiled with <code>dev</code>, <code>hmr</code>, custom elements, injected CSS, runes forced on or off and TypeScript, to push the code down every path.</p></div>
       </div>

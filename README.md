@@ -4,6 +4,11 @@ An experimental Rust port of the Svelte 5 compiler and tooling, including a fast
 inside components is parsed with [oxc](https://oxc.rs). Every layer is checked against the JS
 original by diffing outputs over large corpora.
 
+Most of the code was written with [Claude Code](https://claude.com/claude-code), Anthropic's coding
+agent, under human direction. Nothing is taken on trust: every result in the tables below comes
+from comparing against the official JavaScript tools, and the scripts to rerun them are in
+`oracle/`.
+
 - **Parser**: `parse(source, { modern: true })` and the legacy AST from `svelte/compiler`
   5.57.2.
 - **svelte2tsx**: the component-to-TypeScript transform from `svelte2tsx` 0.7.61, which
@@ -26,10 +31,10 @@ original by diffing outputs over large corpora.
 | svelte-check-rs, TypeScript diagnostics | identical to `svelte-check --tsgo` 4.7.6 on the private app (2,477 diagnostics under strict options) and Windmill (7,922) |
 | svelte-check-rs, compiler warnings | identical to svelte-check on the private app and Windmill (89 warnings) |
 | svelte-check-rs, CSS diagnostics (`css`/`scss`/`less`) | identical to svelte-check on Windmill (96 warnings in all); the CSS linter matches svelte-check's on 4,567/4,567 Svelte tests, Windmill, the private app and 47,072 synthetic files |
-| CSS output (`css.code`, `css.hasGlobal`, injected styles) | byte-identical on every component of the code generation oracle (Svelte test suites 6,929 compilations, the private app 342, Windmill 3,964), plus `dev`/`css: 'injected'` variants and the CSS linter's 31,418 synthetic files (1 differs: oxc rejects a mangled TypeScript expression acorn accepts) |
-| Client code generation (`compile`, `generate: 'client'`, `js.code`) | byte-identical on every client compilation of the code generation oracle: Svelte test suites (runtime-runes 1,408, runtime-legacy 1,657, hydration 98, css 187/188: a `cssHash` function the harness can't call, snapshot 33), the private app 171, Windmill 1,982, bits-ui 226, immich 411, language-tools 668; also with `dev`, `hmr`, `fragments: 'tree'`, `experimental.async`, `customElement`, `css: 'injected'`, `compatibility.componentApi: 4` variants, and the runes/legacy/TypeScript/custom-element variants of the test suites and Windmill |
-| Module code generation (`compileModule`, client and server, `js.code`) | byte-identical on every module of the code generation oracle, both modes: bits-ui 58, immich 45 (7 more are `.svelte.ts` files type stripping can't handle), Windmill 116, runtime-runes 20, runtime-legacy 1, snapshot 3, language-tools 8, the private app 1, also with `dev` and the other variants; the error code matches on the 34 modules of Svelte's compiler-errors and validator samples that fail |
-| JS printer (esrap 2.4.0 `ts({ comments })`) | byte-identical code and source map mappings on 16,470 JS files: Svelte's snapshot expectations 74/74, Svelte's sources 368/368, `node_modules` 4,747/4,747 (oracle and a Windmill sample, minified files included), and the compiler's output for every component of the code generation oracle re-parsed (Svelte test suites 6,975, the private app 342, Windmill 3,964) |
+| CSS output (`css.code`, `css.hasGlobal`, injected styles) | identical on every component of the code generation oracle (Svelte test suites 6,929 compilations, the private app 342, Windmill 3,964), plus `dev`/`css: 'injected'` variants and the CSS linter's 31,418 synthetic files (1 differs: oxc rejects a mangled TypeScript expression acorn accepts) |
+| Client code generation (`compile`, `generate: 'client'`, `js.code`) | identical on every client compilation of the code generation oracle: Svelte test suites (runtime-runes 1,408, runtime-legacy 1,657, hydration 98, css 187/188: a `cssHash` function the harness can't call, snapshot 33), the private app 171, Windmill 1,982, bits-ui 226, immich 411, language-tools 668; also with `dev`, `hmr`, `fragments: 'tree'`, `experimental.async`, `customElement`, `css: 'injected'`, `compatibility.componentApi: 4` variants, and the runes/legacy/TypeScript/custom-element variants of the test suites and Windmill |
+| Module code generation (`compileModule`, client and server, `js.code`) | identical on every module of the code generation oracle, both modes: bits-ui 58, immich 45 (7 more are `.svelte.ts` files type stripping can't handle), Windmill 116, runtime-runes 20, runtime-legacy 1, snapshot 3, language-tools 8, the private app 1, also with `dev` and the other variants; the error code matches on the 34 modules of Svelte's compiler-errors and validator samples that fail |
+| JS printer (esrap 2.4.0 `ts({ comments })`) | identical code and source map mappings on 16,470 JS files: Svelte's snapshot expectations 74/74, Svelte's sources 368/368, `node_modules` 4,747/4,747 (oracle and a Windmill sample, minified files included), and the compiler's output for every component of the code generation oracle re-parsed (Svelte test suites 6,975, the private app 342, Windmill 3,964) |
 
 The remaining svelte2tsx mismatches are 2 scripts that oxc can't parse but TypeScript
 recovers from, and 2 samples where npm 0.7.61 throws but the current language-tools source
