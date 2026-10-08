@@ -9,7 +9,8 @@
 //! Positions are UTF-16 offsets, like JavaScript string indices.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Once;
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Mutex, Once, OnceLock};
 
 use napi_derive::napi;
 use rusvelte::transform::{self, options::CompileOptions};
@@ -18,13 +19,43 @@ use serde_json::{Value, json};
 /// `compile(source, options)`
 #[napi]
 pub fn compile(source: String, options: String) -> String {
-    run(&source, &options, false)
+    on_worker(source, options, false)
 }
 
 /// `compileModule(source, options)`
 #[napi(js_name = "compileModule")]
 pub fn compile_module(source: String, options: String) -> String {
-    run(&source, &options, true)
+    on_worker(source, options, true)
+}
+
+/// The analysis and transform recurse over the template and the scripts' syntax trees, and a
+/// stack overflow aborts the whole process (it can't be caught like a panic). So compilations
+/// run on one long-lived thread with a large stack; its memory is only committed as it's used.
+const WORKER_STACK: usize = 256 << 20;
+
+type Job = (String, String, bool, Sender<String>);
+
+fn on_worker(source: String, options: String, module: bool) -> String {
+    static WORKER: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (tx, rx) = channel::<Job>();
+        std::thread::Builder::new()
+            .name("rusvelte".into())
+            .stack_size(WORKER_STACK)
+            .spawn(move || {
+                for (source, options, module, reply) in rx {
+                    let _ = reply.send(run(&source, &options, module));
+                }
+            })
+            .expect("spawn the rusvelte compile thread");
+        Mutex::new(tx)
+    });
+    let (reply, result) = channel();
+    let sent = worker.lock().map(|tx| tx.send((source, options, module, reply)).is_ok()).unwrap_or(false);
+    match (sent, result.recv()) {
+        (true, Ok(json)) => json,
+        _ => json!({ "unsupported": "the compile thread is unavailable" }).to_string(),
+    }
 }
 
 /// The Svelte version whose output this build reproduces
@@ -69,26 +100,34 @@ fn run(source: &str, options: &str, module: bool) -> String {
     .to_string()
 }
 
-/// Byte offsets → UTF-16 offsets
-struct Utf16Offsets<'a> {
-    source: &'a str,
-    ascii: bool,
+/// Byte offsets → UTF-16 offsets, through one table built per non-ASCII source
+struct Utf16Offsets {
+    /// the UTF-16 offset of each byte offset (empty for ASCII sources, where they're equal)
+    table: Vec<u32>,
 }
 
-impl<'a> Utf16Offsets<'a> {
-    fn new(source: &'a str) -> Self {
-        Utf16Offsets { source, ascii: source.is_ascii() }
+impl Utf16Offsets {
+    fn new(source: &str) -> Self {
+        if source.is_ascii() {
+            return Utf16Offsets { table: Vec::new() };
+        }
+        let mut table = Vec::with_capacity(source.len() + 1);
+        let mut utf16 = 0u32;
+        for c in source.chars() {
+            // bytes inside a character map to its start
+            for _ in 0..c.len_utf8() {
+                table.push(utf16);
+            }
+            utf16 += c.len_utf16() as u32;
+        }
+        table.push(utf16);
+        Utf16Offsets { table }
     }
 
     fn of(&self, byte: usize) -> usize {
-        if self.ascii {
+        if self.table.is_empty() {
             return byte;
         }
-        let end = byte.min(self.source.len());
-        let mut end = end;
-        while !self.source.is_char_boundary(end) {
-            end -= 1;
-        }
-        self.source[..end].encode_utf16().count()
+        self.table[byte.min(self.table.len() - 1)] as usize
     }
 }

@@ -3,7 +3,11 @@
 #
 # - Push a tag `v<version>` matching packages/rusvelte/package.json to publish (needs the
 #   NPM_TOKEN secret).
-# - Run it by hand (Actions → Release → Run workflow) for a dry run: everything but the upload.
+# - Run it by hand (Actions → Release → Run workflow) for a dry run: everything but the upload,
+#   whichever branch or tag it runs on.
+#
+# Actions are pinned to commits and build tools to versions, so a compromised upstream release
+# can't change what gets built and published; update the pins deliberately.
 #
 # Linux builds target glibc 2.17 (cargo-zigbuild), so they load on old distributions too.
 name: Release
@@ -30,23 +34,23 @@ jobs:
           - { target: x86_64-pc-windows-msvc, os: windows-latest, lib: rusvelte_node.dll, test: native }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       - name: Build
         if: ${{ !matrix.zig }}
-        run: cargo build --release -p rusvelte-node --target ${{ matrix.target }}
+        run: cargo build --locked --release -p rusvelte-node --target ${{ matrix.target }}
       - name: Build (zig)
         if: ${{ matrix.zig }}
         env:
           # a cdylib for musl must link the C runtime dynamically
           RUSTFLAGS: ${{ contains(matrix.target, 'musl') && '-C target-feature=-crt-static' || '' }}
         run: |
-          pip install cargo-zigbuild ziglang
-          cargo zigbuild --release -p rusvelte-node --target ${{ matrix.zig }}
+          pip install cargo-zigbuild==0.23.4 ziglang==0.16.0
+          cargo zigbuild --locked --release -p rusvelte-node --target ${{ matrix.zig }}
       - name: Collect
         shell: bash
         run: |
@@ -59,7 +63,7 @@ jobs:
       - name: Test (Alpine)
         if: ${{ matrix.test == 'alpine' }}
         run: docker run --rm -v "$PWD:/w" -w /w node:24-alpine node packages/rusvelte/npm/smoke-test.cjs dist/rusvelte.${{ matrix.target }}.node
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rusvelte.${{ matrix.target }}
           path: dist/rusvelte.${{ matrix.target }}.node
@@ -71,17 +75,17 @@ jobs:
       contents: read
       id-token: write # npm provenance
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
       - name: Check the tag matches the package version
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         run: |
           version=$(node -p "require('./packages/rusvelte/package.json').version")
           test "v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != package version $version"; exit 1; }
@@ -91,8 +95,8 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          # a tag publishes; a manual run is a dry run
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then DRY_RUN=""; else DRY_RUN="--dry-run"; fi
+          # only a pushed tag publishes; a manual run is always a dry run
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/tags/* ]]; then DRY_RUN=""; else DRY_RUN="--dry-run"; fi
           # the platform packages first, so the main package's optional dependencies exist;
           # versions already on npm (from an earlier, partly failed run) are skipped
           for dir in npm-out/platform-* npm-out/compiler; do
@@ -101,7 +105,7 @@ jobs:
             (cd "$dir" && npm publish --access public --provenance $DRY_RUN)
           done
       - name: Deprecate the unscoped packages of the first attempt
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         continue-on-error: true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

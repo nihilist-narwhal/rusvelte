@@ -492,6 +492,9 @@ pub struct Root<'a> {
 pub struct Ast<'a> {
     pub nodes: Vec<Node<'a>>,
     pub fragments: Vec<Fragment>,
+    /// The deepest nesting of template nodes the parser saw (its stack is explicit; the passes
+    /// after it recurse, so `transform::compile` declines templates nested deeper than it can)
+    pub max_depth: usize,
 }
 
 impl<'a> Ast<'a> {

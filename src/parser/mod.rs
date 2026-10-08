@@ -454,6 +454,7 @@ impl<'a> Parser<'a> {
     }
 
     pub fn pop(&mut self) -> Option<Open> {
+        self.ast.max_depth = self.ast.max_depth.max(self.stack.len());
         if let Some(f) = self.fragments.pop() {
             // a fragment with declaration tags gets its own scope
             let fragment = &self.ast.fragments[f];

@@ -189,12 +189,56 @@ pub struct CompileOutput {
     pub runes: bool,
 }
 
-/// `compile(source, options)` (only `generate: 'server'` so far)
+/// Templates nested deeper than this are declined (`unsupported`): the analysis and transform
+/// recurse per level, and Svelte's own compiler already overflows its stack well before it
+pub const MAX_TEMPLATE_DEPTH: usize = 1000;
+
+/// `compile(source, options)`
 pub fn compile(source: &str, options: &options::CompileOptions) -> Result<CompileOutput, CompileError> {
+    analyze::evaluate::take_unrepresentable();
+    let output = compile_component(source, options)?;
+    if analyze::evaluate::take_unrepresentable() {
+        return Err(unrepresentable());
+    }
+    Ok(output)
+}
+
+/// A constant the JS compiler folds exactly can't be represented (see `evaluate::UNREPRESENTABLE`)
+fn unrepresentable() -> CompileError {
+    CompileError { code: "unsupported", message: "a constant expression can't be represented exactly".into(), position: None }
+}
+
+/// `deprecate(...)` in `validate-options.js`: each deprecated option is warned about once per
+/// process (`warn_once`), before anything else
+fn deprecated_option_warnings(options: &options::CompileOptions, warnings: &mut Vec<Warning>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ACCESSORS: AtomicBool = AtomicBool::new(false);
+    static IMMUTABLE: AtomicBool = AtomicBool::new(false);
+    for &key in &options.deprecated {
+        let (warned, w) = match key {
+            "accessors" => (&ACCESSORS, analyze::warnings::options_deprecated_accessors()),
+            "immutable" => (&IMMUTABLE, analyze::warnings::options_deprecated_immutable()),
+            _ => continue,
+        };
+        if !warned.swap(true, Ordering::Relaxed) {
+            warnings.push(Warning { code: w.code, message: w.message, position: None });
+        }
+    }
+}
+
+fn compile_component(source: &str, options: &options::CompileOptions) -> Result<CompileOutput, CompileError> {
     let alloc = Allocator::default();
     let mut warnings: Vec<Warning> = Vec::new();
+    deprecated_option_warnings(options, &mut warnings);
     let component = crate::parse_with_warnings(&alloc, source, &mut warnings)
         .map_err(|err| analyze::acorn::reword_parse_error(err, source))?;
+    if component.ast.max_depth > MAX_TEMPLATE_DEPTH {
+        return Err(CompileError {
+            code: "unsupported",
+            message: format!("the template is nested more than {MAX_TEMPLATE_DEPTH} levels deep"),
+            position: None,
+        });
+    }
     let root = &component.root;
     let mut scripts: Vec<&crate::ast::Script> = [&root.instance, &root.module].into_iter().flatten().collect();
     scripts.sort_by_key(|s| s.start);
@@ -400,6 +444,15 @@ pub const VERSION: &str = "5.57.2";
 /// `compileModule(source, options)`: a `.svelte.js` module (JavaScript with runes). Only
 /// `filename`, `generate`, `dev`, `rootDir` and `experimental` matter.
 pub fn compile_module(source: &str, options: &options::CompileOptions) -> Result<CompileOutput, CompileError> {
+    analyze::evaluate::take_unrepresentable();
+    let output = compile_module_inner(source, options)?;
+    if analyze::evaluate::take_unrepresentable() {
+        return Err(unrepresentable());
+    }
+    Ok(output)
+}
+
+fn compile_module_inner(source: &str, options: &options::CompileOptions) -> Result<CompileOutput, CompileError> {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let alloc = Allocator::default();
     let locator = std::rc::Rc::new(crate::locator::Locator::new(source));
@@ -593,6 +646,7 @@ fn clone_simple(o: &options::CompileOptions) -> options::CompileOptions {
         preserve_whitespace: o.preserve_whitespace,
         runes: o.runes,
         hmr: o.hmr,
+        deprecated: o.deprecated.clone(),
     }
 }
 

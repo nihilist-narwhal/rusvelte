@@ -32,7 +32,13 @@ export let native = null;
 export let load_error = null;
 try {
 	native = load();
+	// a build from another rusvelte version may not have this API
+	if (typeof native.compile !== 'function' || typeof native.compileModule !== 'function' || typeof native.svelteVersion !== 'function') {
+		throw new Error('it lacks compile, compileModule or svelteVersion');
+	}
+	native.version = native.svelteVersion();
 } catch (e) {
+	native = null;
 	const where = process.env.RUSVELTE_NATIVE ?? platform_package();
 	load_error = `no native module for ${process.platform}-${process.arch} (${where}): ${e.message.split('\n')[0]}`;
 }
@@ -40,4 +46,4 @@ try {
 export const compile = native?.compile;
 export const compileModule = native?.compileModule;
 /** The Svelte version whose output this build reproduces */
-export const svelteVersion = native?.svelteVersion() ?? null;
+export const svelteVersion = native?.version ?? null;

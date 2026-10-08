@@ -128,7 +128,7 @@ fn main() {
                         out.css.as_ref().map_or("", |c| c.code.as_str()),
                         &source,
                     )
-                } else if check_warnings && record.get("warnings").is_some() && warnings_json(&out.warnings) != record["warnings"] {
+                } else if check_warnings && record.get("warnings").is_some() && warnings_json(&out.warnings, &source) != record["warnings"] {
                     let expected: Vec<String> = record["warnings"].as_array().unwrap().iter().map(|w| w["code"].as_str().unwrap_or("").to_string()).collect();
                     let actual: Vec<&str> = out.warnings.iter().map(|w| w.code).collect();
                     (format!("warnings differ: expected {expected:?} got {actual:?}"), String::new())
@@ -194,12 +194,20 @@ fn shorten(s: &str) -> String {
     s
 }
 
-/// The warnings as the oracle records them: `[{ code, position }]`
-fn warnings_json(warnings: &[rusvelte::analyze::Warning]) -> Value {
+/// The warnings as the oracle records them: `[{ code, position }]`, positions in UTF-16 code
+/// units like JavaScript's (the compiler's are byte offsets; the Node binding converts them too)
+fn warnings_json(warnings: &[rusvelte::analyze::Warning], source: &str) -> Value {
+    let utf16 = |byte: usize| -> usize {
+        let mut end = byte.min(source.len());
+        while !source.is_char_boundary(end) {
+            end -= 1;
+        }
+        source[..end].encode_utf16().count()
+    };
     Value::Array(
         warnings
             .iter()
-            .map(|w| serde_json::json!({ "code": w.code, "position": w.position.map(|(s, e)| vec![s, e]) }))
+            .map(|w| serde_json::json!({ "code": w.code, "position": w.position.map(|(s, e)| vec![utf16(s), utf16(e)]) }))
             .collect(),
     )
 }

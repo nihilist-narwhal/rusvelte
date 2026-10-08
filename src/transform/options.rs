@@ -50,6 +50,9 @@ pub struct CompileOptions {
     /// `runes` (`None`: inferred)
     pub runes: Option<bool>,
     pub hmr: bool,
+    /// deprecated options that were given (`accessors`, `immutable`): `validate-options.js`
+    /// warns about them, once per process
+    pub deprecated: Vec<&'static str>,
 }
 
 impl Default for CompileOptions {
@@ -74,6 +77,7 @@ impl Default for CompileOptions {
             preserve_whitespace: false,
             runes: None,
             hmr: false,
+            deprecated: Vec::new(),
         }
     }
 }
@@ -117,6 +121,11 @@ impl CompileOptions {
         o.preserve_whitespace = bool_of("preserveWhitespace", false);
         o.runes = v.get("runes").and_then(Value::as_bool);
         o.hmr = bool_of("hmr", false);
+        for key in ["accessors", "immutable"] {
+            if v.get(key).is_some() {
+                o.deprecated.push(key);
+            }
+        }
         o
     }
 }

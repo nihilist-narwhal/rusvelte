@@ -239,7 +239,7 @@ impl<'a, 's> Ctx<'a, 's> {
             P::Js(K::NumericLiteral(n)) => add(values, Val::Num(n.value)),
             P::Js(K::BooleanLiteral(b)) => add(values, Val::Bool(b.value)),
             P::Js(K::NullLiteral(_)) => add(values, Val::Null),
-            P::Js(K::BigIntLiteral(b)) => add(values, b.value.parse::<i128>().map_or(Val::Unknown, Val::BigInt)),
+            P::Js(K::BigIntLiteral(b)) => add(values, b.value.parse::<i128>().ok().or_else(unrepresentable).map_or(Val::Unknown, Val::BigInt)),
             P::Js(K::RegExpLiteral(r)) => add(values, Val::RegExp(nodes::addr(&K::RegExpLiteral(r)), format!("/{}/{}", r.regex.pattern.text, r.regex.flags))),
             P::Js(K::IdentifierReference(_)) | P::TplExpr(Expr::Ident { .. }) => self.identifier(expression, scope, values),
             P::Js(K::BinaryExpression(e)) => self.binary(e, scope, values),
@@ -469,7 +469,7 @@ fn unary(op: UnaryOperator, v: &Val) -> Val {
         UnaryOperator::Void => Val::Undefined,
         UnaryOperator::Typeof => Val::Str(v.type_of().into()),
         UnaryOperator::UnaryNegation => match v {
-            Val::BigInt(n) => Val::BigInt(-n),
+            Val::BigInt(n) => n.checked_neg().or_else(unrepresentable).map_or(Val::Unknown, Val::BigInt),
             v => v.to_number().map_or(Val::Unknown, |n| Val::Num(-n)),
         },
         UnaryOperator::UnaryPlus => v.to_number().map_or(Val::Unknown, Val::Num),
@@ -491,8 +491,8 @@ fn loose_equals(a: &Val, b: &Val) -> bool {
         (Val::RegExp(..), _) => loose_equals(&a.to_primitive(), b),
         (_, Val::RegExp(..)) => loose_equals(a, &b.to_primitive()),
         (Val::Num(n), Val::Str(s)) | (Val::Str(s), Val::Num(n)) => *n == s.as_str().string_to_number(),
-        (Val::BigInt(n), Val::Num(m)) | (Val::Num(m), Val::BigInt(n)) => (*n as f64) == *m,
-        (Val::BigInt(n), Val::Str(s)) | (Val::Str(s), Val::BigInt(n)) => s.trim().parse::<i128>().is_ok_and(|x| x == *n),
+        (Val::BigInt(n), Val::Num(m)) | (Val::Num(m), Val::BigInt(n)) => compare_bigint_number(*n, *m) == Some(std::cmp::Ordering::Equal),
+        (Val::BigInt(n), Val::Str(s)) | (Val::Str(s), Val::BigInt(n)) => string_to_bigint(s) == Some(*n),
         _ => false,
     }
 }
@@ -505,6 +505,63 @@ fn strict_equals(a: &Val, b: &Val) -> bool {
 }
 
 /// Abstract relational comparison `a < b` (None for undefined)
+thread_local! {
+    /// Set when a constant the JS compiler would fold exactly can't be represented here (a
+    /// BigInt beyond 128 bits, a string with a lone surrogate): `transform::compile` then
+    /// declines the component, so the JS compiler handles it and the output stays identical
+    static UNREPRESENTABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Note an unrepresentable constant (see `UNREPRESENTABLE`); returns `None` for `?`
+fn unrepresentable<T>() -> Option<T> {
+    UNREPRESENTABLE.with(|u| u.set(true));
+    None
+}
+
+/// Clears the flag before a compilation and reads it after
+pub fn take_unrepresentable() -> bool {
+    UNREPRESENTABLE.with(|u| u.replace(false))
+}
+
+/// A BigInt compared with a number exactly (not through a lossy conversion); `None` for NaN
+fn compare_bigint_number(x: i128, y: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if y.is_nan() {
+        return None;
+    }
+    const LIMIT: f64 = 170141183460469231731687303715884105728.0; // 2^127
+    if y >= LIMIT {
+        return Some(Ordering::Less);
+    }
+    if y < -LIMIT {
+        return Some(Ordering::Greater);
+    }
+    // |y| < 2^127, so its integer part converts exactly
+    let t = y.trunc();
+    match x.cmp(&(t as i128)) {
+        Ordering::Equal => Some(0f64.partial_cmp(&(y - t))?),
+        o => Some(o),
+    }
+}
+
+/// `StringToBigInt`: `None` where it's a SyntaxError (or beyond what's represented)
+fn string_to_bigint(s: &str) -> Option<i128> {
+    let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if s.is_empty() {
+        return Some(0);
+    }
+    for (prefix, radix) in [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)] {
+        if let Some(digits) = s.strip_prefix(prefix) {
+            return if digits.is_empty() || digits.starts_with(['+', '-']) { None } else { i128::from_str_radix(digits, radix).ok() };
+        }
+    }
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<i128>().ok()
+}
+
 fn less_than(a: &Val, b: &Val) -> Option<bool> {
     let (a, b) = (a.to_primitive(), b.to_primitive());
     if let (Val::Str(x), Val::Str(y)) = (&a, &b) {
@@ -514,11 +571,11 @@ fn less_than(a: &Val, b: &Val) -> Option<bool> {
         (Val::BigInt(x), Val::BigInt(y)) => return Some(x < y),
         (Val::BigInt(x), _) => {
             let y = b.to_number()?;
-            return if y.is_nan() { None } else { Some((*x as f64) < y) };
+            return compare_bigint_number(*x, y).map(|o| o == std::cmp::Ordering::Less);
         }
         (_, Val::BigInt(y)) => {
             let x = a.to_number()?;
-            return if x.is_nan() { None } else { Some(x < (*y as f64)) };
+            return compare_bigint_number(*y, x).map(|o| o == std::cmp::Ordering::Greater);
         }
         _ => {}
     }
@@ -547,7 +604,7 @@ fn binary(op: BinaryOperator, a: &Val, b: &Val) -> Option<Val> {
                 Val::Str(s)
             } else {
                 match (&pa, &pb) {
-                    (Val::BigInt(x), Val::BigInt(y)) => Val::BigInt(x.checked_add(*y)?),
+                    (Val::BigInt(x), Val::BigInt(y)) => Val::BigInt(x.checked_add(*y).or_else(unrepresentable)?),
                     (Val::BigInt(_), _) | (_, Val::BigInt(_)) => return None,
                     _ => Val::Num(pa.to_number()? + pb.to_number()?),
                 }
@@ -557,15 +614,22 @@ fn binary(op: BinaryOperator, a: &Val, b: &Val) -> Option<Val> {
             if let (Val::BigInt(x), Val::BigInt(y)) = (a, b) {
                 let (x, y) = (*x, *y);
                 return Some(Val::BigInt(match op {
-                    O::Subtraction => x.checked_sub(y)?,
-                    O::Multiplication => x.checked_mul(y)?,
+                    O::Subtraction => x.checked_sub(y).or_else(unrepresentable)?,
+                    O::Multiplication => x.checked_mul(y).or_else(unrepresentable)?,
                     O::Division => x.checked_div(y)?,
                     O::Remainder => x.checked_rem(y)?,
-                    O::Exponential => x.checked_pow(u32::try_from(y).ok()?)?,
+                    O::Exponential => x.checked_pow(u32::try_from(y).ok()?).or_else(unrepresentable)?,
                     O::BitwiseAnd => x & y,
                     O::BitwiseOR => x | y,
                     O::BitwiseXOR => x ^ y,
-                    O::ShiftLeft => x.checked_shl(u32::try_from(y).ok()?)?,
+                    // `checked_shl` only checks the shift amount: bits shifted out are an overflow too
+                    O::ShiftLeft => {
+                        let r = x.checked_shl(u32::try_from(y).ok()?).or_else(unrepresentable)?;
+                        if r >> y != x {
+                            return unrepresentable();
+                        }
+                        r
+                    }
                     O::ShiftRight => x.checked_shr(u32::try_from(y).ok()?)?,
                     _ => return None,
                 }));
@@ -816,7 +880,8 @@ fn global_fn(keypath: &str) -> Option<(Val, Option<GlobalFn>)> {
         }))),
         "String.fromCharCode" => Some((Val::String, Some(|a: &[Val]| {
             let units: Option<Vec<u16>> = (0..a.len()).map(|i| num_arg(a, i).map(|x| x.to_uint_32() as u16)).collect();
-            Some(Val::Str(String::from_utf16_lossy(&units?)))
+            // a lone surrogate has no Rust string form: not folded
+            Some(Val::Str(String::from_utf16(&units?).ok().or_else(unrepresentable)?))
         }))),
         "String.fromCodePoint" => Some((Val::String, Some(|a: &[Val]| {
             let mut s = String::new();
@@ -825,7 +890,8 @@ fn global_fn(keypath: &str) -> Option<(Val, Option<GlobalFn>)> {
                 if x.trunc() != x || !(0.0..=1_114_111.0).contains(&x) {
                     return None;
                 }
-                s.push(char::from_u32(x as u32).unwrap_or('\u{fffd}'));
+                // surrogate code points have no Rust string form: not folded
+                s.push(char::from_u32(x as u32).or_else(unrepresentable)?);
             }
             Some(Val::Str(s))
         }))),
@@ -906,7 +972,7 @@ impl<'a, 's> Ctx<'a, 's> {
                     ELit::Number(x) => Val::Num(*x),
                     ELit::Boolean(b) => Val::Bool(*b),
                     ELit::Null => Val::Null,
-                    ELit::BigInt(b) => b.parse::<i128>().map_or(Val::Unknown, Val::BigInt),
+                    ELit::BigInt(b) => b.parse::<i128>().ok().or_else(unrepresentable).map_or(Val::Unknown, Val::BigInt),
                     ELit::RegExp(r) => Val::RegExp(n as *const ENode as usize, format!("/{}/{}", r.pattern, r.flags)),
                 },
             ),

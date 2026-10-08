@@ -4,6 +4,8 @@
 // built by Svelte's own code. Anything rusvelte doesn't handle falls back to the real compiler:
 // other Svelte versions, unsupported options, compile errors (so their messages and frames
 // are Svelte's own) and internal failures.
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as native from './native.js';
 
 const debug = !!process.env.RUSVELTE_DEBUG;
@@ -132,35 +134,59 @@ class JsSourceMap {
 }
 
 /**
- * @param {{
- *   real: typeof import('svelte/compiler'),
- *   state: any,
- *   CompileDiagnostic: any,
- *   merge_with_preprocessor_map: Function,
- *   get_source_name: Function,
- *   MagicSourceMap: any
- * }} svelte
+ * The internals of the installed compiler that results are built with (its `state`,
+ * `CompileDiagnostic`, source map helpers and magic-string's `SourceMap`), loaded only once the
+ * versions match: another version may lay its files out differently
+ * @param {string} real_url the URL of the installed `svelte/compiler` entry
  */
-export function create(svelte) {
-	const { real, state, CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap } = svelte;
+async function load_internals(real_url) {
+	const at = (path) => new URL(path, real_url).href;
+	const [state, { CompileDiagnostic }, { merge_with_preprocessor_map, get_source_name }] = await Promise.all([
+		import(at('./state.js')),
+		import(at('./utils/compile_diagnostic.js')),
+		import(at('./utils/mapped_code.js'))
+	]);
+	const magic_string = createRequire(fileURLToPath(real_url)).resolve('magic-string');
+	// `require` resolves its CommonJS build, where `SourceMap` hangs off the default export
+	const magic = await import(pathToFileURL(magic_string).href);
+	const MagicSourceMap = magic.SourceMap ?? magic.default?.SourceMap;
+	for (const [name, value] of Object.entries({ CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap })) {
+		if (typeof value !== 'function') throw new Error(`${name} is not available`);
+	}
+	if (typeof state.reset !== 'function' || typeof state.set_source !== 'function' || typeof state.adjust !== 'function') {
+		throw new Error('svelte/compiler state has an unexpected shape');
+	}
+	return { state, CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap };
+}
+
+/**
+ * `compile` and `compileModule` for the installed compiler: rusvelte's where it can run, the
+ * installed compiler's otherwise
+ * @param {typeof import('svelte/compiler')} real
+ * @param {string} real_url
+ */
+export async function create(real, real_url) {
+	const use_real = (reason) => {
+		console.warn(`[rusvelte] ${reason}; using svelte/compiler`);
+		return { compile: real.compile, compileModule: real.compileModule };
+	};
+	if (!native.native) return use_real(native.load_error);
+	if (real.VERSION !== native.svelteVersion && !process.env.RUSVELTE_ALLOW_VERSION_MISMATCH) {
+		return use_real(`svelte ${real.VERSION} is installed, but this rusvelte build reproduces svelte ${native.svelteVersion}`);
+	}
+	let internals;
+	try {
+		internals = await load_internals(real_url);
+	} catch (e) {
+		return use_real(`can't use the internals of the installed svelte/compiler (${e.message})`);
+	}
+	const { state, CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap } = internals;
 
 	/** results rusvelte produced (not the real compiler) */
 	const native_results = new WeakSet();
 
 	class CompileWarning extends CompileDiagnostic {
 		name = 'CompileWarning';
-	}
-
-	if (!native.native) {
-		console.warn(`[rusvelte] ${native.load_error}; using svelte/compiler`);
-		return { compile: real.compile, compileModule: real.compileModule };
-	}
-
-	const version_ok = real.VERSION === native.svelteVersion || !!process.env.RUSVELTE_ALLOW_VERSION_MISMATCH;
-	if (!version_ok) {
-		console.warn(
-			`[rusvelte] svelte ${real.VERSION} is installed, but this rusvelte build reproduces svelte ${native.svelteVersion}; using svelte/compiler`
-		);
 	}
 
 	/**
@@ -170,10 +196,15 @@ export function create(svelte) {
 	function run(source, options, module) {
 		// `validate-options.js` defaults `rootDir` to the working directory
 		if (options.rootDir === undefined && typeof process !== 'undefined') options = { ...options, rootDir: process.cwd() };
-		if (!version_ok) return fell_back(`svelte ${real.VERSION}`), null;
 		const bad = unsupported_option(options, module ? MODULE_OPTIONS : COMPONENT_OPTIONS);
 		if (bad) return fell_back(`option ${bad}`), null;
-		const result = JSON.parse((module ? native.compileModule : native.compile)(source, native_options(options)));
+		let result;
+		try {
+			result = JSON.parse((module ? native.compileModule : native.compile)(source, native_options(options)));
+		} catch (e) {
+			// a broken or mismatched native build: the real compiler takes over
+			return fell_back(`native error: ${e.message}`), null;
+		}
 		if (result.unsupported) return fell_back(result.unsupported), null;
 		// let the real compiler throw, so the error is exactly Svelte's
 		if (result.error) return fell_back(`compile error ${result.error.code}`), null;
@@ -265,7 +296,8 @@ export function create(svelte) {
 			metadata: { runes: result.runes },
 			// parsed on demand: vite-plugin-svelte doesn't read it
 			get ast() {
-				return (ast ??= real.parse(source, { modern: !!options.modernAst, filename: options.filename }));
+				// compile's AST (TypeScript removed etc.); warnings are dropped so the filter isn't called twice
+				return (ast ??= real.compile(source, { ...options, generate: false, warningFilter: () => false }).ast);
 			},
 			set ast(value) {
 				ast = value;
@@ -277,19 +309,28 @@ export function create(svelte) {
 
 	/** @type {typeof real.compileModule} */
 	function compileModule(source, options) {
+		const result = compile_module_native(source, options);
+		if (verify && native_results.has(result)) check('module', remove_bom(source), options, result);
+		return result;
+	}
+
+	/** @type {typeof real.compileModule} */
+	function compile_module_native(source, options) {
 		source = remove_bom(source);
 		const result = run(source, options, true);
 		if (!result) return real.compileModule(source, options);
 		set_state(source, options, true);
 		options = { ...options, filename: options.filename ?? '(unknown)' };
 		const js_source_name = get_source_name(options.filename, undefined, 'input.svelte.js');
-		return {
+		const compiled = {
 			js: { code: result.js.code, map: new JsSourceMap(result.js.mappings, js_source_name, source) },
 			css: null,
 			warnings: warnings_of(result, options),
 			metadata: { runes: true },
 			ast: null
 		};
+		native_results.add(compiled);
+		return compiled;
 	}
 
 	return { compile, compileModule };

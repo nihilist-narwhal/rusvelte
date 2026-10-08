@@ -83,3 +83,5 @@ for (const [key, files] of Object.entries(differences).sort((x, y) => y[1].lengt
 	console.log(`${String(files.length).padStart(5)}  ${key}  (e.g. ${files[0]})`);
 }
 console.log(`${same}/${total} identical; native ${stats.native}, fallbacks ${JSON.stringify(stats.fallback)}`);
+// differences, or nothing compiled natively, fail the check
+if (same !== total || stats.native === 0) process.exit(1);
