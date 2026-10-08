@@ -470,6 +470,14 @@ impl<'s> Analyzer<'s> {
         if node.name == "$$slots" {
             self.uses_slots = true;
         }
+        if !self.runes {
+            if node.name == "$$props" {
+                self.uses_props = true;
+            }
+            if node.name == "$$restProps" {
+                self.uses_rest_props = true;
+            }
+        }
 
         if self.runes
             && utils::is_rune(node.name).is_some()
@@ -1543,6 +1551,7 @@ impl<'s> Analyzer<'s> {
                         _ => {}
                     }
                 }
+                self.needs_props = true;
                 match &d.id {
                     BindingPattern::BindingIdentifier(i) => {
                         if let Some(b) = self.get(st.scope, i.name.as_str()) {
@@ -2890,6 +2899,11 @@ impl<'s> Analyzer<'s> {
                     self.validate_slot_attribute(a, true, st)?;
                 }
             }
+            if let Attr::Directive { kind: "BindDirective", name, .. } = a {
+                if *name != "this" {
+                    self.uses_component_bindings = true;
+                }
+            }
             if let Attr::Attach { expression, .. } = a {
                 self.disallow_unparenthesized_sequences(expression)?;
             }
@@ -3436,6 +3450,27 @@ pub fn legacy_exports(an: &mut Analyzer) {
     for s in nodes::children(program, an.ast) {
         match s {
             P::Js(AstKind::ExportDeclaration(d)) => {
+                an.needs_props = true;
+                match &d.declaration {
+                    Declaration::FunctionDeclaration(f) => {
+                        if let Some(id) = &f.id {
+                            an.exports.push((id.name.to_string(), None));
+                        }
+                    }
+                    Declaration::ClassDeclaration(c) => {
+                        if let Some(id) = &c.id {
+                            an.exports.push((id.name.to_string(), None));
+                        }
+                    }
+                    Declaration::VariableDeclaration(v) if v.kind == VariableDeclarationKind::Const => {
+                        for declarator in &v.declarations {
+                            for id in scope::extract_identifiers(nodes::binding(&declarator.id)) {
+                                an.exports.push((id.name.to_string(), None));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 if let Declaration::VariableDeclaration(v) = &d.declaration {
                     if v.kind != VariableDeclarationKind::Const {
                         for declarator in &v.declarations {
@@ -3449,6 +3484,7 @@ pub fn legacy_exports(an: &mut Analyzer) {
                 }
             }
             P::Js(AstKind::ExportNamedDeclaration(d)) => {
+                an.needs_props = true;
                 for s in &d.specifiers {
                     if s.export_kind.is_type() {
                         continue;
@@ -3465,8 +3501,10 @@ pub fn legacy_exports(an: &mut Analyzer) {
                             if exported.name != local.name {
                                 binding.prop_alias = Some(exported.name.as_str());
                             }
+                            continue;
                         }
                     }
+                    an.exports.push((local.name.to_string(), Some(exported.name.to_string())));
                 }
             }
             _ => {}

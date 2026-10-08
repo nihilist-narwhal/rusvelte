@@ -304,6 +304,13 @@ pub(crate) struct Analyzer<'s> {
     pub fragment_dynamic: FxHashSet<usize>,
     /// `analysis.instance_body`
     pub instance_body: blockers::InstanceBody<'s>,
+    /// `analysis.needs_props`, `uses_props`, `uses_rest_props`, `uses_component_bindings`
+    pub needs_props: bool,
+    pub uses_props: bool,
+    pub uses_rest_props: bool,
+    pub uses_component_bindings: bool,
+    /// `analysis.exports` (legacy): (name, alias)
+    pub exports: Vec<(String, Option<String>)>,
     /// `analysis.needs_context`
     pub needs_context: bool,
     /// `analysis.pickled_awaits` (AwaitExpression keys)
@@ -585,6 +592,11 @@ pub(crate) fn analyze_component<'s>(
         has_props_rune: false,
         metas: Vec::new(),
         needs_context: false,
+        needs_props: false,
+        uses_props: false,
+        uses_rest_props: false,
+        uses_component_bindings: false,
+        exports: Vec::new(),
         instance_body: blockers::InstanceBody::default(),
         node_meta: FxHashMap::default(),
         attr_meta: FxHashMap::default(),
