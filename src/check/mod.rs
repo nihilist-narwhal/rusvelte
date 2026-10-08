@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{json, Map, Value};
 
+use crate::svelte2tsx::kit::{is_kit_file, to_original_pos, upsert_kit_file, AddedCode, KitFilesSettings};
 use crate::svelte2tsx::rewrite_imports::RewriteExternalImports;
 use crate::svelte2tsx::{svelte2tsx_full, Svelte2TsxOptions};
 use map::{Code, Diagnostic, Position, Range};
@@ -57,6 +58,8 @@ struct Entry {
     is_ts_file: bool,
     source: String,
     code: String,
+    /// a SvelteKit file: the code svelte-check inserted
+    kit: Option<Vec<AddedCode>>,
 }
 
 /// `isTsSvelte`
@@ -77,7 +80,7 @@ fn is_ts_svelte(text: &str) -> bool {
 }
 
 /// `findFiles`: everything under the workspace except `node_modules` and dot directories
-fn find_files(dir: &Path, workspace: &Path, ignored: &[Box<dyn Fn(&str) -> bool + Sync>], out: &mut Vec<PathBuf>) {
+fn find_files(dir: &Path, workspace: &Path, ignored: &[Box<dyn Fn(&str) -> bool + Sync>], out: &mut Vec<PathBuf>, kit: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<_> = rd.flatten().collect();
     entries.sort_by_key(|e| e.file_name());
@@ -90,11 +93,16 @@ fn find_files(dir: &Path, workspace: &Path, ignored: &[Box<dyn Fn(&str) -> bool 
             if name == "node_modules" || name.starts_with('.') {
                 continue;
             }
-            find_files(&path, workspace, ignored, out);
+            find_files(&path, workspace, ignored, out, kit);
         } else if name.ends_with(".svelte") {
             let rel = relative_posix(workspace, &path);
             if !ignored.iter().any(|i| i(&rel)) {
                 out.push(path);
+            }
+        } else if (name.ends_with(".ts") || name.ends_with(".js")) && is_kit_file(&path.to_string_lossy(), &KitFilesSettings::default()) {
+            let rel = relative_posix(workspace, &path);
+            if !ignored.iter().any(|i| i(&rel)) {
+                kit.push(path);
             }
         }
     }
@@ -170,10 +178,11 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
     let use_svelte = opts.sources.iter().any(|s| s == "svelte");
 
     // find and convert the components
-    let files = timed(opts.timings, "find files", || {
+    let (files, kit_files) = timed(opts.timings, "find files", || {
         let mut files = Vec::new();
-        find_files(&workspace, &workspace, &ignored, &mut files);
-        files
+        let mut kit = Vec::new();
+        find_files(&workspace, &workspace, &ignored, &mut files, &mut kit);
+        (files, kit)
     });
     // start on the compiler warnings right away (they don't depend on the emit)
     let mut warnings_cache = if use_svelte && opts.incremental { WarningsCache::load(&workspace, &cache) } else { WarningsCache::default() };
@@ -221,13 +230,33 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
                     if write_if_changed(&out_path, &r.code).is_err() || write_if_changed(&dts_path, &dts).is_err() {
                         continue;
                     }
-                    *results[i].lock().unwrap() = Some(Entry { source_path: path.clone(), out_path, dts_path, is_ts_file: is_ts, source, code: r.code });
+                    *results[i].lock().unwrap() = Some(Entry { source_path: path.clone(), out_path, dts_path, is_ts_file: is_ts, source, code: r.code, kit: None });
                 });
             }
         });
         results.into_iter().map(|m| m.into_inner().unwrap()).collect()
     });
-    let entries: Vec<Entry> = entries.into_iter().flatten().collect();
+    let mut entries: Vec<Entry> = entries.into_iter().flatten().collect();
+    // SvelteKit files, with the types svelte-check adds (`emitSvelteFiles`)
+    for path in &kit_files {
+        let Ok(source) = std::fs::read_to_string(path) else { continue };
+        let out_path = emit_dir.join(path.strip_prefix(&workspace).unwrap_or(path));
+        let rewrite = RewriteExternalImports { source_path: path.clone(), generated_path: out_path.clone(), workspace_path: workspace.clone() };
+        let Some(r) = upsert_kit_file(&path.to_string_lossy(), &source, &KitFilesSettings::default(), Some(&rewrite), None) else { continue };
+        let _ = std::fs::create_dir_all(out_path.parent().unwrap());
+        if write_if_changed(&out_path, &r.text).is_err() {
+            continue;
+        }
+        entries.push(Entry {
+            source_path: path.clone(),
+            dts_path: out_path.clone(),
+            out_path,
+            is_ts_file: path.extension().is_some_and(|e| e == "ts"),
+            source,
+            code: r.text,
+            kit: Some(r.added_code),
+        });
+    }
     if opts.incremental {
         // remove what earlier runs generated for files that are gone or failed now
         let current: std::collections::HashSet<&Path> = entries.iter().flat_map(|e| [e.out_path.as_path(), e.dts_path.as_path()]).collect();
@@ -242,7 +271,8 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
 
     let mut by_file: Vec<FileDiagnostics> = Vec::new();
     let mut index: HashMap<PathBuf, usize> = HashMap::new();
-    for e in &entries {
+    // every converted file gets a record when svelte-check runs its Svelte diagnostics
+    for e in entries.iter().filter(|_| use_svelte || opts.sources.iter().any(|s| s == "css")) {
         index.insert(e.source_path.clone(), by_file.len());
         by_file.push(FileDiagnostics { path: e.source_path.clone(), text: e.source.clone(), diagnostics: Vec::new() });
     }
@@ -461,6 +491,10 @@ fn add_subpath_import_paths(paths: &mut Map<String, Value>, workspace: &Path, ov
 /// `mapCliDiagnosticsToLsp`: group by file, map the ones in generated files
 fn map_ts_diagnostics(diags: &[tsc::CliDiagnostic], entries: &[Entry], workspace: &Path, tsconfig: &Path, threads: usize) -> Vec<(PathBuf, String, Vec<Diagnostic>)> {
     let by_out: HashMap<&Path, &Entry> = entries.iter().map(|e| (e.out_path.as_path(), e)).collect();
+    // kit files that got code inserted may still be reached through .svelte-kit/types; skip those
+    let excluded: std::collections::HashSet<&Path> =
+        entries.iter().filter(|e| e.kit.as_ref().is_some_and(|a| !a.is_empty())).map(|e| e.source_path.as_path()).collect();
+    let diags: Vec<&tsc::CliDiagnostic> = diags.iter().filter(|d| !d.file_path.as_deref().is_some_and(|p| excluded.contains(p))).collect();
     let mut groups: Vec<(PathBuf, Vec<&tsc::CliDiagnostic>)> = Vec::new();
     let mut pos: HashMap<PathBuf, usize> = HashMap::new();
     for d in diags {
@@ -482,6 +516,7 @@ fn map_ts_diagnostics(diags: &[tsc::CliDiagnostic], entries: &[Entry], workspace
                 let Some((path, file_diags)) = groups.get(i) else { break };
                 let owned: Vec<tsc::CliDiagnostic> = file_diags.iter().map(|d| (*d).clone()).collect();
                 let r = match by_out.get(path.as_path()) {
+                    Some(entry) if entry.kit.is_some() => (entry.source_path.clone(), entry.source.clone(), map_kit_entry(entry, &owned)),
                     Some(entry) => (entry.source_path.clone(), entry.source.clone(), map_entry(entry, workspace, &owned)),
                     None => {
                         let text = std::fs::read_to_string(path).unwrap_or_default();
@@ -494,6 +529,31 @@ fn map_ts_diagnostics(diags: &[tsc::CliDiagnostic], entries: &[Entry], workspace
         }
     });
     results.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
+}
+
+/// A SvelteKit file's diagnostics, mapped back through the inserted code
+fn map_kit_entry(entry: &Entry, diags: &[tsc::CliDiagnostic]) -> Vec<Diagnostic> {
+    let added = entry.kit.as_deref().unwrap_or(&[]);
+    let source = map::U16Text::new(&entry.source);
+    let generated = map::U16Text::new(&entry.code);
+    let kind = if is_typescript_file(&entry.source_path) { "ts" } else { "js" };
+    diags
+        .iter()
+        .map(|d| {
+            let offset = generated.offset_at(Position { line: d.line as i64, character: d.character as i64 });
+            let (start, _) = to_original_pos(offset, added);
+            let (end, _) = to_original_pos(offset + d.length, added);
+            Diagnostic {
+                range: Range { start: source.position_at(start as i64), end: source.position_at(end as i64) },
+                severity: d.severity,
+                source: kind,
+                message: d.message.clone(),
+                code: Some(Code::Num(d.code)),
+                code_description: None,
+                position_unknown: false,
+            }
+        })
+        .collect()
 }
 
 fn is_typescript_file(p: &Path) -> bool {
