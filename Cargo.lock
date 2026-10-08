@@ -699,6 +699,7 @@ name = "svelte-rs"
 version = "0.1.0"
 dependencies = [
  "fancy-regex",
+ "indexmap",
  "oxc_allocator",
  "oxc_ast",
  "oxc_ast_visit",

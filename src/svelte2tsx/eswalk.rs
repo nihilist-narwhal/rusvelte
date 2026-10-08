@@ -18,15 +18,19 @@ pub enum Ctx {
     PropertyKey,
     /// `Property.value`
     PropertyValue,
-    /// `CallExpression.callee` / `NewExpression.callee`, with the first argument if it's a literal
-    Callee { first_arg: Option<Literal> },
+    /// `CallExpression.callee` / `NewExpression.callee`, with the first argument
+    Callee { first_arg: FirstArg },
 }
 
-/// The value of a literal first argument (`dispatch('name')`)
+/// A call's first argument, as `arguments[0].value` sees it (`dispatch('name')`)
 #[derive(Debug, Clone, PartialEq)]
-pub enum Literal {
-    String(String),
-    Other,
+pub enum FirstArg {
+    /// no arguments (`arguments[0]` is undefined)
+    Missing,
+    /// a literal's value, stringified
+    Value(String),
+    /// no `value` property
+    NoValue,
 }
 
 pub trait EsHandler {
@@ -59,13 +63,16 @@ impl<'h, H: EsHandler> EsWalker<'h, H> {
         self.h.identifier(name, span.start as usize, span.end as usize, &ctx);
     }
 
-    fn first_arg(args: &[Argument]) -> Option<Literal> {
-        match args.first()? {
-            Argument::StringLiteral(s) => Some(Literal::String(s.value.to_string())),
-            Argument::NumericLiteral(_) | Argument::BooleanLiteral(_) | Argument::NullLiteral(_) | Argument::BigIntLiteral(_) | Argument::RegExpLiteral(_) => {
-                Some(Literal::Other)
-            }
-            _ => None,
+    fn first_arg(args: &[Argument]) -> FirstArg {
+        match args.first() {
+            None => FirstArg::Missing,
+            Some(Argument::StringLiteral(s)) => FirstArg::Value(s.value.to_string()),
+            Some(Argument::NumericLiteral(n)) => FirstArg::Value(js_number(n.value)),
+            Some(Argument::BooleanLiteral(b)) => FirstArg::Value(b.value.to_string()),
+            Some(Argument::NullLiteral(_)) => FirstArg::Value("null".into()),
+            Some(Argument::BigIntLiteral(b)) => FirstArg::Value(b.raw.as_ref().map_or(String::new(), |r| r.trim_end_matches('n').to_string())),
+            Some(Argument::RegExpLiteral(r)) => FirstArg::Value(r.raw.as_ref().map_or(String::new(), |r| r.to_string())),
+            _ => FirstArg::NoValue,
         }
     }
 
@@ -301,6 +308,15 @@ impl<'a, H: EsHandler> Visit<'a> for EsWalker<'_, H> {
         if toggles {
             self.h.set_declaration(false);
         }
+    }
+}
+
+/// `String(n)` for the numbers literals produce
+fn js_number(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e21 {
+        format!("{n:.0}")
+    } else {
+        format!("{n}")
     }
 }
 

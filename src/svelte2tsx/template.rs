@@ -11,6 +11,9 @@ use oxc_span::GetSpan;
 
 use super::elements::{Elements, Kind, NodeInfo};
 use super::eswalk::{Ctx, EsHandler, EsWalker};
+use super::script::events::EventHandler;
+use super::script::hoistable::RootSnippet;
+use super::slots::{SlotAttr, SlotHandler};
 use super::htmlx::Verbatim;
 use super::transform::*;
 use crate::ast::{Ast, Attr, Chunk, Declaration, Expr, Node, Pattern};
@@ -122,6 +125,12 @@ pub struct Converter<'s, 'm, 'a> {
     pub uses_rest_props: bool,
     pub uses_slots: bool,
     pub is_runes: bool,
+    pub uses_accessors: bool,
+    pub slots: SlotHandler<'s>,
+    pub event_handler: EventHandler,
+    /// `ComponentDocumentation`'s text
+    pub component_documentation: String,
+    pub root_snippets: Vec<RootSnippet>,
     // stores (Stores.ts + Scope.ts)
     is_declaration: bool,
     scopes: Vec<Scope>,
@@ -137,6 +146,10 @@ struct Scope {
 
 impl EsHandler for Converter<'_, '_, '_> {
     fn identifier(&mut self, name: &str, _start: usize, _end: usize, ctx: &Ctx) {
+        // eventHandler.handleIdentifier
+        if let Ctx::Callee { first_arg } = ctx {
+            self.event_handler.callees.push((name.to_string(), first_arg.clone()));
+        }
         // handleIdentifier
         match name {
             "$$props" => {
@@ -211,6 +224,11 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
             uses_rest_props: false,
             uses_slots: false,
             is_runes: false,
+            uses_accessors: opts.accessors,
+            slots: SlotHandler::new(source),
+            event_handler: EventHandler::default(),
+            component_documentation: String::new(),
+            root_snippets: Vec::new(),
             is_declaration: false,
             scopes: vec![Scope::default()],
             current_scope: 0,
@@ -332,7 +350,10 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
     fn node(&mut self, node: &'m LNode<'m, 'a>, parent: Parent<'m, 'm, 'a>) -> Result<()> {
         match node {
             LNode::Text(t) => self.text(t, parent),
-            LNode::Comment { start, end, .. } => {
+            LNode::Comment { start, end, data, .. } => {
+                if data.contains("@component") {
+                    self.component_documentation = super::script::js_trim(&data.replacen("@component", "", 1)).to_string();
+                }
                 self.str.overwrite(*start, *end, "", true)?;
                 Ok(())
             }
@@ -400,6 +421,10 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
                 Ok(())
             }
             LNode::EachBlock { children, context, expression, key, else_block, .. } => {
+                self.slots.scope_child();
+                if let Some(c) = context {
+                    self.slots.handle_scope_and_resolve(c, (pattern_start(c), pattern_end(c)), expression, "EachBlock");
+                }
                 self.handle_each(node)?;
                 self.children(children, Parent::Block { ty: "EachBlock", children })?;
                 if let Some(c) = context {
@@ -412,6 +437,7 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
                 if let Some(else_block) = else_block {
                     self.else_block(else_block, "EachBlock")?;
                 }
+                self.slots.scope_parent();
                 Ok(())
             }
             LNode::KeyBlock { start, end, expression, children } => {
@@ -427,6 +453,13 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
                 self.children(children, Parent::Block { ty: "KeyBlock", children })
             }
             LNode::AwaitBlock { expression, value, error, pending, then, catch, .. } => {
+                self.slots.scope_child();
+                if let Some(v) = value {
+                    self.slots.handle_scope_and_resolve(v, (pattern_start(v), pattern_end(v)), expression, "ThenBlock");
+                }
+                if let Some(e) = error {
+                    self.slots.handle_scope_and_resolve(e, (pattern_start(e), pattern_end(e)), expression, "CatchBlock");
+                }
                 self.expr(expression);
                 if let Some(v) = value {
                     self.pattern(v, true);
@@ -437,6 +470,7 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
                 for (ty, b) in [("PendingBlock", pending), ("ThenBlock", then), ("CatchBlock", catch)] {
                     self.children(&b.children, Parent::Block { ty, children: &b.children })?;
                 }
+                self.slots.scope_parent();
                 self.handle_await(node)
             }
             LNode::SnippetBlock { .. } => self.snippet(node, parent),
@@ -687,10 +721,12 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
             if self.opts.svelte5_plus {
                 self.handle_implicit_children(el, id);
             }
-            // handleComponentLet: template scope only (slot types come later)
+            self.handle_component_let(el);
         } else {
             if el.kind == "Options" {
                 self.handle_svelte_options(el);
+            } else if el.kind == "Slot" {
+                self.handle_slot(el);
             }
             if doctype {
                 self.str.remove(el.start, el.end.unwrap_or(0))?;
@@ -718,6 +754,9 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
             self.children(children, me)?;
         }
 
+        if is_component {
+            self.slots.scope_parent();
+        }
         if !doctype {
             let id = self.element.expect("current element");
             self.els.perform_transformation(&mut self.str, id)?;
@@ -725,6 +764,78 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
         }
         let _ = parent;
         Ok(())
+    }
+
+    /// `handleComponentLet`: a child template scope with the component's `let:`s
+    fn handle_component_let(&mut self, el: &LElement) {
+        self.slots.scope_child();
+        let component_type = if matches!(el.name, "svelte:component" | "svelte:self") { "__sveltets_1_componentType()" } else { el.name };
+        let mut lets: Vec<(&Attr, &'static str, String)> = let_nodes(&el.attributes).into_iter().map(|l| (l, "", "default".to_string())).collect();
+        for child in el.children.as_deref().unwrap_or(&[]) {
+            if let LNode::Element(c) = child {
+                if let Some(slot_name) = slot_name(c) {
+                    lets.extend(let_nodes(&c.attributes).into_iter().map(|l| (l, "", slot_name.clone())));
+                }
+            }
+        }
+        for (attr, _, slot_name) in lets {
+            if let Attr::Directive { start, end, name, expression, .. } = attr {
+                self.slots.handle_let(*start, *end, name, expression.as_ref(), component_type, &slot_name);
+            }
+        }
+    }
+
+    /// `slotHandler.handleSlot`
+    fn handle_slot(&mut self, el: &'m LElement<'m, 'a>) {
+        let slot_name = match el.attributes.iter().find(|a| attr_name(a) == Some("name")) {
+            None => "default".to_string(),
+            Some(LAttr::Attribute { value: LAttrValue::Chunks(chunks), .. }) => match chunks.first() {
+                Some(LChunk::Text(Chunk::Text { raw, .. })) => raw.to_string(),
+                _ => "undefined".to_string(),
+            },
+            Some(_) => "undefined".to_string(),
+        };
+        let mut attrs = Vec::new();
+        for a in &el.attributes {
+            let name = attr_name(a);
+            if name == Some("name") {
+                continue;
+            }
+            match a {
+                LAttr::Other { attr: Attr::Spread { expression, .. }, .. } => {
+                    let raw = match expression {
+                        Expr::Ident { name, .. } => name.clone(),
+                        Expr::Js(js) => match js.inner() {
+                            Expression::Identifier(id) => id.name.to_string(),
+                            _ => "undefined".into(),
+                        },
+                        Expr::Literal { .. } => "undefined".into(),
+                    };
+                    attrs.push(SlotAttr::Spread(raw));
+                }
+                LAttr::Attribute { value: LAttrValue::Chunks(chunks), .. } if !chunks.is_empty() => {
+                    let name = name.unwrap_or("").to_string();
+                    match chunks.as_slice() {
+                        [LChunk::Text(Chunk::Text { raw, .. })] => attrs.push(SlotAttr::String(name, format!("\"{raw}\""))),
+                        [LChunk::AttributeShorthand { expression, .. }] => {
+                            let ident = match expression {
+                                Expr::Ident { name, .. } => name.clone(),
+                                Expr::Js(js) => match js.inner() {
+                                    Expression::Identifier(id) => id.name.to_string(),
+                                    _ => "undefined".into(),
+                                },
+                                Expr::Literal { .. } => "undefined".into(),
+                            };
+                            attrs.push(SlotAttr::Shorthand(name, ident));
+                        }
+                        [LChunk::MustacheTag { expression, .. }] => attrs.push(SlotAttr::Expression(name, expression)),
+                        _ => attrs.push(SlotAttr::String(name, "\"__svelte_ts_string\"".into())),
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.slots.handle_slot(slot_name, attrs);
     }
 
     fn handle_svelte_options(&mut self, el: &LElement) {
@@ -739,6 +850,7 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
                 };
                 match attr.name() {
                     Some("runes") => self.is_runes = truthy,
+                    Some("accessors") => self.uses_accessors = truthy,
                     _ => {}
                 }
             }
@@ -885,7 +997,12 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
                             ts.extend(trailing);
                             self.els.append_to_start_end(el, ts);
                         }
-                        "EventHandler" => self.handle_event_handler(start, name, expression, el)?,
+                        "EventHandler" => {
+                            if expression.is_none() {
+                                self.event_handler.handle_event_handler(name, parent.ty(), parent.name());
+                            }
+                            self.handle_event_handler(start, name, expression, el)?
+                        }
                         "Let" => self.handle_let(start, end, name, expression, parent, el)?,
                         _ => {}
                     }
@@ -1447,7 +1564,22 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
 
         self.handle_snippet(*start, end.unwrap_or(0), expression, *parameters, *type_params, children, parent_component)?;
         match parent {
-            Parent::Root => {}
+            Parent::Root => {
+                // root snippet: moved to the instance or even the module script later
+                let mut globals = super::periscope::snippet_globals(self.ast, expression, *parameters, children);
+                let mut components = Vec::new();
+                collect_snippet_component_globals(children, &mut components);
+                globals.extend(components);
+                let name = match expression {
+                    Expr::Ident { name, .. } => name.clone(),
+                    Expr::Js(js) => match js.inner() {
+                        Expression::Identifier(id) => id.name.to_string(),
+                        _ => "undefined".into(),
+                    },
+                    Expr::Literal { .. } => "undefined".into(),
+                };
+                self.root_snippets.push(RootSnippet { start: *start, end: end.unwrap_or(0), globals: globals.into_iter().collect(), name });
+            }
             Parent::Element(p) => {
                 if let Some(c) = &p.children {
                     self.add_pending_hoist(p.kind, c);
@@ -1597,16 +1729,63 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
     }
 
     fn blank_other_script_tags(&mut self, root: &LegacyRoot, verbatim: &[Verbatim]) -> Result<()> {
-        // scripts nested inside elements, or inside {@html}, aren't top level
-        let mut nested: Vec<(usize, usize)> = Vec::new();
-        collect_nested_scripts(&root.children, true, &mut nested);
+        let top_level = top_level_scripts(root, verbatim);
         for v in verbatim.iter().filter(|v| !v.is_style) {
-            let top_level = !nested.iter().any(|&(s, e)| (s == v.start && e == v.end) || (s <= v.start && e >= v.end && s != usize::MAX));
-            if !top_level {
+            if !top_level.iter().any(|t| std::ptr::eq(*t, v)) {
                 self.str.remove(v.start, v.end)?;
             }
         }
         Ok(())
+    }
+
+    /// `stores.getStoreNames()`: `$name`s used in the template that aren't declared there
+    pub fn resolved_stores(&self) -> Vec<String> {
+        self.possible_stores
+            .iter()
+            .filter(|(name, scope)| {
+                let mut s = Some(*scope);
+                while let Some(i) = s {
+                    if self.scopes[i].declared.contains(name) {
+                        return false;
+                    }
+                    s = self.scopes[i].parent;
+                }
+                true
+            })
+            .map(|(name, _)| name[1..].to_string())
+            .collect()
+    }
+}
+
+/// `Scripts.getTopLevelScriptTags`'s candidates: scripts not nested in elements or `{@html}`
+pub fn top_level_scripts<'v, 'a>(root: &LegacyRoot, verbatim: &'v [Verbatim<'a>]) -> Vec<&'v Verbatim<'a>> {
+    let mut nested: Vec<(usize, usize)> = Vec::new();
+    collect_nested_scripts(&root.children, true, &mut nested);
+    verbatim
+        .iter()
+        .filter(|v| !v.is_style)
+        .filter(|v| !nested.iter().any(|&(s, e)| (s == v.start && e == v.end) || (s <= v.start && e >= v.end)))
+        .collect()
+}
+
+/// `getTopLevelScriptTags`: `(instance, module)`
+pub fn script_tags<'v, 'a>(root: &LegacyRoot, verbatim: &'v [Verbatim<'a>]) -> (Option<&'v Verbatim<'a>>, Option<&'v Verbatim<'a>>) {
+    let mut instance = None;
+    let mut module = None;
+    for tag in top_level_scripts(root, verbatim) {
+        let is_module = tag.attributes.iter().any(|a| (a.name == "context" && a.value.is_some_and(|v| v.2 == "module")) || a.name == "module");
+        if is_module {
+            module = Some(tag);
+        } else {
+            instance = Some(tag);
+        }
+    }
+    (instance, module)
+}
+
+impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
+    pub fn into_str(self) -> MagicString<'s> {
+        self.str
     }
 }
 
@@ -1851,4 +2030,77 @@ fn try_escape_attribute_value(s: &str, use_template_literal: bool) -> Option<Str
     }
     let json = serde_json::to_string(s).unwrap();
     Some(json[1..json.len() - 1].to_string())
+}
+
+/// The `let:` directives among attributes (`getLetNodes`)
+fn let_nodes<'r, 'a>(attributes: &'r [LAttr<'_, 'a>]) -> Vec<&'r Attr<'a>> {
+    attributes
+        .iter()
+        .filter_map(|a| match a {
+            LAttr::Other { attr, legacy_type: "Let" } => Some(*attr),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `getSlotName`: the static value of a `slot` attribute
+fn slot_name(el: &LElement) -> Option<String> {
+    let a = el.attributes.iter().find(|a| match a {
+        LAttr::Attribute { attr, .. } | LAttr::Other { attr, .. } => attr.name() == Some("slot"),
+    })?;
+    match a {
+        LAttr::Attribute { value: LAttrValue::Chunks(chunks), .. } => match chunks.first() {
+            Some(LChunk::Text(Chunk::Text { raw, .. })) if !raw.is_empty() => Some(raw.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn attr_name<'r>(a: &'r LAttr) -> Option<&'r str> {
+    match a {
+        LAttr::Attribute { attr, .. } | LAttr::Other { attr, .. } => attr.name(),
+    }
+}
+
+/// `collectSnippetComponentGlobals`: component names used in a snippet
+fn collect_snippet_component_globals(children: &[LNode], out: &mut Vec<String>) {
+    static COMPONENT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"^([A-Z]|([a-zA-Z]+\.))").unwrap());
+    for c in children {
+        match c {
+            LNode::Element(el) => {
+                if el.kind == "InlineComponent" {
+                    if el.name == "svelte:component" {
+                        match el.expression {
+                            Some(Expr::Ident { name, .. }) => out.push(name.clone()),
+                            Some(Expr::Js(js)) => {
+                                if let Expression::Identifier(id) = js.inner() {
+                                    out.push(id.name.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if el.name != "svelte:self" && !el.name.starts_with("svelte:") && COMPONENT.is_match(el.name) {
+                        out.push(el.name.to_string());
+                    }
+                }
+                if let Some(ch) = &el.children {
+                    collect_snippet_component_globals(ch, out);
+                }
+            }
+            LNode::IfBlock { children, else_block, .. } | LNode::EachBlock { children, else_block, .. } => {
+                collect_snippet_component_globals(children, out);
+                if let Some(e) = else_block {
+                    collect_snippet_component_globals(&e.children, out);
+                }
+            }
+            LNode::AwaitBlock { pending, then, catch, .. } => {
+                for b in [pending, then, catch] {
+                    collect_snippet_component_globals(&b.children, out);
+                }
+            }
+            LNode::KeyBlock { children, .. } | LNode::SnippetBlock { children, .. } => collect_snippet_component_globals(children, out),
+            _ => {}
+        }
+    }
 }

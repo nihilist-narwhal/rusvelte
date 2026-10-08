@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
-use svelte_rs::svelte2tsx::{htmlx2jsx, Options};
+use svelte_rs::svelte2tsx::{htmlx2jsx, svelte2tsx, Options, Svelte2TsxOptions};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -33,7 +33,27 @@ fn main() {
         }
         let source = fs::read_to_string(corpus.join(rel)).unwrap();
         let expected: Value = serde_json::from_str(&fs::read_to_string(expected_dir.join(format!("{id}.json"))).unwrap()).unwrap();
-        let actual = std::panic::catch_unwind(|| htmlx2jsx(&source, &opts));
+        let o = &entry["options"];
+        if o["mode"].as_str() == Some("dts") {
+            continue;
+        }
+        let actual = std::panic::catch_unwind(|| {
+            if o.is_object() {
+                let s2t = Svelte2TsxOptions {
+                    filename: o["filename"].as_str().map(str::to_string),
+                    is_ts_file: o["isTsFile"].as_bool().unwrap_or(false),
+                    mode_ts: true,
+                    accessors: o["accessors"].as_bool().unwrap_or(false),
+                    typings_namespace: o["typingsNamespace"].as_str().unwrap_or("svelteHTML").to_string(),
+                    namespace_foreign: o["namespace"].as_str() == Some("foreign"),
+                    emit_jsdoc: o["emitJsDoc"].as_bool().unwrap_or(false),
+                    svelte5_plus: true,
+                };
+                svelte2tsx(&source, &s2t)
+            } else {
+                htmlx2jsx(&source, &opts)
+            }
+        });
         let reason = match (actual, expected.get("ok").and_then(Value::as_str)) {
             (Err(_), _) => Some("panic".to_string()),
             (Ok(Ok(code)), Some(exp)) => {
