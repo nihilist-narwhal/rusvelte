@@ -1,7 +1,7 @@
 // Generates synthetic .svelte corpora for the css_lint parity check (then run
 // oracle/css_oracle.cjs on each and compare with `compare_css`).
 //
-// usage: node oracle/gen_css_samples.mjs <out root> [which...]
+// usage: [SEED=n] node oracle/gen_css_samples.mjs <out root> [which...]
 //   nm-css / nm-scss / nm-less: stylesheets from installed node_modules wrapped in <style>
 //   mut-css / mut-scss / mut-less: random mutations of real style contents (parser recovery)
 //   html: mutations of the markup around <style> tags (tag extraction)
@@ -29,7 +29,9 @@ const SVELTE_DIRS = [
 ];
 
 // deterministic PRNG (mulberry32)
+const SEED = Number(process.env.SEED || 0);
 function rng(seed) {
+    seed += SEED * 1000;
     let a = seed >>> 0;
     return () => {
         a = (a + 0x6d2b79f5) >>> 0;
@@ -259,6 +261,36 @@ if (want('html')) {
         }
     }
     writeCorpus('html', files);
+}
+
+// heavier markup mutations anywhere in the file
+if (want('html2')) {
+    const r = rng(22);
+    const pool = [...HTML_INSERTS, ...HTML_INSERTS, ...INSERTS];
+    const files = [];
+    for (const d of SVELTE_DIRS) {
+        for (const f of walk(d, ['.svelte'])) {
+            const t = fs.readFileSync(f, 'utf8');
+            if (!t.includes('<style') && r() > 0.1) continue;
+            for (let i = 0; i < 2; i++) {
+                let s = t;
+                const n = 3 + Math.floor(r() * 6);
+                for (let j = 0; j < n; j++) {
+                    const pos = Math.floor(r() * (s.length + 1));
+                    const op = r();
+                    if (op < 0.3) s = s.slice(0, pos) + s.slice(pos + 1 + Math.floor(r() * 8));
+                    else if (op < 0.9) s = s.slice(0, pos) + pool[Math.floor(r() * pool.length)] + s.slice(pos);
+                    else {
+                        const from = Math.floor(r() * s.length);
+                        s = s.slice(0, pos) + s.slice(from, from + Math.floor(r() * 60)) + s.slice(pos);
+                    }
+                }
+                if (!s.includes('<style')) s = '<style>.a { foo: bar; } .b {}</style>\n' + s;
+                files.push({ text: s, from: f });
+            }
+        }
+    }
+    writeCorpus('html2', files);
 }
 
 // --- hand-written ---
