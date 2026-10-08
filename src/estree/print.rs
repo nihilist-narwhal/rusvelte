@@ -1156,7 +1156,7 @@ impl<'a> Printer<'a> {
     }
 
     fn handle_var_declaration(&mut self, cx: &mut Ctx, node: &'a Node, d: &'a VariableDeclaration, no_in: bool) {
-        let mut open = self.new_ctx();
+        let open = self.new_ctx();
         let mut join = self.new_ctx();
         let mut child = self.new_ctx();
 
@@ -1191,7 +1191,6 @@ impl<'a> Printer<'a> {
         } else {
             self.write(&mut join, ", ");
         }
-        let _ = &mut open;
     }
 
     fn write_for_head_declaration(&mut self, cx: &mut Ctx, node: &'a Node, no_in: bool) {
