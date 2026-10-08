@@ -185,7 +185,9 @@ pub fn to_virtual_pos(pos: usize, added_code: &[AddedCode]) -> usize {
 }
 
 /// `toOriginalPos`: a generated position to an original one, and whether it was inside
-/// inserted code (then the position is where the code was inserted)
+/// inserted code (then the position is where the code was inserted). Where the JS returns a
+/// negative position (the start of an insertion near the start of the file), this returns 0;
+/// svelte-check clamps it to 0 anyway.
 pub fn to_original_pos(pos: usize, added_code: &[AddedCode]) -> (usize, bool) {
     let mut total = 0;
     let mut idx = 0;
@@ -202,7 +204,7 @@ pub fn to_original_pos(pos: usize, added_code: &[AddedCode]) -> (usize, bool) {
             return (prev.original_pos, true);
         }
     }
-    (pos.wrapping_sub(total), false)
+    (pos.saturating_sub(total), false)
 }
 
 /// `internalHelpers.upsertKitFile(ts, fileName, settings, getSource, undefined, rewrite)`.
@@ -1307,10 +1309,8 @@ fn parse_tag(text: &str, i: usize, e: usize, tags: &mut Vec<JsDocTag>, in_signat
                 tag.param = Some(param_name);
             }
         }
-        "returns" | "return" | "throws" | "exception" | "typedef" | "template" => {
-            if j < e && b[j] == b'{' {
-                j = type_expression(text, j, e, &mut tag.imports);
-            }
+        "returns" | "return" | "throws" | "exception" | "typedef" | "template" if j < e && b[j] == b'{' => {
+            j = type_expression(text, j, e, &mut tag.imports);
         }
         _ => {}
     }

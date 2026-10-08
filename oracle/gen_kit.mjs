@@ -91,6 +91,23 @@ for (const filePath of files) {
 		errors++;
 		result = { error: String(e.message).split('\n')[0] };
 	}
+	// internalHelpers.toOriginalPos around every insertion
+	if (result?.addedCode) {
+		const positions = new Set([0, result.text.length]);
+		for (const a of result.addedCode) {
+			for (const d of [-1, 0, 1]) {
+				positions.add(a.generatedPos + d);
+				positions.add(a.generatedPos + a.length + d);
+			}
+		}
+		result.mapped = [...positions]
+			.filter((p) => p >= 0)
+			.sort((a, b) => a - b)
+			.map((p) => {
+				const { pos, inGenerated } = internalHelpers.toOriginalPos(p, result.addedCode);
+				return [p, pos, inGenerated];
+			});
+	}
 	entries.push({ rel, isKit, fileName: sourcePath, workspacePath: workspace, generatedPath: outPath, result });
 }
 fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde_json::Value;
-use svelte_rs::svelte2tsx::kit::{is_kit_file, upsert_kit_file, AddedCode, KitFilesSettings};
+use svelte_rs::svelte2tsx::kit::{is_kit_file, to_original_pos, upsert_kit_file, AddedCode, KitFilesSettings};
 use svelte_rs::svelte2tsx::rewrite_imports::RewriteExternalImports;
 
 fn added_code_json(a: &AddedCode) -> Value {
@@ -34,6 +34,7 @@ fn main() {
     let emit_dir = format!("{workspace}/.svelte-kit/.svelte-check/svelte");
     let (mut files, mut is_kit_ok, mut kit, mut text_ok, mut both_ok) = (0, 0, 0, 0, 0);
     let mut failures = Vec::new();
+    let (mut mapped, mut mapped_ok) = (0, 0);
     for entry in oracle["entries"].as_array().unwrap() {
         let rel = entry["rel"].as_str().unwrap();
         if filter.as_ref().is_some_and(|f| !rel.contains(f.as_str())) {
@@ -71,6 +72,16 @@ fn main() {
                 let t_ok = e["text"].as_str() == Some(out.text.as_str());
                 let actual_added: Vec<Value> = out.added_code.iter().map(added_code_json).collect();
                 let a_ok = e["addedCode"].as_array().is_some_and(|exp| exp == &actual_added);
+                // toOriginalPos (negative JS positions are 0 here), with the same addedCode
+                for m in e["mapped"].as_array().into_iter().flatten().filter(|_| a_ok) {
+                    let (pos, orig, inside) = (m[0].as_u64().unwrap() as usize, m[1].as_i64().unwrap().max(0) as usize, m[2].as_bool().unwrap());
+                    mapped += 1;
+                    if to_original_pos(pos, &out.added_code) == (orig, inside) {
+                        mapped_ok += 1;
+                    } else {
+                        failures.push(format!("{rel}: toOriginalPos({pos}) differs: expected {:?}", (orig, inside)));
+                    }
+                }
                 if !t_ok || !a_ok {
                     failures.push(format!("{rel}: {}", if t_ok { "addedCode differs" } else { "text differs" }));
                     if verbose {
@@ -96,5 +107,5 @@ fn main() {
     for f in &failures {
         println!("{f}");
     }
-    println!("{files} files: isKitFile {is_kit_ok}/{files}; {kit} kit files: text {text_ok}/{kit}, text+addedCode {both_ok}/{kit}");
+    println!("{files} files: isKitFile {is_kit_ok}/{files}; {kit} kit files: text {text_ok}/{kit}, text+addedCode {both_ok}/{kit}; toOriginalPos {mapped_ok}/{mapped}");
 }
