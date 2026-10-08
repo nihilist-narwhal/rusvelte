@@ -140,17 +140,48 @@ pub fn style_diagnostics_utf16(text: &[u16]) -> Vec<CssDiagnostic> {
         .collect()
 }
 
+/// Nesting depth (of the guarded parser methods) handled on the calling thread. Enough for any
+/// real stylesheet and safe on a 2 MiB thread stack (a level takes up to ~1.3 KiB).
+const SHALLOW_DEPTH: u32 = 150;
+/// Deeper stylesheets are parsed again on a thread with a large stack, up to this depth. (The JS
+/// parser overflows its stack somewhere between ~300 and ~2000 levels, depending on the
+/// construct, and svelte-check then fails as a whole; past this limit we report nothing.)
+const DEEP_DEPTH: u32 = 20_000;
+const DEEP_STACK: usize = 256 << 20;
+
 /// `doValidation(document, parseStylesheet(document))`: parse errors, then lint warnings.
 /// `None` when the JS would throw.
 fn validate(css: &[u16], dialect: Dialect) -> Option<Vec<lint::Marker>> {
-    let mut p = parser::Parser::new(css, dialect);
-    let root = p.parse_stylesheet();
-    let ast = p.ast;
-    let mut markers = collect_parse_errors(&ast, root);
-    let lint = lint::lint(&ast, css, root);
-    ast.recycle();
-    markers.extend(lint.ok()?);
-    Some(markers)
+    match validate_with_limit(css, dialect, SHALLOW_DEPTH) {
+        Ok(r) => r,
+        Err(()) => std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(DEEP_STACK)
+                .spawn_scoped(s, || validate_with_limit(css, dialect, DEEP_DEPTH).unwrap_or(None))
+                .ok()
+                .and_then(|h| h.join().ok())
+                .flatten()
+        }),
+    }
+}
+
+/// `Err` when the stylesheet nests deeper than `max_depth`
+fn validate_with_limit(css: &[u16], dialect: Dialect, max_depth: u32) -> Result<Option<Vec<lint::Marker>>, ()> {
+    let run = std::panic::AssertUnwindSafe(|| {
+        let mut p = parser::Parser::new(css, dialect, max_depth);
+        let root = p.parse_stylesheet();
+        let ast = p.ast;
+        let mut markers = collect_parse_errors(&ast, root);
+        let lint = lint::lint(&ast, css, root);
+        ast.recycle();
+        markers.extend(lint.ok()?);
+        Some(markers)
+    });
+    match std::panic::catch_unwind(run) {
+        Ok(r) => Ok(r),
+        Err(payload) if payload.is::<parser::DepthExceeded>() => Err(()),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// `ParseErrorCollector`: the issues of the nodes in the tree, in tree order (pre-order, and

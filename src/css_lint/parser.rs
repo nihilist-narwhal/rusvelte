@@ -180,12 +180,17 @@ const PAGE_BOX_DIRECTIVES: [&str; 16] = [
     "@top-right-corner",
 ];
 
+/// The unwind payload when the parse nests deeper than allowed
+pub struct DepthExceeded;
+
 pub struct Parser<'a> {
     pub scanner: Scanner<'a>,
     pub ast: Ast,
     pub token: Token,
     pub prev_token: Option<Token>,
     last_error_token: Option<u32>,
+    depth: u32,
+    max_depth: u32,
     pub dialect: Dialect,
 }
 
@@ -214,15 +219,87 @@ pub fn is_word(c: u16) -> bool {
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(src: &'a [u16], dialect: Dialect) -> Self {
+    pub fn new(src: &'a [u16], dialect: Dialect, max_depth: u32) -> Self {
         Parser {
             scanner: Scanner::new(src, dialect),
             ast: Ast::new(),
             token: Token::initial(),
             prev_token: None,
             last_error_token: None,
+            depth: 0,
+            max_depth,
             dialect,
         }
+    }
+
+    // --- recursion guard ---
+    //
+    // Every recursive cycle of the grammar goes through one of the guarded methods below. Past
+    // `max_depth` the parse is abandoned by unwinding with `DepthExceeded` (`resume_unwind`
+    // doesn't run the panic hook); the caller catches it.
+
+    #[inline]
+    fn enter(&mut self) {
+        if self.depth >= self.max_depth {
+            std::panic::resume_unwind(Box::new(DepthExceeded));
+        }
+        self.depth += 1;
+    }
+
+    pub fn parse_declarations(&mut self, f: DeclFn) -> Option<NodeId> {
+        self.enter();
+        let r = self.parse_declarations_impl(f);
+        self.depth -= 1;
+        r
+    }
+
+    pub fn parse_selector(&mut self, is_nested: bool) -> Option<NodeId> {
+        self.enter();
+        let r = self.parse_selector_impl(is_nested);
+        self.depth -= 1;
+        r
+    }
+
+    pub fn parse_supports_condition(&mut self) -> NodeId {
+        self.enter();
+        let r = self.parse_supports_condition_impl();
+        self.depth -= 1;
+        r
+    }
+
+    pub fn parse_media_condition(&mut self) -> NodeId {
+        self.enter();
+        let r = self.parse_media_condition_impl();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_container_query(&mut self) -> NodeId {
+        self.enter();
+        let r = self.parse_container_query_impl();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_style_query(&mut self) -> NodeId {
+        self.enter();
+        let r = self.parse_style_query_impl();
+        self.depth -= 1;
+        r
+    }
+
+    pub fn parse_binary_expr(&mut self, preparsed_left: Option<NodeId>, preparsed_oper: Option<NodeId>) -> Option<NodeId> {
+        self.enter();
+        let r = self.parse_binary_expr_impl(preparsed_left, preparsed_oper);
+        self.depth -= 1;
+        r
+    }
+
+    pub fn scss_internal_parse_if_statement(&mut self, parse_statement: DeclFn) -> NodeId {
+        self.enter();
+        let r = self.scss_internal_parse_if_statement_impl(parse_statement);
+        self.depth -= 1;
+        r
     }
 
     // --- token helpers ---
@@ -666,7 +743,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn parse_declarations(&mut self, f: DeclFn) -> Option<NodeId> {
+    fn parse_declarations_impl(&mut self, f: DeclFn) -> Option<NodeId> {
         let node = self.create(Class::Declarations);
         if !self.accept(TT::CurlyL) {
             return None;
@@ -706,7 +783,7 @@ impl<'a> Parser<'a> {
         self.finish(node)
     }
 
-    pub fn parse_selector(&mut self, is_nested: bool) -> Option<NodeId> {
+    fn parse_selector_impl(&mut self, is_nested: bool) -> Option<NodeId> {
         if self.dialect == Dialect::Less {
             return self.less_parse_selector(is_nested);
         }
@@ -1225,7 +1302,7 @@ impl<'a> Parser<'a> {
         self.nested_declaration(is_nested)
     }
 
-    pub fn parse_supports_condition(&mut self) -> NodeId {
+    fn parse_supports_condition_impl(&mut self) -> NodeId {
         if self.dialect == Dialect::Scss
             && let Some(i) = self.scss_parse_interpolation()
         {
@@ -1372,7 +1449,7 @@ impl<'a> Parser<'a> {
         Some(self.finish(node))
     }
 
-    pub fn parse_media_condition(&mut self) -> NodeId {
+    fn parse_media_condition_impl(&mut self) -> NodeId {
         if self.dialect == Dialect::Scss
             && let Some(i) = self.scss_parse_interpolation()
         {
@@ -1606,7 +1683,7 @@ impl<'a> Parser<'a> {
         Some(self.parse_body(node, DeclFn::ContainerDeclaration(is_nested)))
     }
 
-    fn parse_container_query(&mut self) -> NodeId {
+    fn parse_container_query_impl(&mut self) -> NodeId {
         let node = self.create(Class::Node);
         if self.accept_ident("not") {
             let c = self.parse_container_query_in_parens();
@@ -1657,7 +1734,7 @@ impl<'a> Parser<'a> {
         self.finish(node)
     }
 
-    fn parse_style_query(&mut self) -> NodeId {
+    fn parse_style_query_impl(&mut self) -> NodeId {
         let node = self.create(Class::Node);
         if self.accept_ident("not") {
             let s = self.parse_style_in_parens();
@@ -2198,7 +2275,7 @@ impl<'a> Parser<'a> {
         Some(self.finish(node))
     }
 
-    pub fn parse_binary_expr(&mut self, preparsed_left: Option<NodeId>, preparsed_oper: Option<NodeId>) -> Option<NodeId> {
+    fn parse_binary_expr_impl(&mut self, preparsed_left: Option<NodeId>, preparsed_oper: Option<NodeId>) -> Option<NodeId> {
         let mut node = self.create(Class::BinaryExpression);
         let left = match preparsed_left {
             Some(l) => Some(l),

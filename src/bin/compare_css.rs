@@ -38,8 +38,14 @@ fn run() {
     let (mut total, mut pass, mut with_diags, mut with_diags_pass, mut n_diags) = (0, 0, 0, 0, 0);
     let mut time = Duration::ZERO;
     let mut failures = Vec::new();
+    let mut oracle_crashed = 0;
     for (rel, exp) in &expected {
         if filter.as_ref().is_some_and(|f| !rel.contains(f.as_str())) {
+            continue;
+        }
+        // svelte-check itself fails on the file (stack overflow on deeply nested CSS)
+        if exp.as_str().is_some_and(|s| s.starts_with("crash")) {
+            oracle_crashed += 1;
             continue;
         }
         let path = if rel.is_empty() { corpus.to_path_buf() } else { corpus.join(rel) };
@@ -75,6 +81,9 @@ fn run() {
     for f in failures.iter().take(if verbose { 0 } else { 30 }) {
         println!("FAIL {f}");
     }
+    if oracle_crashed > 0 {
+        println!("{oracle_crashed} files skipped: svelte-check crashes on them");
+    }
     println!(
         "{pass}/{total} files match exactly ({with_diags_pass}/{with_diags} files with diagnostics, {n_diags} expected diagnostics); style_diagnostics total {:.1} ms",
         time.as_secs_f64() * 1000.0
@@ -82,7 +91,7 @@ fn run() {
 }
 
 fn main() {
-    // deeply nested stylesheets recurse deeply, like the JS parser
-    let child = std::thread::Builder::new().stack_size(256 << 20).spawn(run).unwrap();
+    // run on a thread with the default (2 MiB) stack like a worker thread would
+    let child = std::thread::Builder::new().spawn(run).unwrap();
     child.join().unwrap();
 }

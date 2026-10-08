@@ -400,7 +400,7 @@ impl<'a> Parser<'a> {
         Some(self.scss_internal_parse_if_statement(parse_statement))
     }
 
-    fn scss_internal_parse_if_statement(&mut self, parse_statement: DeclFn) -> NodeId {
+    pub(super) fn scss_internal_parse_if_statement_impl(&mut self, parse_statement: DeclFn) -> NodeId {
         let node = self.create(Class::IfStatement);
         self.consume_token();
         let e = self.parse_expr(true);

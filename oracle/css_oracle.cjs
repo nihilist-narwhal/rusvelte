@@ -63,9 +63,18 @@ async function main() {
     for (const file of files) {
         const text = fs.readFileSync(file, 'utf-8');
         const uri = pathToFileURL(file).href;
-        await sc.upsertDocument({ uri, text }, true);
-        const { diagnostics } = await sc.getDiagnosticsForFile(uri);
-        await sc.removeDocument(uri);
+        let diagnostics;
+        try {
+            // parses the stylesheet (in the `documentOpen` handler)
+            await sc.upsertDocument({ uri, text }, true);
+            ({ diagnostics } = await sc.getDiagnosticsForFile(uri));
+        } catch (e) {
+            // e.g. a stack overflow on deeply nested CSS: svelte-check itself fails then
+            result[path.relative(roots.get(file), file)] = 'crash: ' + String(e).split('\n')[0];
+            continue;
+        } finally {
+            await sc.removeDocument(uri).catch(() => {});
+        }
         result[path.relative(roots.get(file), file)] = diagnostics.map((d) => ({
             range: d.range,
             severity: d.severity,
