@@ -29,7 +29,8 @@ pub struct Options {
     pub accessors: bool,
 }
 
-const SVG_ATTRIBUTES: &str = include_str!("svgattributes.txt");
+static SVG_ATTRIBUTES: std::sync::LazyLock<HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| include_str!("svgattributes.txt").split_whitespace().collect());
 
 const NUMBER_ONLY_ATTRIBUTES: &[&str] = &[
     "aria-colcount", "aria-colindex", "aria-colspan", "aria-level", "aria-posinset", "aria-rowcount",
@@ -1079,7 +1080,7 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
     }
 
     fn transform_attribute_case(&self, name: &str, el: usize) -> String {
-        let is_svg = SVG_ATTRIBUTES.split_whitespace().any(|x| x == name);
+        let is_svg = SVG_ATTRIBUTES.contains(name);
         if !self.opts.preserve_attribute_case
             && !is_svg
             && !(self.els.kind(el) == Kind::Element && self.els.is_custom_element(el))

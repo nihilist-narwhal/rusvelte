@@ -25,16 +25,28 @@ pub struct VerbatimAttr<'a> {
 
 const WS: &str = r"\t\n\x0B\x0C\r \u{a0}\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}";
 
-fn tag_regex(tag: &str) -> fancy_regex::Regex {
+fn tag_regex(tag: &str) -> regex::Regex {
     // (<!--[^]*?-->)|(<tag((?:\s+[^=>'"\/\s]+=(?:"[^"]*"|'[^']*'|[^>\s]+)|\s+[^=>'"\/\s]+)*\s*)>)([\S\s]*?)<\/tag>
-    fancy_regex::Regex::new(&format!(
+    regex::Regex::new(&format!(
         r#"(<!--[\s\S]*?-->)|(<{tag}((?:[{WS}]+[^=>'"/{WS}]+=(?:"[^"]*"|'[^']*'|[^>{WS}]+)|[{WS}]+[^=>'"/{WS}]+)*[{WS}]*)>)([\s\S]*?)</{tag}>"#
     ))
     .unwrap()
 }
 
-static SCRIPT: LazyLock<fancy_regex::Regex> = LazyLock::new(|| tag_regex("script"));
-static STYLE: LazyLock<fancy_regex::Regex> = LazyLock::new(|| tag_regex("style"));
+static SCRIPT: LazyLock<regex::Regex> = LazyLock::new(|| tag_regex("script"));
+static STYLE: LazyLock<regex::Regex> = LazyLock::new(|| tag_regex("style"));
+
+/// The opening tag alone, anchored, for its groups (running the capture engine over a whole
+/// element is slow when the contents are large)
+fn open_tag_regex(tag: &str) -> regex::Regex {
+    regex::Regex::new(&format!(
+        r#"^<{tag}((?:[{WS}]+[^=>'"/{WS}]+=(?:"[^"]*"|'[^']*'|[^>{WS}]+)|[{WS}]+[^=>'"/{WS}]+)*[{WS}]*)>"#
+    ))
+    .unwrap()
+}
+
+static SCRIPT_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| open_tag_regex("script"));
+static STYLE_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| open_tag_regex("style"));
 static ATTR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r#"([\w\-$]+\b)(?:=(?:"([^"]*)"|'([^']*)'|(\S+)))?"#).unwrap());
 
@@ -62,28 +74,29 @@ fn parse_attributes(s: &str, start: usize) -> Vec<VerbatimAttr<'_>> {
 
 fn find_next(htmlx: &str, from: usize) -> Option<(Verbatim<'_>, usize)> {
     let mut best: Option<(Verbatim, usize)> = None;
-    for (is_style, re) in [(false, &*SCRIPT), (true, &*STYLE)] {
+    for (is_style, re, open_re) in [(false, &*SCRIPT, &*SCRIPT_OPEN), (true, &*STYLE, &*STYLE_OPEN)] {
         let mut pos = from;
-        while let Ok(Some(m)) = re.captures_from_pos(htmlx, pos) {
-            let whole = m.get(0).unwrap();
+        while let Some(whole) = re.find_at(htmlx, pos) {
             if whole.as_str().starts_with("<!--") {
                 pos = whole.end().max(pos + 1);
                 continue;
             }
             if best.as_ref().is_none_or(|(b, _)| whole.start() < b.start) {
-                let open = m.get(2).unwrap();
-                let content = m.get(4);
                 let tag = if is_style { "style" } else { "script" };
-                let content_start = whole.start() + open.as_str().len();
-                let content_len = content.map_or(0, |c| c.as_str().len());
+                // the regex matched `<tag attrs>content</tag>`: re-read the opening tag for its groups
+                let Some(open) = open_re.captures(&htmlx[whole.start()..]) else { break };
+                let open_len = open.get(0).unwrap().len();
+                let attrs = open.get(1).map_or("", |a| a.as_str());
+                let content_start = whole.start() + open_len;
+                let content_end = whole.end() - format!("</{tag}>").len();
                 best = Some((
                     Verbatim {
                         is_style,
                         start: whole.start(),
                         end: whole.end(),
-                        attributes: parse_attributes(m.get(3).map_or("", |a| a.as_str()), whole.start() + tag.len() + 1),
+                        attributes: parse_attributes(attrs, whole.start() + tag.len() + 1),
                         content_start,
-                        content_end: content_start + content_len,
+                        content_end: content_end.max(content_start),
                     },
                     whole.end(),
                 ));

@@ -71,6 +71,8 @@ pub struct MagicString<'s> {
     /// chunk starting / ending at each offset (dense, `NONE` if none)
     by_start: Vec<u32>,
     by_end: Vec<u32>,
+    /// original start offset → chunk, to find the chunk containing an offset quickly
+    starts: std::collections::BTreeMap<usize, u32>,
 }
 
 impl<'s> MagicString<'s> {
@@ -89,6 +91,7 @@ impl<'s> MagicString<'s> {
             last_searched_chunk: 0,
             by_start,
             by_end,
+            starts: std::collections::BTreeMap::from([(0, 0)]),
         }
     }
 
@@ -348,6 +351,15 @@ impl<'s> MagicString<'s> {
             return Ok(());
         }
 
+        // Fast path: the chunk whose original range contains `index`. magic-string finds it by
+        // walking neighbors from the last searched chunk; when that walk would succeed it ends
+        // at this same chunk.
+        if let Some((_, &c)) = self.starts.range(..=index).next_back() {
+            if self.chunk(c).contains(index) {
+                return self.split_chunk(c, index);
+            }
+        }
+
         let mut chunk = self.last_searched_chunk;
         let mut previous_chunk = chunk;
         let search_forward = index > self.chunk(chunk).end;
@@ -408,6 +420,7 @@ impl<'s> MagicString<'s> {
         self.by_end[index] = chunk;
         self.by_start[index] = new_id;
         self.by_end[new_end] = new_id;
+        self.starts.insert(index, new_id);
 
         if chunk == self.last_chunk {
             self.last_chunk = new_id;
