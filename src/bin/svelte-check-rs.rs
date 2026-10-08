@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use svelte_rs::check::writer::{Format, Threshold};
-use svelte_rs::check::{run, CheckOptions};
+use rusvelte::check::writer::{Format, Threshold};
+use rusvelte::check::{run, CheckOptions};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -87,7 +87,7 @@ fn main() {
         threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
         timings,
         incremental,
-        watch: svelte_rs::check::writer::WatchOutput {
+        watch: rusvelte::check::writer::WatchOutput {
             watching: watch,
             clear_screen: !preserve_watch_output && std::io::stdout().is_terminal(),
         },
@@ -95,7 +95,7 @@ fn main() {
     if watch {
         let stdout = std::io::stdout();
         let mut out = LineFlush(stdout.lock());
-        svelte_rs::check::watch(&opts, &mut out);
+        rusvelte::check::watch(&opts, &mut out);
     }
     let start = std::time::Instant::now();
     let stdout = std::io::stdout();

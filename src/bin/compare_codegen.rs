@@ -1,4 +1,4 @@
-//! Compare `svelte_rs::transform::compile` with the output of `oracle/gen_codegen.mjs`.
+//! Compare `rusvelte::transform::compile` with the output of `oracle/gen_codegen.mjs`.
 //!
 //!   cargo run --release --bin compare_codegen -- <oracle out dir> [client|server]
 //!
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::Value;
-use svelte_rs::transform::options::{CompileOptions, Generate};
+use rusvelte::transform::options::{CompileOptions, Generate};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -74,7 +74,7 @@ fn main() {
         }
         if let Some(Some(code)) = expected_error {
             error_total += 1;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| svelte_rs::transform::compile_module(&source, &options)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rusvelte::transform::compile_module(&source, &options)));
             let got = match &result {
                 Err(_) => "panic".to_string(),
                 Ok(Err(e)) => e.code.to_string(),
@@ -96,9 +96,9 @@ fn main() {
         let t = std::time::Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if is_module {
-                svelte_rs::transform::compile_module(&source, &options)
+                rusvelte::transform::compile_module(&source, &options)
             } else {
-                svelte_rs::transform::compile(&source, &options)
+                rusvelte::transform::compile(&source, &options)
             }
         }));
         compile_time += t.elapsed();

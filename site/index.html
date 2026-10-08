@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>rust-velte</title>
+<title>rusvelte</title>
 <meta name="description" content="An experimental Rust port of the Svelte 5 compiler and svelte-check, verified byte-for-byte against the official tools.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ff3e00'/%3E%3Cpath d='M9 22V10h7a4 4 0 0 1 0 8h-7m7 0 5 4' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
@@ -136,7 +136,7 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
 <body>
 <div class="wrap">
   <header class="top">
-    <a class="brand" href="#"><span class="dot"></span>rust-velte</a>
+    <a class="brand" href="#"><span class="dot"></span>rusvelte</a>
     <nav>
       <a href="#parity">Parity</a>
       <a href="#speed">Speed</a>
@@ -149,7 +149,7 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
     <div class="hero">
       <span class="tag">Experimental · not affiliated with the Svelte team</span>
       <h1>The Svelte 5 compiler, in Rust.<br><em>Byte for byte.</em></h1>
-      <p class="lede">rust-velte is a port of the Svelte 5 compiler and svelte-check to Rust. Every layer is checked against the official JavaScript tools: on four real-world codebases its compiled output is identical, character for character, to Svelte 5.57.2's.</p>
+      <p class="lede">rusvelte is a port of the Svelte 5 compiler and svelte-check to Rust. Every layer is checked against the official JavaScript tools: on four real-world codebases its compiled output is identical, character for character, to Svelte 5.57.2's.</p>
       <div class="cta">
         <a class="btn primary repo-link" href="#">View the source</a>
         <a class="btn ghost" href="#parity">See the numbers</a>
@@ -204,7 +204,7 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
     <section id="speed">
       <h2>Speed</h2>
       <p class="sub">Same machine, warm runs. Compile times exclude file reading and use one thread; the compiler hasn't been profiled or tuned yet.</p>
-      <div class="legend"><span><i style="background:var(--bar-js)"></i>Official (Node)</span><span><i style="background:var(--accent)"></i>rust-velte</span></div>
+      <div class="legend"><span><i style="background:var(--bar-js)"></i>Official (Node)</span><span><i style="background:var(--accent)"></i>rusvelte</span></div>
       <div class="bars">
         <div class="bar-row">
           <div class="label"><span>Compile Windmill, client (1,982 components)</span><span>6.0 s → 1.6 s</span></div>
@@ -272,7 +272,7 @@ cd my-app
   </main>
 
   <footer>
-    rust-velte ports code from <a href="https://github.com/sveltejs/svelte">Svelte</a>, <a href="https://github.com/sveltejs/language-tools">Svelte language tools</a>, <a href="https://github.com/sveltejs/esrap">esrap</a>, <a href="https://github.com/Rich-Harris/magic-string">magic-string</a> and <a href="https://github.com/microsoft/vscode-css-languageservice">vscode-css-languageservice</a>, and parses JavaScript with <a href="https://oxc.rs">oxc</a>. MIT licensed. It is an independent project, not affiliated with or endorsed by the Svelte team.
+    rusvelte ports code from <a href="https://github.com/sveltejs/svelte">Svelte</a>, <a href="https://github.com/sveltejs/language-tools">Svelte language tools</a>, <a href="https://github.com/sveltejs/esrap">esrap</a>, <a href="https://github.com/Rich-Harris/magic-string">magic-string</a> and <a href="https://github.com/microsoft/vscode-css-languageservice">vscode-css-languageservice</a>, and parses JavaScript with <a href="https://oxc.rs">oxc</a>. MIT licensed. It is an independent project, not affiliated with or endorsed by the Svelte team.
   </footer>
 </div>
 <script>

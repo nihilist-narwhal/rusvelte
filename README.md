@@ -1,4 +1,4 @@
-# rust-velte
+# rusvelte
 
 An experimental Rust port of the Svelte 5 compiler and tooling, including a faster `svelte-check`. Not affiliated with the Svelte team; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the projects it ports. The project page lives in `site/` and deploys to GitHub Pages. JavaScript
 inside components is parsed with [oxc](https://oxc.rs). Every layer is checked against the JS
@@ -90,7 +90,7 @@ flags (`--singleThreaded` makes results independent of how files are split betwe
 
 ## CSS output
 
-`svelte_rs::compile_css(source, filename, &CssOptions)` returns `result.css` of `compile`
+`rusvelte::compile_css(source, filename, &CssOptions)` returns `result.css` of `compile`
 (`code` and `has_global`), and `transform::compile_styles` also the stylesheet injected into
 the JS with `css: 'injected'` or custom elements. It is a port of `render_stylesheet`
 (`src/transform/css.rs`), with the `cssHash`, `css`, `dev`, `customElement` and `rootDir`
@@ -98,7 +98,7 @@ options. Source maps aren't produced yet.
 
 ## Analysis
 
-`svelte_rs::analyze::compile_diagnostics(source, filename)` reproduces the `warnings` of
+`rusvelte::analyze::compile_diagnostics(source, filename)` reproduces the `warnings` of
 `compile(source, { dev: true, generate: false, filename })`, or the error it throws. That
 covers scopes, runes and legacy analysis, a11y, CSS pruning (`css_unused_selector`) and
 svelte-ignore. `compile_diagnostics_with` takes the `runes`, `customElement` and

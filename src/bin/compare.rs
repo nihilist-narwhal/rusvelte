@@ -33,9 +33,9 @@ fn main() {
 
         let actual = std::panic::catch_unwind(|| {
             if legacy {
-                svelte_rs::parse_legacy(&source, loose)
+                rusvelte::parse_legacy(&source, loose)
             } else {
-                svelte_rs::parse_modern(&source, loose)
+                rusvelte::parse_modern(&source, loose)
             }
         });
         let reason = match (actual, &expected) {

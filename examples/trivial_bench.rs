@@ -9,13 +9,13 @@ fn main() {
         let n: usize = std::env::var("N").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
         let t = std::time::Instant::now();
         for _ in 0..n {
-            std::hint::black_box(svelte_rs::analyze::compile_diagnostics(src, "App.svelte")).ok();
+            std::hint::black_box(rusvelte::analyze::compile_diagnostics(src, "App.svelte")).ok();
         }
         let per = t.elapsed().as_secs_f64() / n as f64 * 1e6;
         let t = std::time::Instant::now();
         for _ in 0..n {
             let alloc = oxc_allocator::Allocator::default();
-            std::hint::black_box(svelte_rs::parse(&alloc, src, false)).ok();
+            std::hint::black_box(rusvelte::parse(&alloc, src, false)).ok();
         }
         let parse = t.elapsed().as_secs_f64() / n as f64 * 1e6;
         println!("{:6.2} µs total, {:6.2} µs parse  {:?}", per, parse, &src[..src.len().min(30)]);

@@ -1,4 +1,4 @@
-//! Compare `svelte_rs::transform::compile_styles` with the output of
+//! Compare `rusvelte::transform::compile_styles` with the output of
 //! `oracle/gen_css_output.mjs` (`result.css` of `compile(source, { filename, generate: 'client',
 //! ...compileOptions })`, and the `$$css` code of injected styles).
 //!
@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{json, Value};
-use svelte_rs::transform::{compile_styles, CssHashInput, CssMode, CssOptions};
+use rusvelte::transform::{compile_styles, CssHashInput, CssMode, CssOptions};
 
 /// A JS `hash` function for evaluated `cssHash` functions (`compiler/utils.js`)
 const JS_HASH: &str = "(str) => { str = str.replace(/\\r/g, ''); let hash = 5381; let i = str.length; while (i--) hash = ((hash << 5) - hash) ^ str.charCodeAt(i); return (hash >>> 0).toString(36); }";

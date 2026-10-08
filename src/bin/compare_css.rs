@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use svelte_rs::css_lint::{CssDiagnostic, style_diagnostics};
+use rusvelte::css_lint::{CssDiagnostic, style_diagnostics};
 
 fn to_json(d: &CssDiagnostic) -> Value {
     json!({

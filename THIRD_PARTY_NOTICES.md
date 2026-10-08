@@ -1,6 +1,6 @@
 # Third-party notices
 
-rust-velte ports code from the following MIT-licensed projects. Their notices follow.
+rusvelte ports code from the following MIT-licensed projects. Their notices follow.
 
 ## [Svelte](https://github.com/sveltejs/svelte)
 

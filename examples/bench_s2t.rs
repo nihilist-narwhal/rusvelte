@@ -2,9 +2,9 @@
 fn main() {
     let dir = std::env::args().nth(1).unwrap();
     let files: Vec<(String, String)> = glob(&std::path::PathBuf::from(&dir));
-    let opts: Vec<svelte_rs::svelte2tsx::Svelte2TsxOptions> = files
+    let opts: Vec<rusvelte::svelte2tsx::Svelte2TsxOptions> = files
         .iter()
-        .map(|(name, src)| svelte_rs::svelte2tsx::Svelte2TsxOptions {
+        .map(|(name, src)| rusvelte::svelte2tsx::Svelte2TsxOptions {
             filename: Some(name.clone()),
             is_ts_file: src.contains("lang=\"ts\"") || src.contains("lang='ts'"),
             emit_jsdoc: true,
@@ -13,7 +13,7 @@ fn main() {
         .collect();
     let run = || {
         for ((_, src), o) in files.iter().zip(&opts) {
-            let _ = std::hint::black_box(svelte_rs::svelte2tsx::svelte2tsx(src, o));
+            let _ = std::hint::black_box(rusvelte::svelte2tsx::svelte2tsx(src, o));
         }
     };
     for _ in 0..3 {
@@ -38,7 +38,7 @@ fn main() {
                 s.spawn(|| loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some((_, src)) = files.get(i) else { break };
-                    let _ = std::hint::black_box(svelte_rs::svelte2tsx::svelte2tsx(src, &opts[i]));
+                    let _ = std::hint::black_box(rusvelte::svelte2tsx::svelte2tsx(src, &opts[i]));
                 });
             }
         });

@@ -612,6 +612,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rusvelte"
+version = "0.1.0"
+dependencies = [
+ "compact_str",
+ "fancy-regex",
+ "indexmap",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_diagnostics",
+ "oxc_ecmascript",
+ "oxc_estree",
+ "oxc_parser",
+ "oxc_span",
+ "oxc_syntax",
+ "regex",
+ "rustc-hash",
+ "ryu-js",
+ "serde_json",
+ "smallvec",
+ "unicode-id-start",
+]
+
+[[package]]
 name = "ryu-js"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -699,30 +723,6 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
-name = "svelte-rs"
-version = "0.1.0"
-dependencies = [
- "compact_str",
- "fancy-regex",
- "indexmap",
- "oxc_allocator",
- "oxc_ast",
- "oxc_ast_visit",
- "oxc_diagnostics",
- "oxc_ecmascript",
- "oxc_estree",
- "oxc_parser",
- "oxc_span",
- "oxc_syntax",
- "regex",
- "rustc-hash",
- "ryu-js",
- "serde_json",
- "smallvec",
- "unicode-id-start",
-]
 
 [[package]]
 name = "syn"

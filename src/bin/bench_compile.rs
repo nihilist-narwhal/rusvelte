@@ -21,12 +21,12 @@ fn main() {
         for (src, _) in &files {
             let alloc = oxc_allocator::Allocator::default();
             let src = src.strip_prefix('\u{feff}').unwrap_or(src);
-            let _ = std::hint::black_box(svelte_rs::parse(&alloc, src, false));
+            let _ = std::hint::black_box(rusvelte::parse(&alloc, src, false));
         }
     };
     let diagnostics = || {
         for (src, name) in &files {
-            let _ = std::hint::black_box(svelte_rs::analyze::compile_diagnostics(src, name));
+            let _ = std::hint::black_box(rusvelte::analyze::compile_diagnostics(src, name));
         }
     };
     println!("{} files, {:.2} MB", files.len(), bytes as f64 / 1e6);

@@ -16,12 +16,12 @@ fn main() {
         for (src, loose) in &files {
             let alloc = oxc_allocator::Allocator::default();
             let src = src.strip_prefix('\u{feff}').unwrap_or(src);
-            let _ = std::hint::black_box(svelte_rs::parse(&alloc, src, *loose));
+            let _ = std::hint::black_box(rusvelte::parse(&alloc, src, *loose));
         }
     };
     let with_json = || {
         for (src, loose) in &files {
-            let _ = std::hint::black_box(svelte_rs::parse_modern(src, *loose));
+            let _ = std::hint::black_box(rusvelte::parse_modern(src, *loose));
         }
     };
     println!("{} files, {:.2} MB", files.len(), bytes as f64 / 1e6);

@@ -1,4 +1,4 @@
-//! Compare the esrap port (`svelte_rs::estree::print`) with the output of
+//! Compare the esrap port (`rusvelte::estree::print`) with the output of
 //! `oracle/gen_esrap.mjs` (acorn + esrap's `print(ast, ts({ comments }))`).
 //!
 //!   cargo run --release --bin compare_esrap -- <oracle out.json>...
@@ -17,8 +17,8 @@ use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
 use serde_json::Value;
-use svelte_rs::estree::{self, convert, print};
-use svelte_rs::locator::Locator;
+use rusvelte::estree::{self, convert, print};
+use rusvelte::locator::Locator;
 
 fn first_difference(expected: &str, actual: &str) -> (usize, String, String) {
     let e: Vec<&str> = expected.split('\n').collect();

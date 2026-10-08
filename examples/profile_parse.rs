@@ -11,7 +11,7 @@ fn main() {
     while t.elapsed().as_secs_f64() < secs {
         for (src, loose) in &files {
             let alloc = oxc_allocator::Allocator::default();
-            let _ = std::hint::black_box(svelte_rs::parse(&alloc, src.strip_prefix('\u{feff}').unwrap_or(src), *loose));
+            let _ = std::hint::black_box(rusvelte::parse(&alloc, src.strip_prefix('\u{feff}').unwrap_or(src), *loose));
         }
     }
 }

@@ -1,5 +1,5 @@
 //! Replay tools/fuzz_magic_string.mjs cases against src/magic_string.rs
-use svelte_rs::magic_string::MagicString;
+use rusvelte::magic_string::MagicString;
 
 /// UTF-16 offset → byte offset
 fn byte_at(s: &str, utf16: usize) -> usize {

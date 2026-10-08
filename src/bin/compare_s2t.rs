@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
-use svelte_rs::svelte2tsx::{htmlx2jsx, svelte2tsx, Options, Svelte2TsxOptions};
+use rusvelte::svelte2tsx::{htmlx2jsx, svelte2tsx, Options, Svelte2TsxOptions};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -49,7 +49,7 @@ fn main() {
                     namespace_foreign: o["namespace"].as_str() == Some("foreign"),
                     emit_jsdoc: o["emitJsDoc"].as_bool().unwrap_or(false),
                     svelte5_plus: true,
-                    rewrite_external_imports: o.get("rewriteExternalImports").map(|r| svelte_rs::svelte2tsx::rewrite_imports::RewriteExternalImports {
+                    rewrite_external_imports: o.get("rewriteExternalImports").map(|r| rusvelte::svelte2tsx::rewrite_imports::RewriteExternalImports {
                         source_path: o["filename"].as_str().unwrap().into(),
                         generated_path: r["generatedPath"].as_str().unwrap().into(),
                         workspace_path: r["workspacePath"].as_str().unwrap().into(),

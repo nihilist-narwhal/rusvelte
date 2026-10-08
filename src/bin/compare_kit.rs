@@ -5,8 +5,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde_json::Value;
-use svelte_rs::svelte2tsx::kit::{is_kit_file, to_original_pos, upsert_kit_file, AddedCode, KitFilesSettings};
-use svelte_rs::svelte2tsx::rewrite_imports::RewriteExternalImports;
+use rusvelte::svelte2tsx::kit::{is_kit_file, to_original_pos, upsert_kit_file, AddedCode, KitFilesSettings};
+use rusvelte::svelte2tsx::rewrite_imports::RewriteExternalImports;
 
 fn added_code_json(a: &AddedCode) -> Value {
     serde_json::json!({

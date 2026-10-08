@@ -1,4 +1,4 @@
-//! Compare `svelte_rs::analyze::compile_diagnostics` with the output of
+//! Compare `rusvelte::analyze::compile_diagnostics` with the output of
 //! `oracle/gen_compile.mjs` (`compile(source, { dev: true, generate: false, filename })`).
 //!
 //!   cargo run --release --bin compare_compile -- <corpus dir> <oracle out dir>
@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{json, Value};
-use svelte_rs::analyze::{compile_diagnostics_with, CompileOptions, Diagnostic, Position};
+use rusvelte::analyze::{compile_diagnostics_with, CompileOptions, Diagnostic, Position};
 
 fn pos(p: &Option<Position>) -> Value {
     match p {

@@ -7,11 +7,11 @@ fn main() {
     let mut json: serde_json::Value = args.get(3).map(|s| serde_json::from_str(s).unwrap()).unwrap_or(serde_json::json!({}));
     json["generate"] = args.get(2).cloned().unwrap_or_else(|| "server".into()).into();
     json["filename"] = args[1].clone().into();
-    let options = svelte_rs::transform::options::CompileOptions::from_json(&json);
+    let options = rusvelte::transform::options::CompileOptions::from_json(&json);
     let result = if args[1].ends_with(".js") || args[1].ends_with(".ts") {
-        svelte_rs::transform::compile_module(&source, &options)
+        rusvelte::transform::compile_module(&source, &options)
     } else {
-        svelte_rs::transform::compile(&source, &options)
+        rusvelte::transform::compile(&source, &options)
     };
     match result {
         Ok(out) => print!("{}", out.js),
