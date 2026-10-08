@@ -155,7 +155,8 @@ impl<'a, 's> Server<'a, 's> {
             }
         };
 
-        for a in &el.attributes {
+        let all_attributes = self.element_attributes(n);
+        for &a in &all_attributes {
             match a {
                 Attr::Attribute { name, value, .. } => {
                     if *name == "value" {
@@ -203,7 +204,7 @@ impl<'a, 's> Server<'a, 's> {
                     } else if u::is_content_editable_binding(name) || (*name == "value" && el.name == "textarea") {
                         content = Some(b::call("$.escape", vec![e]));
                     } else if *name == "group" && !is_sequence {
-                        let value_attribute = el.attributes.iter().find(|x| matches!(x, Attr::Attribute { name: "value", .. }));
+                        let value_attribute = all_attributes.iter().copied().find(|x| matches!(x, Attr::Attribute { name: "value", .. }));
                         let Some(Attr::Attribute { value: va, .. }) = value_attribute else { continue };
                         let is_checkbox = el.attributes.iter().any(|x| matches!(x, Attr::Attribute { name: "type", value, .. } if u::text_value(value) == Some("checkbox")));
                         let v = self.build_attribute_value(va, st, opt, false, false, false);
@@ -416,7 +417,8 @@ impl<'a, 's> Server<'a, 's> {
         let mut attributes = Vec::new();
         let mut class_directives = Vec::new();
         let mut style_directives = Vec::new();
-        for a in &el.attributes {
+        let _ = &el.attributes;
+        for a in self.element_attributes(n) {
             match a {
                 Attr::Attribute { .. } | Attr::Spread { .. } => attributes.push(ElAttr::Attr(a)),
                 Attr::Directive { kind: "BindDirective", .. } => attributes.push(ElAttr::Bind(a)),

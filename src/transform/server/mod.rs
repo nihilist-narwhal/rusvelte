@@ -81,6 +81,9 @@ pub struct Server<'a, 's> {
     /// `state.filename` (relative to `rootDir`)
     pub filename: String,
     pub dev: bool,
+    /// Elements the analysis gives an empty `class`/`style` attribute (appended to their attributes)
+    pub synthetic_class: rustc_hash::FxHashSet<crate::ast::NodeId>,
+    pub synthetic_style: rustc_hash::FxHashSet<crate::ast::NodeId>,
     /// Names of the functions snippets became (the JS marks them `___snippet`)
     pub snippet_fns: Vec<String>,
     /// The converted instance script's statements and declarators, by origin
@@ -280,7 +283,14 @@ pub fn server_component(s: &mut Server) -> Node {
     let mut component_block = instance_body;
     component_block.extend(template_body);
     if let Some(props_id) = s.an.props_id {
-        component_block.insert(0, b::r#const(b::id(props_id.name), b::call("$.props_id", vec![b::id("$$renderer")])));
+        // the declaration's own identifier (with its position, so comments land around it)
+        let mut id = b::id(props_id.name);
+        if let Some((start, end)) = props_id.span {
+            let span = oxc_span::Span::new(start, end);
+            id.span = Some(crate::estree::Span::new(start, end));
+            id.loc = Some(s.conv.location(span));
+        }
+        component_block.insert(0, b::r#const(id, b::call("$.props_id", vec![b::id("$$renderer")])));
     }
     let mut component_block = b::block(component_block);
     // trick esrap into including comments
@@ -351,4 +361,68 @@ fn program_body(node: Node) -> Vec<Node> {
 /// `{ type: 'Program', sourceType: 'module', body }`
 fn program_node(body: Vec<Node>) -> Node {
     Node::new(NodeKind::Program(crate::estree::Program { body, source_type: crate::estree::SourceType::Module }))
+}
+
+thread_local! {
+    /// The `class=""`/`style=""` attributes the analysis appends (`create_attribute`)
+    static SYNTHETIC: (&'static crate::ast::Attr<'static>, &'static crate::ast::Attr<'static>) = {
+        let make = |name: &'static str| -> &'static crate::ast::Attr<'static> {
+            Box::leak(Box::new(crate::ast::Attr::Attribute {
+                start: usize::MAX,
+                end: usize::MAX,
+                name,
+                name_loc: None,
+                value: crate::ast::AttrValue::Sequence(vec![crate::ast::Chunk::Text { start: usize::MAX, end: usize::MAX, raw: "", data: "".into() }]),
+            }))
+        };
+        (make("class"), make("style"))
+    };
+}
+
+impl<'a, 's> Server<'a, 's> {
+    /// An element's attributes, with the analysis' synthetic `class`/`style` at the end
+    pub fn element_attributes(&self, n: crate::ast::NodeId) -> Vec<&'s crate::ast::Attr<'s>> {
+        let crate::ast::Node::Element(el) = &self.ast().nodes[n] else { return vec![] };
+        let mut out: Vec<&'s crate::ast::Attr<'s>> = el.attributes.iter().collect();
+        if self.synthetic_class.contains(&n) {
+            out.push(SYNTHETIC.with(|s| s.0));
+        }
+        if self.synthetic_style.contains(&n) {
+            out.push(SYNTHETIC.with(|s| s.1));
+        }
+        out
+    }
+}
+
+/// The elements that get a synthetic `class=""` (scoped or with class directives) and
+/// `style=""` (with style directives), when they have no such attribute nor a spread
+pub fn synthetic_attributes(an: &Analyzer, scoped: &rustc_hash::FxHashSet<crate::ast::NodeId>) -> (rustc_hash::FxHashSet<crate::ast::NodeId>, rustc_hash::FxHashSet<crate::ast::NodeId>) {
+    let mut class = rustc_hash::FxHashSet::default();
+    let mut style = rustc_hash::FxHashSet::default();
+    for &n in &an.elements {
+        let crate::ast::Node::Element(el) = &an.ast.nodes[n] else { continue };
+        let (mut has_class, mut has_style, mut has_spread, mut has_class_directive, mut has_style_directive) = (false, false, false, false, false);
+        for a in &el.attributes {
+            match a {
+                crate::ast::Attr::Spread { .. } => {
+                    has_spread = true;
+                    break;
+                }
+                crate::ast::Attr::Attribute { name, .. } => {
+                    has_class |= name.to_lowercase() == "class";
+                    has_style |= name.to_lowercase() == "style";
+                }
+                crate::ast::Attr::Directive { kind: "ClassDirective", .. } => has_class_directive = true,
+                crate::ast::Attr::StyleDirective { .. } => has_style_directive = true,
+                _ => {}
+            }
+        }
+        if !has_spread && !has_class && (scoped.contains(&n) || has_class_directive) {
+            class.insert(n);
+        }
+        if !has_spread && !has_style && has_style_directive {
+            style.insert(n);
+        }
+    }
+    (class, style)
 }

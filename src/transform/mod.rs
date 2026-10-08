@@ -251,6 +251,7 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
         None => String::new(),
     };
     let scoped = analysis.css.as_ref().map(|m| m.scoped_elements.clone()).unwrap_or_default();
+    let (synthetic_class, synthetic_style) = server::synthetic_attributes(&analysis.an, &scoped);
 
     let css = match (&root.css, &analysis.css) {
         (Some(sheet), Some(meta)) if !combined.css_injected && !analysis.custom_element => {
@@ -297,6 +298,8 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
                 dev: options.dev,
                 instance_nodes: Default::default(),
                 snippet_fns: Vec::new(),
+                synthetic_class,
+                synthetic_style,
             };
             server::server_component(&mut s)
         }
