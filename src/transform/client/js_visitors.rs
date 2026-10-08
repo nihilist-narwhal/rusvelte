@@ -1102,15 +1102,16 @@ impl<'a, 's> Client<'a, 's> {
                     continue;
                 }
                 if rune == "$props" {
-                    let mut seen: Vec<String> = vec!["$$slots".into(), "$$events".into(), "$$legacy".into()];
+                    // the names as literals (a numeric key stays a number)
+                    let mut seen: Vec<Node> = vec![b::literal("$$slots"), b::literal("$$events"), b::literal("$$legacy")];
                     if self.an.custom_element {
-                        seen.push("$$host".into());
+                        seen.push(b::literal("$$host"));
                     }
                     if let NodeKind::Identifier(i) = &d.id.kind {
                         let exclude_id = self.an.sc.unique("rest_excludes");
                         self.hoisted.push(b::var(
                             b::id(exclude_id.as_str()),
-                            b::new("Set", vec![b::array(seen.iter().map(|n| b::literal(n.as_str())).collect::<Vec<_>>())]),
+                            b::new("Set", vec![b::array(seen.clone())]),
                         ));
                         let mut args = vec![b::id("$$props"), b::id(exclude_id.as_str())];
                         if self.dev {
@@ -1120,9 +1121,11 @@ impl<'a, 's> Client<'a, 's> {
                     } else if let NodeKind::ObjectPattern(o) = &d.id.kind {
                         for property in &o.properties {
                             if let NodeKind::Property(p) = &property.kind {
+                                // `key.type === 'Identifier' ? key.name : key.value`
                                 let name = match &p.key.kind {
-                                    NodeKind::Identifier(i) => i.name.to_string(),
-                                    _ => js::get_name(&p.key).unwrap_or_default(),
+                                    NodeKind::Identifier(i) => b::literal(i.name.as_str()),
+                                    NodeKind::Literal(l) => b::literal(l.value.clone()),
+                                    _ => b::literal(js::get_name(&p.key).unwrap_or_default()),
                                 };
                                 seen.push(name.clone());
                                 let id = match &p.value.kind {
@@ -1144,14 +1147,14 @@ impl<'a, 's> Client<'a, 's> {
                                     }
                                 }
                                 if self.is_prop_source(bid) {
-                                    let source = self.get_prop_source(bid, &name, initial);
+                                    let source = self.get_prop_source_with(bid, name, initial);
                                     declarations.push(b::declarator(id, source));
                                 }
                             } else if let NodeKind::RestElement(r) = &property.kind {
                                 let exclude_id = self.an.sc.unique("rest_excludes");
                                 self.hoisted.push(b::var(
                                     b::id(exclude_id.as_str()),
-                                    b::new("Set", vec![b::array(seen.iter().map(|n| b::literal(n.as_str())).collect::<Vec<_>>())]),
+                                    b::new("Set", vec![b::array(seen.clone())]),
                                 ));
                                 let mut args = vec![b::id("$$props"), b::id(exclude_id.as_str())];
                                 if self.dev {

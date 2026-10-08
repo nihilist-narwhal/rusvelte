@@ -251,8 +251,13 @@ impl<'a, 's> Client<'a, 's> {
 
     /// `get_prop_source(binding, state, name, initial)`
     pub fn get_prop_source(&self, b: BindingId, name: &str, initial: Option<Node>) -> Node {
+        self.get_prop_source_with(b, b::literal(name), initial)
+    }
+
+    /// `get_prop_source` with the name as a literal
+    pub fn get_prop_source_with(&self, b: BindingId, name: Node, initial: Option<Node>) -> Node {
         let binding = self.binding(b);
-        let mut args = vec![b::id("$$props"), b::literal(name)];
+        let mut args = vec![b::id("$$props"), name];
         let mut flags: u32 = 0;
         if binding.kind == Kind::BindableProp {
             flags |= PROPS_IS_BINDABLE;
