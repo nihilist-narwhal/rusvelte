@@ -173,7 +173,7 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
         files
     });
     // start on the compiler warnings right away (they don't depend on the emit)
-    let svelte_warnings = if use_svelte { Some(svelte_warnings_start(&workspace, &cache, &files)?) } else { None };
+    let svelte_warnings = if use_svelte { Some(svelte_warnings_start(&workspace, &cache, &files, (opts.threads / 2).max(1))?) } else { None };
 
     let _ = std::fs::remove_dir_all(&emit_dir);
     std::fs::create_dir_all(&emit_dir).map_err(|e| e.to_string())?;
@@ -234,9 +234,9 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
 
     // compiler warnings come first in each file
     if let Some(handle) = svelte_warnings {
-        let results = timed(opts.timings, "svelte compiler warnings (wait)", || svelte_warnings_finish(handle))?;
+        let (results, has_preprocess) = timed(opts.timings, "svelte compiler warnings (wait)", || svelte_warnings_finish(handle))?;
         for (path, diags) in results {
-            let mapped = map_compiler_diagnostics(&path, diags, &opts.compiler_warnings);
+            let mapped = map_compiler_diagnostics(&path, diags, &opts.compiler_warnings, has_preprocess);
             match index.get(&path) {
                 Some(&i) => by_file[i].diagnostics.extend(mapped),
                 None => {
@@ -524,66 +524,159 @@ fn map_entry(entry: &Entry, workspace: &Path, diags: &[tsc::CliDiagnostic]) -> V
 
 const WARNINGS_SCRIPT: &str = r#"
 const { createRequire } = require('node:module');
+const { pathToFileURL } = require('node:url');
 const fs = require('node:fs');
 const path = require('node:path');
 const [workspace, listFile] = process.argv.slice(2);
 const req = createRequire(path.join(workspace, 'noop.js'));
-const { compile } = req('svelte/compiler');
-const files = JSON.parse(fs.readFileSync(listFile, 'utf8'));
-const out = {};
-const pos = (p) => p && { line: p.line, column: p.column };
-for (const f of files) {
-    const text = fs.readFileSync(f, 'utf8');
-    try {
-        const r = compile(text, { dev: true, generate: false, filename: f });
-        out[f] = { warnings: r.warnings.map((w) => ({ code: w.code, message: w.message, start: pos(w.start), end: pos(w.end) })) };
-    } catch (e) {
-        out[f] = { error: { code: e.code, message: e.message, start: pos(e.start), end: pos(e.end) } };
+const { compile, preprocess } = req('svelte/compiler');
+
+// sourcemap decoding + trace-mapping's originalPositionFor (greatest lower bound)
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function decode(mappings) {
+    const lines = [];
+    let line = [], i = 0, col = 0, src = 0, sl = 0, sc = 0, nm = 0;
+    const vlq = () => {
+        let value = 0, shift = 0, c;
+        do { c = B64.indexOf(mappings[i++]); value |= (c & 31) << shift; shift += 5; } while (c & 32);
+        return value & 1 ? -(value >>> 1) : value >>> 1;
+    };
+    while (i <= mappings.length) {
+        const ch = mappings[i];
+        if (i === mappings.length || ch === ';') { line.sort((a, b) => a[0] - b[0]); lines.push(line); line = []; col = 0; i++; continue; }
+        if (ch === ',') { i++; continue; }
+        col += vlq(); const seg = [col];
+        if (i < mappings.length && mappings[i] !== ',' && mappings[i] !== ';') {
+            src += vlq(); sl += vlq(); sc += vlq(); seg.push(src, sl, sc);
+            if (i < mappings.length && mappings[i] !== ',' && mappings[i] !== ';') { nm += vlq(); }
+        }
+        line.push(seg);
     }
+    return lines;
 }
-process.stdout.write(JSON.stringify(out));
+function originalPositionFor(lines, line, column) {
+    const segs = lines[line];
+    if (!segs || !segs.length) return null;
+    let lo = 0, hi = segs.length - 1, found = -1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (segs[mid][0] <= column) { found = mid; lo = mid + 1; } else hi = mid - 1; }
+    if (found === -1) return null;
+    while (found > 0 && segs[found - 1][0] === segs[found][0]) found--;
+    const s = segs[found];
+    return s.length === 1 ? null : { line: s[2], character: s[3] };
+}
+
+async function loadConfig() {
+    for (const name of ['svelte.config.js', 'svelte.config.mjs', 'svelte.config.cjs']) {
+        const p = path.join(workspace, name);
+        if (fs.existsSync(p)) {
+            try { return (await import(pathToFileURL(p).href)).default ?? {}; } catch (e) { return { loadError: String(e) }; }
+        }
+    }
+    return null;
+}
+
+function wrap(preprocessors) {
+    return (Array.isArray(preprocessors) ? preprocessors : [preprocessors]).map((p) => ({ markup: p.markup, script: p.script, style: p.style }));
+}
+
+(async () => {
+    const config = await loadConfig();
+    const files = JSON.parse(fs.readFileSync(listFile, 'utf8'));
+    const out = {};
+    for (const f of files) {
+        const text = fs.readFileSync(f, 'utf8');
+        let code = text, lines = null;
+        try {
+            if (config && config.preprocess) {
+                const pre = await preprocess(text, wrap(config.preprocess), { filename: f });
+                const result = pre.code || (pre.toString && pre.toString()) || '';
+                if (result !== text) {
+                    code = result;
+                    const map = pre.map && (typeof pre.map === 'string' ? JSON.parse(pre.map) : pre.map);
+                    lines = map && map.mappings !== undefined ? decode(typeof map.mappings === 'string' ? map.mappings : '') : null;
+                }
+            }
+        } catch (e) {
+            out[f] = { preprocessError: String(e && e.message || e) };
+            continue;
+        }
+        // positions as the language server gets them, mapped through the preprocessor's map
+        const range = (w) => {
+            const start = w.start || { line: 1, column: 0 };
+            const end = w.end || start;
+            const r = { start: { line: start.line - 1, character: start.column }, end: { line: end.line - 1, character: end.column } };
+            if (!lines) return r;
+            const map = (p) => (p.line < 0 ? { line: -1, character: -1 } : originalPositionFor(lines, p.line, p.character) || { line: -1, character: -1 });
+            const o = { start: map(r.start), end: map(r.end) };
+            if (o.start.line === o.end.line && r.start.line === r.end.line && o.end.character - o.start.character === r.end.character - r.start.character - 1) o.end.character += 1;
+            return o;
+        };
+        try {
+            const options = { dev: true, ...((config && config.compilerOptions) || {}), generate: false, filename: f };
+            const r = compile(code, options);
+            out[f] = { warnings: r.warnings.map((w) => ({ code: w.code, message: w.message, range: range(w) })) };
+        } catch (e) {
+            out[f] = { error: { code: e.code, message: e.message, range: range(e) } };
+        }
+    }
+    out['\0config'] = { preprocess: !!(config && config.preprocess) };
+    process.stdout.write(JSON.stringify(out));
+})();
 "#;
 
-struct WarningsHandle(std::process::Child);
+struct WarningsHandle(Vec<std::process::Child>);
 
-fn svelte_warnings_start(workspace: &Path, cache: &Path, files: &[PathBuf]) -> Result<WarningsHandle, String> {
+/// Spread the files over a few Node processes (preprocessors like PostCSS are slow)
+fn svelte_warnings_start(workspace: &Path, cache: &Path, files: &[PathBuf], processes: usize) -> Result<WarningsHandle, String> {
     std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
     let script = cache.join("compiler-warnings.cjs");
-    let list = cache.join("compiler-warnings-files.json");
     std::fs::write(&script, WARNINGS_SCRIPT).map_err(|e| e.to_string())?;
-    std::fs::write(&list, serde_json::to_string(&files.iter().map(|f| f.to_string_lossy()).collect::<Vec<_>>()).unwrap()).map_err(|e| e.to_string())?;
-    let child = std::process::Command::new("node")
-        .arg(&script)
-        .arg(workspace)
-        .arg(&list)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("Failed to run node for the compiler warnings: {e}"))?;
-    Ok(WarningsHandle(child))
+    // about 50 files per process at least, so small projects don't pay for many Node startups
+    let processes = processes.clamp(1, files.len().div_ceil(50).max(1));
+    let mut children = Vec::new();
+    for (i, chunk) in files.chunks(files.len().div_ceil(processes).max(1)).enumerate() {
+        let list = cache.join(format!("compiler-warnings-files-{i}.json"));
+        std::fs::write(&list, serde_json::to_string(&chunk.iter().map(|f| f.to_string_lossy()).collect::<Vec<_>>()).unwrap()).map_err(|e| e.to_string())?;
+        let child = std::process::Command::new("node")
+            .arg(&script)
+            .arg(workspace)
+            .arg(&list)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("Failed to run node for the compiler warnings: {e}"))?;
+        children.push(child);
+    }
+    Ok(WarningsHandle(children))
 }
 
 /// Per file: `Ok(warnings)` or `Err(error)`, as JSON
 type CompilerResult = Result<Vec<Value>, Value>;
 
-fn svelte_warnings_finish(h: WarningsHandle) -> Result<Vec<(PathBuf, CompilerResult)>, String> {
-    let out = h.0.wait_with_output().map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("compiler warnings: {e}"))?;
-    let Value::Object(m) = v else { return Ok(Vec::new()) };
-    Ok(m
-        .into_iter()
-        .map(|(k, v)| {
-            let r = match v.get("error") {
-                Some(e) => Err(e.clone()),
-                None => Ok(v.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default()),
+fn svelte_warnings_finish(h: WarningsHandle) -> Result<(Vec<(PathBuf, CompilerResult)>, bool), String> {
+    let mut results = Vec::new();
+    let mut has_preprocess = false;
+    for child in h.0 {
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("compiler warnings: {e}"))?;
+        let Value::Object(mut m) = v else { continue };
+        has_preprocess |= m.remove("\0config").is_some_and(|c| c["preprocess"] == Value::Bool(true));
+        for (k, v) in m {
+            let r = if let Some(e) = v.get("error") {
+                Err(e.clone())
+            } else if let Some(e) = v.get("preprocessError") {
+                Err(json!({ "message": e, "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } } }))
+            } else {
+                Ok(v.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default())
             };
-            (PathBuf::from(k), r)
-        })
-        .collect())
+            results.push((PathBuf::from(k), r));
+        }
+    }
+    Ok((results, has_preprocess))
 }
 
 /// The Svelte plugin's `getDiagnostics` for compiler output (no preprocessors)
-fn map_compiler_diagnostics(path: &Path, result: CompilerResult, settings: &HashMap<String, String>) -> Vec<Diagnostic> {
+fn map_compiler_diagnostics(path: &Path, result: CompilerResult, settings: &HashMap<String, String>, has_preprocess: bool) -> Vec<Diagnostic> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let verbatim = crate::svelte2tsx::htmlx::find_verbatim_elements(&text);
     let lang_of = |style: bool| -> String {
@@ -593,16 +686,12 @@ fn map_compiler_diagnostics(path: &Path, result: CompilerResult, settings: &Hash
     };
     let script_lang = lang_of(false);
     let style_lang = lang_of(true);
-    let ignore_script = !script_lang.is_empty() && script_lang != "ts";
-    let ignore_style = !style_lang.is_empty();
+    // without preprocessors, warnings in scripts/styles in other languages are noise
+    let ignore_script = !has_preprocess && !script_lang.is_empty() && script_lang != "ts";
+    let ignore_style = !has_preprocess && !style_lang.is_empty();
     let range_of = |v: &Value| -> Range {
-        let p = |p: Option<&Value>| -> Option<Position> {
-            let p = p?;
-            Some(Position { line: p["line"].as_i64()? - 1, character: p["column"].as_i64()? })
-        };
-        let start = p(v.get("start")).unwrap_or(Position { line: 0, character: 0 });
-        let end = p(v.get("end")).unwrap_or(start);
-        Range { start, end }
+        let p = |p: &Value| Position { line: p["line"].as_i64().unwrap_or(0), character: p["character"].as_i64().unwrap_or(0) };
+        Range { start: p(&v["range"]["start"]), end: p(&v["range"]["end"]) }
     };
     let description = |code: &str| -> Option<String> {
         let first = code.chars().next()?;
@@ -652,7 +741,7 @@ fn map_compiler_diagnostics(path: &Path, result: CompilerResult, settings: &Hash
         Err(e) => {
             let message = e["message"].as_str().unwrap_or("").to_string();
             let has_lang = !script_lang.is_empty() || !style_lang.is_empty();
-            if message.contains("expected") && has_lang {
+            if message.contains("expected") && has_lang && !has_preprocess {
                 return Vec::new();
             }
             let code = e["code"].as_str().map(str::to_string);
