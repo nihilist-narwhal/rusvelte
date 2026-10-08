@@ -509,6 +509,8 @@ pub(crate) struct ComponentAnalysis<'s> {
     pub css: Option<css::Meta<'s>>,
     /// `analysis.css.has_global`
     pub css_has_global: bool,
+    /// Everything else the analysis computed (scopes, bindings, metadata), for code generation
+    pub an: Analyzer<'s>,
 }
 
 pub(crate) fn analyze_component<'s>(
@@ -839,6 +841,7 @@ pub(crate) fn analyze_component<'s>(
         component_name,
         custom_element: an.custom_element,
         css,
+        an,
     })
 }
 
