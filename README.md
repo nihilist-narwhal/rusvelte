@@ -16,6 +16,8 @@ from comparing against the official JavaScript tools, and the scripts to rerun t
 - **svelte-check-rs**: a native `svelte-check --tsgo`. It converts every component in
   parallel, writes svelte-check's overlay, runs TypeScript 7 (tsgo) and maps the
   diagnostics back.
+- **rusvelte (npm)**: the compiler as a drop-in for `svelte/compiler` in Vite builds, through a
+  Node binding (`bindings/node`, `packages/rusvelte`); see its README.
 
 ## Status
 
@@ -34,6 +36,7 @@ from comparing against the official JavaScript tools, and the scripts to rerun t
 | CSS output (`css.code`, `css.hasGlobal`, injected styles) | identical on every component of the code generation oracle (Svelte test suites 6,929 compilations, the private app 342, Windmill 3,964), plus `dev`/`css: 'injected'` variants and the CSS linter's 31,418 synthetic files (1 differs: oxc rejects a mangled TypeScript expression acorn accepts) |
 | Client code generation (`compile`, `generate: 'client'`, `js.code`) | identical on every client compilation of the code generation oracle: Svelte test suites (runtime-runes 1,408, runtime-legacy 1,657, hydration 98, css 187/188: a `cssHash` function the harness can't call, snapshot 33), the private app 171, Windmill 1,982, bits-ui 226, immich 411, language-tools 668; also with `dev`, `hmr`, `fragments: 'tree'`, `experimental.async`, `customElement`, `css: 'injected'`, `compatibility.componentApi: 4` variants, and the runes/legacy/TypeScript/custom-element variants of the test suites and Windmill |
 | Module code generation (`compileModule`, client and server, `js.code`) | identical on every module of the code generation oracle, both modes: bits-ui 58, immich 45 (7 more are `.svelte.ts` files type stripping can't handle), Windmill 116, runtime-runes 20, runtime-legacy 1, snapshot 3, language-tools 8, the private app 1, also with `dev` and the other variants; the error code matches on the 34 modules of Svelte's compiler-errors and validator samples that fail |
+| Drop-in through the npm package (`compile`/`compileModule` results: code, CSS, warnings with frames, metadata) | identical on 14,610 compilations of Windmill, Immich, bits-ui and the private app in the option sets Vite uses (`oracle/check_rusvelte_package.mjs`); production `vite build` output identical to the official compiler's for Windmill and the private app. Source maps are close but not identical yet |
 | JS printer (esrap 2.4.0 `ts({ comments })`) | identical code and source map mappings on 16,470 JS files: Svelte's snapshot expectations 74/74, Svelte's sources 368/368, `node_modules` 4,747/4,747 (oracle and a Windmill sample, minified files included), and the compiler's output for every component of the code generation oracle re-parsed (Svelte test suites 6,975, the private app 342, Windmill 3,964) |
 
 The remaining svelte2tsx mismatches are 2 scripts that oxc can't parse but TypeScript

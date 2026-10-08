@@ -207,6 +207,14 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
       <div class="legend"><span><i style="background:var(--bar-js)"></i>Official (Node)</span><span><i style="background:var(--accent)"></i>rusvelte</span></div>
       <div class="bars">
         <div class="bar-row">
+          <div class="label"><span>Production <code>vite build</code>, Windmill</span><span>81.8 s → 57.9 s</span></div>
+          <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:70.8%"></div>
+        </div>
+        <div class="bar-row">
+          <div class="label"><span>Production <code>vite build</code>, a 171-component SvelteKit app</span><span>8.0 s → 4.7 s</span></div>
+          <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:59%"></div>
+        </div>
+        <div class="bar-row">
           <div class="label"><span>Compile Windmill, client (1,982 components)</span><span>6.0 s → 1.6 s</span></div>
           <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:26%"></div>
         </div>
@@ -223,7 +231,7 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
           <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:14%"></div>
         </div>
       </div>
-      <p class="note">On Windmill, most of svelte-check-rs's 9.3 s is the TypeScript 7 type-check itself. In a real Vite build, bundling and other plugins take part of the time, so whole builds won't speed up by the full factor; measuring that is on the roadmap.</p>
+      <p class="note">On Windmill, most of svelte-check-rs's 9.3 s is the TypeScript 7 type-check itself. In a full <code>vite build</code>, bundling, CSS tooling and preprocessors take most of the time, so whole builds speed up less than the compiler alone; both builds above came out identical to the official ones (apart from SvelteKit's build timestamp). Build times are single runs for Windmill and the median of three for the other app.</p>
     </section>
 
     <section id="how">
@@ -247,14 +255,15 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
             <li><code>compile</code> (client and server) and <code>compileModule</code></li>
             <li>CSS output, scoping and pruning</li>
             <li>svelte2tsx and <code>svelte-check-rs</code> (with TypeScript 7)</li>
+            <li>A drop-in for <code>svelte/compiler</code> in Vite builds (Node binding)</li>
           </ul>
         </div>
         <div class="card">
           <h3>Not yet</h3>
           <ul class="plain">
-            <li>Source maps for compiled JS</li>
-            <li>A Node binding, as a drop-in for vite-plugin-svelte</li>
-            <li>Timing real <code>vite build</code>s; then a native Rolldown plugin</li>
+            <li>Source maps identical to the official ones (close, not exact yet)</li>
+            <li>Testing <code>vite dev</code> with hot reload</li>
+            <li>An npm release, then a native Rolldown plugin</li>
             <li>Preprocessors still run in Node</li>
           </ul>
         </div>
@@ -262,7 +271,12 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
     </section>
 
     <section id="try">
-      <h2>Try svelte-check-rs</h2>
+      <h2>Try it</h2>
+      <p class="sub">In a Vite or SvelteKit app on Svelte 5.57.2, after building the package from the repository (see <code>packages/rusvelte</code>):</p>
+<pre><code>npm install /path/to/rusvelte/packages/rusvelte
+NODE_OPTIONS="--import rusvelte/register" vite build</code></pre>
+      <p class="note">Anything rusvelte doesn't handle (other Svelte versions, some options, components with errors) falls back to the official compiler. <code>RUSVELTE_VERIFY=1</code> compiles everything both ways and reports any difference.</p>
+      <h2 style="margin-top:32px">svelte-check-rs</h2>
       <p class="sub">The project needs TypeScript 7 (<code>@typescript/native-preview</code> or <code>typescript@7</code>), as with <code>svelte-check --tsgo</code>.</p>
 <pre><code>cargo build --release --bin svelte-check-rs
 cd my-app
