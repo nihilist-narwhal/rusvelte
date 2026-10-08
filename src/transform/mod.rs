@@ -510,6 +510,20 @@ pub fn compile_module(source: &str, options: &options::CompileOptions) -> Result
     })
 }
 
+/// The `loc` Svelte gives a `<script>`'s `Program` (`read_script`): from the start of the
+/// `<script>` tag to the end of `</script>` (its `start`/`end` stay acorn's)
+pub fn script_program_loc(
+    conv: &crate::estree::convert::Converter,
+    root: &crate::ast::Root,
+    program: &oxc_ast::ast::Program,
+) -> Option<crate::estree::SourceLocation> {
+    [&root.instance, &root.module]
+        .into_iter()
+        .flatten()
+        .find(|s| std::ptr::eq(&s.content.program, program))
+        .map(|s| conv.location(oxc_span::Span::new(s.start as u32, s.end as u32)))
+}
+
 /// The JS comments, as esrap gets them (`analysis.comments`)
 fn estree_comments(comments: &[crate::js::JsComment], locator: &crate::locator::Locator) -> Vec<crate::estree::Comment> {
     comments

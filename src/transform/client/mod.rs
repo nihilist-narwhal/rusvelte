@@ -437,7 +437,11 @@ impl<'a, 's> Client<'a, 's> {
 
     pub fn convert_program(&self, p: P<'s>) -> Node {
         match p {
-            P::Js(oxc_ast::AstKind::Program(program)) => self.conv.program(program),
+            P::Js(oxc_ast::AstKind::Program(program)) => {
+                let mut node = self.conv.program(program);
+                node.loc = crate::transform::script_program_loc(&self.conv, self.an.root, program).or(node.loc);
+                node
+            }
             _ => program_node(vec![]),
         }
     }
