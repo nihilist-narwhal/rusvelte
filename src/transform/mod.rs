@@ -719,6 +719,18 @@ mod tests {
     }
 
     #[test]
+    fn bigint_folding() {
+        // (checked against svelte 5.57.2)
+        let source = "<script>const a = 8n >> -1n; const b = -8n >> 200n; const c = 0n << 1000n; const d = 1n ** 100000000000n; const e = (-1n) ** 5n; const f = 5n << -2n; const g = -170141183460469231731687303715884105727n % -1n;</script>{a} {b} {c} {d} {e} {f} {g}";
+        let options = options::CompileOptions { filename: "A.svelte".into(), generate: options::Generate::Server, ..Default::default() };
+        let js = compile(source, &options).unwrap().js;
+        assert!(js.contains("$$renderer.push(`<!---->16 -1 0 1 -1 1 0`);"), "{js}");
+        // too big for an i128: declined
+        let source = "<script>const a = 1n << 200n;</script>{a}";
+        assert_eq!(compile(source, &options).err().map(|e| e.code), Some("unsupported"));
+    }
+
+    #[test]
     fn compile_module_errors() {
         let options = options::CompileOptions { filename: "a.svelte.js".into(), ..Default::default() };
         let code = |source: &str| compile_module(source, &options).err().map(|e| e.code);

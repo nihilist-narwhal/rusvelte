@@ -626,6 +626,24 @@ fn less_than(a: &Val, b: &Val) -> Option<bool> {
     if x.is_nan() || y.is_nan() { None } else { Some(x < y) }
 }
 
+/// BigInt `x << n` (None, noting it, when the result doesn't fit)
+fn bigint_shl(x: i128, n: u128) -> Option<i128> {
+    if x == 0 {
+        return Some(0);
+    }
+    let r = u32::try_from(n).ok().and_then(|n| x.checked_shl(n));
+    // `checked_shl` only checks the shift amount: bits shifted out are an overflow too
+    match r {
+        Some(r) if r >> n == x => Some(r),
+        _ => unrepresentable(),
+    }
+}
+
+/// BigInt `x >> n`: rounds towards negative infinity, like an arithmetic shift
+fn bigint_shr(x: i128, n: u128) -> i128 {
+    if n >= 128 { if x < 0 { -1 } else { 0 } } else { x >> n }
+}
+
 /// `binary[operator](left, right)` (None where the JS throws)
 fn binary(op: BinaryOperator, a: &Val, b: &Val) -> Option<Val> {
     use BinaryOperator as O;
@@ -659,21 +677,28 @@ fn binary(op: BinaryOperator, a: &Val, b: &Val) -> Option<Val> {
                 return Some(Val::BigInt(match op {
                     O::Subtraction => x.checked_sub(y).or_else(unrepresentable)?,
                     O::Multiplication => x.checked_mul(y).or_else(unrepresentable)?,
-                    O::Division => x.checked_div(y)?,
-                    O::Remainder => x.checked_rem(y)?,
-                    O::Exponential => x.checked_pow(u32::try_from(y).ok()?).or_else(unrepresentable)?,
+                    // dividing by zero throws; `MIN / -1` overflows, `MIN % -1` is 0
+                    O::Division | O::Remainder if y == 0 => return None,
+                    O::Division => x.checked_div(y).or_else(unrepresentable)?,
+                    O::Remainder => x.checked_rem(y).unwrap_or(0),
+                    // a negative exponent throws
+                    O::Exponential if y < 0 => return None,
+                    O::Exponential => match x {
+                        0 | 1 => if y == 0 { 1 } else { x },
+                        -1 => if y % 2 == 0 { 1 } else { -1 },
+                        _ => match u32::try_from(y) {
+                            Ok(e) => x.checked_pow(e).or_else(unrepresentable)?,
+                            Err(_) => return unrepresentable(),
+                        },
+                    },
                     O::BitwiseAnd => x & y,
                     O::BitwiseOR => x | y,
                     O::BitwiseXOR => x ^ y,
-                    // `checked_shl` only checks the shift amount: bits shifted out are an overflow too
-                    O::ShiftLeft => {
-                        let r = x.checked_shl(u32::try_from(y).ok()?).or_else(unrepresentable)?;
-                        if r >> y != x {
-                            return unrepresentable();
-                        }
-                        r
-                    }
-                    O::ShiftRight => x.checked_shr(u32::try_from(y).ok()?)?,
+                    // a negative shift amount shifts the other way
+                    O::ShiftLeft if y >= 0 => bigint_shl(x, y.unsigned_abs())?,
+                    O::ShiftLeft => bigint_shr(x, y.unsigned_abs()),
+                    O::ShiftRight if y >= 0 => bigint_shr(x, y.unsigned_abs()),
+                    O::ShiftRight => bigint_shl(x, y.unsigned_abs())?,
                     _ => return None,
                 }));
             }
