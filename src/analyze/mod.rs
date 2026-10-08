@@ -153,6 +153,16 @@ pub struct AttrMeta {
     pub delegated: bool,
 }
 
+/// `bind:` directive metadata
+#[derive(Default, Debug, Clone)]
+pub struct BindMeta {
+    /// `metadata.binding` (unset for `bind:group`, whose metadata Svelte replaces)
+    pub binding: Option<BindingId>,
+    /// `bind:group`: the group's name and the each blocks contributing to it (innermost first)
+    pub binding_group_name: Option<String>,
+    pub parent_each_blocks: Vec<NodeId>,
+}
+
 /// `ExpressionMetadata`
 #[derive(Default, Debug, Clone)]
 pub struct ExprMeta {
@@ -282,6 +292,10 @@ pub(crate) struct Analyzer<'s> {
     pub props_id: Option<Id<'s>>,
     pub has_props_rune: bool,
     pub metas: Vec<ExprMeta>,
+    /// `bind:` directive metadata (by attribute address)
+    pub bind_meta: FxHashMap<usize, BindMeta>,
+    /// `analysis.binding_groups`: (keypath, bindings) → group name
+    pub binding_groups: Vec<(String, Vec<Option<BindingId>>, String)>,
     /// `attribute.metadata` (by attribute address)
     pub attr_meta: FxHashMap<usize, AttrMeta>,
     /// `node.metadata` of template nodes
@@ -572,6 +586,8 @@ pub(crate) fn analyze_component<'s>(
         instance_body: blockers::InstanceBody::default(),
         node_meta: FxHashMap::default(),
         attr_meta: FxHashMap::default(),
+        bind_meta: FxHashMap::default(),
+        binding_groups: Vec::new(),
         fragment_dynamic: FxHashSet::default(),
         pickled_awaits: FxHashSet::default(),
         async_deriveds: Vec::new(),

@@ -117,6 +117,11 @@ pub struct Scope<'s> {
     /// `$:` statements and snippets), see `track_references`
     pub references: FxIndexMap<&'s str, Vec<RefId>>,
     pub track_refs: bool,
+    /// every name referenced in this scope (`references.has(name)`), whether or not
+    /// `references` is kept
+    pub ref_names: FxHashSet<&'s str>,
+    /// names `generate` handed out here (they become references too)
+    pub generated: FxHashSet<String>,
     /// The parent to continue a lookup with: `parent`, skipping scopes that can never
     /// declare anything or record references (computed by `create_scopes`)
     pub lookup_parent: Option<ScopeId>,
@@ -225,6 +230,13 @@ pub struct Scopes<'s> {
     next_synthetic: usize,
     /// `node.metadata.scopes` of components: slot name → scope (`default` first)
     pub component_scopes: FxHashMap<NodeId, Vec<(&'s str, ScopeId)>>,
+    /// names `generate`/`unique` added to `root.conflicts`
+    pub generated_conflicts: FxHashSet<String>,
+    /// `root.#name_counters`
+    pub name_counters: FxHashMap<String, u32>,
+    /// EachBlock `metadata.index` (`root.unique('$$index')`) and body scope (`metadata.declarations`)
+    pub each_index: FxHashMap<NodeId, String>,
+    pub each_scope: FxHashMap<NodeId, ScopeId>,
 }
 
 impl<'s> Scopes<'s> {
@@ -240,6 +252,8 @@ impl<'s> Scopes<'s> {
             declarations: DeclMap::default(),
             references: FxIndexMap::default(),
             track_refs: parent.is_none(),
+            ref_names: FxHashSet::default(),
+            generated: FxHashSet::default(),
             lookup_parent: parent,
         });
         (self.scopes.len() - 1) as ScopeId
@@ -378,6 +392,7 @@ impl<'s> Scopes<'s> {
         let hash = name_hash(name);
         loop {
             let s = &mut self.scopes[scope as usize];
+            s.ref_names.insert(name);
             if s.track_refs {
                 s.references.entry(name).or_default().push(r);
             }
@@ -385,7 +400,7 @@ impl<'s> Scopes<'s> {
                 self.bindings[b as usize].references.push(r);
                 return;
             }
-            match s.lookup_parent {
+            match s.parent {
                 Some(p) => scope = p,
                 None => {
                     self.conflicts.insert(name);
@@ -395,7 +410,11 @@ impl<'s> Scopes<'s> {
         }
     }
 
-    /// `scope.generate(name)` (only what's needed to compute the component name)
+    fn is_conflict(&self, name: &str) -> bool {
+        self.conflicts.contains(name) || self.generated_conflicts.contains(name)
+    }
+
+    /// `scope.generate(preferred_name)`: a name not used in this scope nor anywhere as a global
     pub fn generate(&mut self, mut scope: ScopeId, preferred_in: &str) -> String {
         while self.scopes[scope as usize].porous {
             scope = self.scopes[scope as usize].parent.unwrap();
@@ -407,16 +426,55 @@ impl<'s> Scopes<'s> {
         if preferred.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
             preferred.replace_range(0..1, "_");
         }
-        let s = &self.scopes[scope as usize];
-        let taken = |name: &str| {
-            s.references.contains_key(name) || s.declarations.contains_key(name) || self.conflicts.contains(name) || is_reserved(name)
-        };
-        let mut name = preferred.clone();
-        let mut n = 1;
-        while taken(&name) {
+        let mut n = self.name_counters.get(&preferred).copied().unwrap_or(0);
+        let mut name;
+        if n == 0 {
+            name = preferred.clone();
+            n = 1;
+        } else {
             name = format!("{preferred}_{n}");
             n += 1;
         }
+        loop {
+            let s = &self.scopes[scope as usize];
+            let taken = s.ref_names.contains(name.as_str())
+                || s.generated.contains(&name)
+                || s.declarations.contains_key(name.as_str())
+                || self.is_conflict(&name)
+                || is_reserved(&name);
+            if !taken {
+                break;
+            }
+            name = format!("{preferred}_{n}");
+            n += 1;
+        }
+        self.name_counters.insert(preferred, n);
+        self.scopes[scope as usize].generated.insert(name.clone());
+        self.generated_conflicts.insert(name.clone());
+        name
+    }
+
+    /// `root.unique(preferred_name)`: a name unique in the whole component
+    pub fn unique(&mut self, preferred_in: &str) -> String {
+        let mut preferred = String::with_capacity(preferred_in.len());
+        for c in preferred_name_chars(preferred_in) {
+            preferred.push_str(c);
+        }
+        let mut n = self.name_counters.get(&preferred).copied().unwrap_or(0);
+        let mut name;
+        if n == 0 {
+            name = preferred.clone();
+            n = 1;
+        } else {
+            name = format!("{preferred}_{n}");
+            n += 1;
+        }
+        while self.is_conflict(&name) {
+            name = format!("{preferred}_{n}");
+            n += 1;
+        }
+        self.name_counters.insert(preferred, n);
+        self.generated_conflicts.insert(name.clone());
         name
     }
 }
@@ -1140,6 +1198,9 @@ impl<'s> ScopeBuilder<'s, '_> {
                 for &child in &ast.fragments[*body].nodes {
                     self.visit_child(p, P::Node(child), s)?;
                 }
+                let index = self.scopes.unique("$$index");
+                self.scopes.each_index.insert(n, index);
+                self.scopes.each_scope.insert(n, s);
                 Ok(())
             }
             Node::AwaitBlock { expression, value, error, pending, then, catch, .. } => {

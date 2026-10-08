@@ -2370,11 +2370,49 @@ impl<'s> Analyzer<'s> {
             }
         }
 
+        // TODO: `<select bind:value>` in legacy mode records `legacy_indirect_bindings`
+
+        // `<option>{expr}</option>`: the expression tag becomes its value
+        if el.name == "option"
+            && !textarea_moved
+            && frag_nodes.len() == 1
+            && matches!(self.ast.nodes[frag_nodes[0]], Node::ExpressionTag { .. })
+            && !el.attributes.iter().any(|a| matches!(a, Attr::Attribute { name: "value", .. }))
+        {
+            self.node_meta_mut(n).synthetic_value_node = Some(frag_nodes[0]);
+        }
+
+        // rich content in <select>/<option>/<optgroup> needs special hydration handling
+        if is_customizable_select_element(self.ast, el) || el.name == "selectedcontent" {
+            self.fragment_dynamic.insert(el.fragment);
+            self.mark_subtree_dynamic();
+        }
+
         if let Some(b) = self.get(st.scope, el.name) {
             let b = self.binding(b);
             if b.declaration_kind == DeclKind::Import && b.references.is_empty() {
                 self.warn(Some(p), w::component_name_lowercase(el.name));
             }
+        }
+
+        let has_spread = el.attributes.iter().any(|a| matches!(a, Attr::Spread { .. }));
+        let svg = utils::is_svg(el.name)
+            || (matches!(el.name, "a" | "title")
+                && self.path.iter().rev().find_map(|q| {
+                    let qn = q.node()?;
+                    (self.ty(*q) == "RegularElement").then(|| self.node_meta.get(&qn).is_some_and(|m| m.svg))
+                }) == Some(true));
+        let mathml = utils::is_mathml(el.name);
+        let m = self.node_meta_mut(n);
+        m.has_spread = has_spread;
+        m.svg = svg;
+        m.mathml = mathml;
+
+        // attributes of custom elements are all set through properties
+        if (el.name.contains('-') || el.attributes.iter().any(|a| matches!(a, Attr::Attribute { name: "is", .. })))
+            && !el.attributes.is_empty()
+        {
+            self.mark_subtree_dynamic();
         }
 
         if let Some(parent_element) = st.parent_element {
@@ -2435,10 +2473,23 @@ impl<'s> Analyzer<'s> {
             self.visit(P::Fragment(el.fragment), &state)?;
             self.emptied_fragment = prev;
             self.path.pop();
-            Ok(())
         } else {
-            self.next(p, &state)
+            self.next(p, &state)?;
         }
+
+        // `<a>` is valid in both HTML and SVG: without a parent element, look at its children
+        if el.name == "a" && st.parent_element.is_none() {
+            let svg_child = self.ast.fragments[el.fragment].nodes.iter().find_map(|&c| match &self.ast.nodes[c] {
+                Node::Element(child) if child.kind == "RegularElement" => {
+                    Some(self.node_meta.get(&c).is_some_and(|m| m.svg) && child.name != "svg")
+                }
+                _ => None,
+            });
+            if svg_child == Some(true) {
+                self.node_meta_mut(n).svg = true;
+            }
+        }
+        Ok(())
     }
 
     fn svelte_element(&mut self, p: P<'s>, n: NodeId, st: &State<'s>) -> Res {
@@ -2447,6 +2498,43 @@ impl<'s> Analyzer<'s> {
         super::a11y::check_element(self, n)?;
         self.save_path(n);
         self.elements.push(n);
+
+        // namespace: an xmlns attribute, else the nearest element's, else the component's
+        let xmlns = el.attributes.iter().find_map(|a| match a {
+            Attr::Attribute { name: "xmlns", value, .. } => match value {
+                AttrValue::Sequence(c) if c.len() == 1 => match &c[0] {
+                    Chunk::Text { data, .. } => Some(data.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        });
+        let (svg, mathml) = match xmlns {
+            Some(ns) => (ns == "http://www.w3.org/2000/svg", ns == "http://www.w3.org/1998/Math/MathML"),
+            None => {
+                let mut result = (self.namespace == "svg", self.namespace == "mathml");
+                for i in (0..self.path.len()).rev() {
+                    let ancestor = self.path[i];
+                    let ty = self.ty(ancestor);
+                    if matches!(ty, "Component" | "SvelteComponent" | "SvelteFragment" | "SnippetBlock") || i == 0 {
+                        break;
+                    }
+                    if matches!(ty, "SvelteElement" | "RegularElement") {
+                        let an = ancestor.node().unwrap();
+                        let foreign = ty == "RegularElement" && self.element(an).is_some_and(|e| e.name == "foreignObject");
+                        let m = self.node_meta.get(&an).cloned().unwrap_or_default();
+                        result = if foreign { (false, false) } else { (m.svg, m.mathml) };
+                        break;
+                    }
+                }
+                result
+            }
+        };
+        let m = self.node_meta_mut(n);
+        m.svg = svg;
+        m.mathml = mathml;
+        self.mark_subtree_dynamic();
 
         if let Some(tag) = &el.tag {
             let meta = self.new_meta(p);
@@ -3145,6 +3233,7 @@ impl<'s> Analyzer<'s> {
             if seq.expressions.len() != 2 {
                 return Err(e::bind_invalid_expression(loc));
             }
+            self.mark_subtree_dynamic();
             let meta = self.new_meta(p);
             for x in &seq.expressions {
                 let target = match nodes::strip(x) {
@@ -3182,13 +3271,48 @@ impl<'s> Analyzer<'s> {
             }
         }
 
+        let mut bind_meta = super::BindMeta { binding, ..Default::default() };
         if name == "group" {
             if let Some(b) = binding {
                 if self.binding(b).kind == Kind::Snippet {
                     return Err(e::bind_group_invalid_snippet_parameter(loc));
                 }
             }
+            // the each blocks whose declarations the binding (indirectly) uses
+            let mut each_blocks = Vec::new();
+            let (keypath, expression_ids) = extract_all_identifiers_from_expression(self.ast, ep);
+            let mut ids = expression_ids.clone();
+            for i in (0..self.path.len()).rev() {
+                let Some(pn) = self.path[i].node() else { continue };
+                let Node::EachBlock { expression: each_expr, .. } = &self.ast.nodes[pn] else { continue };
+                let Some(&each_scope) = self.sc.each_scope.get(&pn) else { continue };
+                let declared = |name: &str| self.sc.scope(each_scope).declarations.contains_key(name);
+                let (refs, rest): (Vec<_>, Vec<_>) = ids.iter().copied().partition(|id: &Id| declared(id.name));
+                if !refs.is_empty() {
+                    self.node_meta_mut(pn).contains_group_binding = true;
+                    each_blocks.push(pn);
+                    ids = rest;
+                    ids.extend(extract_all_identifiers_from_expression(self.ast, nodes::template_expr(each_expr)).1);
+                }
+            }
+            let bindings: Vec<Option<BindingId>> = expression_ids.iter().map(|id| self.get(st.scope, id.name)).collect();
+            let existing = self
+                .binding_groups
+                .iter()
+                .rev()
+                .find(|(k, b, _)| *k == keypath && *b == bindings)
+                .map(|(_, _, g)| g.clone());
+            let group_name = match existing {
+                Some(g) => g,
+                None => {
+                    let g = self.sc.unique("binding_group");
+                    self.binding_groups.push((keypath, bindings, g.clone()));
+                    g
+                }
+            };
+            bind_meta = super::BindMeta { binding: None, binding_group_name: Some(group_name), parent_each_blocks: each_blocks };
         }
+        self.bind_meta.insert(p.key(), bind_meta);
 
         if let Some(b) = binding {
             let b = self.binding(b);
@@ -3605,4 +3729,111 @@ fn callee_rune(scopes: &scope::Scopes, node: P, scope: super::ScopeId) -> Option
     }
     let keypath = scope::get_global_keypath(scopes, node, scope)?;
     super::utils::is_rune(&keypath)
+}
+
+/// `is_customizable_select_element`: `<select>`, `<optgroup>` or `<option>` with rich content
+fn is_customizable_select_element(ast: &crate::ast::Ast, el: &crate::ast::Element) -> bool {
+    if !matches!(el.name, "select" | "optgroup" | "option") {
+        return false;
+    }
+    let mut found = false;
+    find_descendants(ast, Some(el.fragment), &mut |child| {
+        if found {
+            return;
+        }
+        match &ast.nodes[child] {
+            Node::Element(c) if c.kind == "RegularElement" => {
+                if (el.name == "select" && c.name != "option" && c.name != "optgroup")
+                    || (el.name == "optgroup" && c.name != "option")
+                    || el.name == "option"
+                {
+                    found = true;
+                }
+            }
+            Node::Text { .. } => {
+                if el.name == "select" || el.name == "optgroup" {
+                    found = true;
+                }
+            }
+            _ => found = true,
+        }
+    });
+    found
+}
+
+/// `find_descendants`: the nodes of a fragment, looking through blocks
+fn find_descendants(ast: &crate::ast::Ast, fragment: Option<crate::ast::FragId>, f: &mut dyn FnMut(NodeId)) {
+    let Some(fragment) = fragment else { return };
+    for &n in &ast.fragments[fragment].nodes {
+        match &ast.nodes[n] {
+            Node::SnippetBlock { .. } | Node::DebugTag { .. } | Node::ConstTag { .. } | Node::DeclarationTag { .. } | Node::Comment { .. } | Node::ExpressionTag { .. } => {}
+            Node::Text { data, .. } => {
+                if !utils::js_trim(data).is_empty() {
+                    f(n);
+                }
+            }
+            Node::IfBlock { consequent, alternate, .. } => {
+                find_descendants(ast, Some(*consequent), f);
+                find_descendants(ast, *alternate, f);
+            }
+            Node::EachBlock { body, fallback, .. } => {
+                find_descendants(ast, Some(*body), f);
+                find_descendants(ast, *fallback, f);
+            }
+            Node::KeyBlock { fragment, .. } => find_descendants(ast, Some(*fragment), f),
+            Node::AwaitBlock { pending, then, catch, .. } => {
+                find_descendants(ast, *pending, f);
+                find_descendants(ast, *then, f);
+                find_descendants(ast, *catch, f);
+            }
+            Node::Element(e) if e.kind == "SvelteBoundary" => find_descendants(ast, Some(e.fragment), f),
+            _ => f(n),
+        }
+    }
+}
+
+/// `extract_all_identifiers_from_expression`: the keypath of an expression and its identifiers
+fn extract_all_identifiers_from_expression<'s>(ast: &'s crate::ast::Ast<'s>, expr: P<'s>) -> (String, Vec<Id<'s>>) {
+    fn walk<'s>(ast: &'s crate::ast::Ast<'s>, p: P<'s>, parent: Option<P<'s>>, nodes_out: &mut Vec<Id<'s>>, keypath: &mut Vec<String>) {
+        let computed_property_of = |parent: Option<P<'s>>| match parent {
+            Some(P::Js(AstKind::ComputedMemberExpression(m))) => nodes::expr(&m.expression).is(p),
+            _ => false,
+        };
+        if let Some(id) = ident(p) {
+            let is_property = match parent {
+                Some(P::Js(AstKind::StaticMemberExpression(m))) => P::Js(AstKind::IdentifierName(&m.property)).is(p),
+                _ => false,
+            };
+            if !is_property {
+                nodes_out.push(id);
+            }
+            if computed_property_of(parent) {
+                keypath.push(format!("[{}]", id.name));
+            } else {
+                keypath.push(id.name.to_string());
+            }
+            return;
+        }
+        let literal = match p {
+            P::Js(AstKind::StringLiteral(s)) => Some(format!("\"{}\"", s.value)),
+            P::Js(AstKind::NumericLiteral(n)) => Some(super::evaluate::number_to_string(n.value)),
+            P::Js(AstKind::BooleanLiteral(b)) => Some(b.value.to_string()),
+            P::Js(AstKind::NullLiteral(_)) => Some("null".into()),
+            _ => None,
+        };
+        if let Some(value) = literal {
+            keypath.push(if computed_property_of(parent) { format!("[{value}]") } else { value });
+            return;
+        }
+        if let P::Js(AstKind::ThisExpression(_)) = p {
+            keypath.push("this".into());
+        }
+        for c in nodes::children(p, ast) {
+            walk(ast, c, Some(p), nodes_out, keypath);
+        }
+    }
+    let mut ids = Vec::new();
+    let mut keypath = Vec::new();
+    walk(ast, expr, None, &mut ids, &mut keypath);
+    (keypath.join("."), ids)
 }
