@@ -392,6 +392,30 @@ const HAND_LESS = [
     '.a { colr: red; -webkit-foo: 1 } .b {} @apply x;', '.a when {}', '.m( {}', '@a: ;', '@b', '.a { @c: }', '.x { .y() !important; }',
     '@import (x) ;', '@plugin;', '.a { b: `x` }', '.a { b: `x }', '.a { @r(); }', '#ns { .m() { c: d } }', '.a { .mixin() !important }',
     '@rules: { a { b: c } }', '.a(@x: { b: c }) {}', '.guard() when (default()) {}', '@media screen { @media (min-width: 768px) { .a {} } }',
+    // bootstrap-3 style
+    '.clearfix() { &:before, &:after { content: " "; display: table; } &:after { clear: both; } }\n.row { .clearfix(); margin-left: (@gutter / -2); }',
+    '.button-variant(@color; @background; @border) { color: @color; background-color: @background; &:focus, &.focus { color: @color; background-color: darken(@background, 10%); border-color: darken(@border, 25%); } }\n.btn-default { .button-variant(@btn-default-color; @btn-default-bg; @btn-default-border); }',
+    '.make-grid-columns() { .col(@index) { @item: ~".col-xs-@{index}, .col-sm-@{index}"; .col((@index + 1), @item); } .col(@index, @list) when (@index =< @grid-columns) { @item: ~".col-xs-@{index}"; .col((@index + 1), ~"@{list}, @{item}"); } .col(@index, @list) when (@index > @grid-columns) { @{list} { position: relative; } } .col(1); }',
+    '.loop(@counter) when (@counter > 0) { .loop((@counter - 1)); width: (10px * @counter); }\ndiv { .loop(5); }',
+    '@min768: ~"(min-width: 768px)";\n.element { @media @min768 { font-size: 1.2rem; } }\n@media @phone, @tablet and (orientation: landscape) { .x { y: z } }',
+    '.mixin(@color) when (iscolor(@color)) { color: @color } .mixin(@a) when (isnumber(@a)) and (@a > 0) { width: @a } .mixin(@b) when not (@b > 0) { width: 0 }',
+    'button when (@my-option = true) { color: white; } & when (@mode = dark) { .x { color: black } }',
+    '.a { .mixin(#008000); width: ~"calc(100% - @{w})"; @r: { color: red }; filter: ~"progid:DXImageTransform.Microsoft.Alpha(opacity=50)"; }',
+    '.b { background+: url(1.png); background+_: url(2.png); .c; #namespace > .mixin(); #namespace.mixin(); }',
+    '@selector: ~".my-class"; @{selector} { color: red; } @property: color; .widget { @{property}: #0ee; background-@{property}: #999; }',
+    '@primary: blue; @secondary: @primary; @var: "primary"; .x { color: @@var; } .y { color: $color; color: red; }',
+    '@config: { option1: true; option2: false; } .mixin() when (@config[option1] = true) { selected: value; } .z { width: @config[width]; c: .mixin[@result]; }',
+    '@plugin "plugin"; .test { width: pi(); } @import (less) "foo.css"; @import (inline) "not-less-compatible.css"; @import (once, optional) "x";',
+    '.e(@rules) { @media screen { @rules(); } } @detached-ruleset: { background: red; }; .top { .e(@detached-ruleset); }',
+    '.m(@a; @b: 2) when (default()) { x: @a @b } .m(@a, @rest...) { y: @rest } .n(...) {} .o(@arguments) { box-shadow: @arguments; }',
+    '#main { width: ~`"@{str}".toUpperCase() + "!"`; height: `1 + 1`; @var: ~`"hello".toUpperCase()`; }',
+    '.a:hover when (@enabled) { x: y } .b:extend(.c all) {} .d { &:extend(.e all); &-f { g: h } & + & { i: j } && { k: l } }',
+    '.guard1() when (@a) and (@b), (@c) { x: y } .guard2() when not (@a), (@b) {} .lazy { @var: @a; @a: 1; width: @var; }',
+    '.x { .y !important; .z() !important; @w(); color: if((iscolor(@c)), @c, black); width: percentage(0.5); height: unit(5, px); }',
+    '@media (min-width: @screen-sm-min) and (max-width: @screen-sm-max) { .visible-sm { display: block !important; } }',
+    '.mixin(dark; @color) { color: darken(@color, 10%); } .mixin(light; @color) { color: lighten(@color, 10%); } .mixin(@_; @color) { display: block; }',
+    '@my-ruleset: { .my-selector { @media tv { background-color: black; } } }; @media (orientation:portrait) { @my-ruleset(); }',
+    '.a { @import "b"; } .c { @plugin "d"; } @import url(x.less) screen; @import "e" print;',
 ];
 
 if (want('hand')) {
@@ -410,6 +434,13 @@ if (want('hand')) {
         add(c, 'less', 'less#' + i);
         add(c, '', 'less-as-css#' + i);
     });
+    // mutations of the hand-written cases, in every language
+    const r = rng(51);
+    for (const c of [...HAND_CSS, ...HAND_SCSS, ...HAND_LESS]) {
+        for (const lang of ['', 'scss', 'less']) {
+            for (let i = 0; i < 4; i++) add(mutate(c, r), lang, 'hand-mut');
+        }
+    }
     // whole-file shapes
     const shapes = [
         '<style>\r\n.a {\r\n  colr: red;\r\n}\r\n</style>',
