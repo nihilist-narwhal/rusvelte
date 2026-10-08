@@ -56,6 +56,8 @@ It falls back to the official compiler for:
 
 ## Status
 
-- Identical results to `svelte/compiler` on 14,610 compilations of real projects through
-  this package (`oracle/check_rusvelte_package.mjs`), in the option sets Vite uses.
-- Source maps are not identical yet; they can point at slightly different positions.
+- Identical results to `svelte/compiler`, source maps included, on 20,410 compilations of
+  real projects through this package (`oracle/check_rusvelte_package.mjs`), in the option
+  sets Vite uses.
+- Production `vite build` output identical to the official compiler's on the projects tried.
+- Preprocessors (`vitePreprocess`, PostCSS, ...) still run in JavaScript, as before.

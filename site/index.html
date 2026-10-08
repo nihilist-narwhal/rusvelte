@@ -192,7 +192,7 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
           <tbody>
             <tr><td>Parser (modern and legacy AST)</td><td>4,567 / 4,567 Svelte test files</td></tr>
             <tr><td>Compiler warnings and errors</td><td>4,564 / 4,567 Svelte test files; all of Immich and bits-ui; svelte-check's warnings on Windmill</td></tr>
-            <tr><td>CSS output (<code>css.code</code>)</td><td>identical on every compilation above</td></tr>
+            <tr><td>CSS output and source maps (<code>css</code>, <code>js.map</code>, <code>css.map</code>)</td><td>identical on every compilation above</td></tr>
             <tr><td>JS printer (port of esrap)</td><td>identical code and source map mappings on 16,470 JS files</td></tr>
             <tr><td>svelte2tsx</td><td>Windmill 1,982 / 1,982; Svelte tests 4,566 / 4,567</td></tr>
             <tr><td>svelte-check-rs diagnostics</td><td>identical to <code>svelte-check --tsgo</code> on Windmill (7,922 diagnostics)</td></tr>
@@ -255,13 +255,13 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
             <li><code>compile</code> (client and server) and <code>compileModule</code></li>
             <li>CSS output, scoping and pruning</li>
             <li>svelte2tsx and <code>svelte-check-rs</code> (with TypeScript 7)</li>
+            <li>Source maps, identical to the official ones</li>
             <li>A drop-in for <code>svelte/compiler</code> in Vite builds (Node binding)</li>
           </ul>
         </div>
         <div class="card">
           <h3>Not yet</h3>
           <ul class="plain">
-            <li>Source maps identical to the official ones (close, not exact yet)</li>
             <li>Testing <code>vite dev</code> with hot reload</li>
             <li>An npm release, then a native Rolldown plugin</li>
             <li>Preprocessors still run in Node</li>
