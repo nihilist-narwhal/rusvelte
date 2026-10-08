@@ -6,6 +6,7 @@ pub mod check;
 pub mod css;
 pub mod css_lint;
 pub mod error;
+pub mod estree;
 #[allow(clippy::all)]
 pub mod errors;
 pub mod js;
