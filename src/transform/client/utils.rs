@@ -241,7 +241,10 @@ impl<'a, 's> Client<'a, 's> {
             }
             let name = binding.node.name;
             let deep = matches!(binding.kind, Kind::BindableProp | Kind::Template) || binding.declaration_kind == DeclKind::Import || name == "$$props" || name == "$$restProps";
-            let mut getter = self.build_getter(&b::id(name), st);
+            // `{ ...binding.node }`: a copy with the declaration's position
+            let mut id = self.id_node(binding.node);
+            id.origin = None;
+            let mut getter = self.build_getter(&id, st);
             if deep {
                 getter = b::call("$.deep_read_state", vec![getter]);
             }
