@@ -6,6 +6,7 @@
 mod a11y;
 #[allow(clippy::all)]
 mod a11y_data;
+mod comments;
 mod css;
 mod nodes;
 mod scope;
@@ -269,13 +270,18 @@ impl<'s> Analyzer<'s> {
         }
     }
 
-    /// `[first.start, last.end]` of the `leadingComments` of a node
-    pub fn leading_comment_range(&self, p: P<'s>) -> Option<(usize, usize)> {
-        let comments = self.leading_comments.get(&p.key())?;
-        let first = comments.first()?;
-        let last = comments.last()?;
-        let last_end = last.0 + 2 + last.1.len() + if self.source[last.0..].starts_with("/*") { 2 } else { 0 };
-        Some((first.0, last_end))
+    /// `[first.start, last.end]` of the `leadingComments` of the root of a template expression:
+    /// the comments of its parse that come before it
+    pub fn leading_comment_range(&self, e: &crate::ast::Expr<'s>, root_start: usize) -> Option<(usize, usize)> {
+        let crate::ast::Expr::Js(js) = e else { return None };
+        let ctx = js.comments?;
+        let mut range: Option<(usize, usize)> = None;
+        for c in &self.root.comments[..ctx.upto as usize] {
+            if c.start >= ctx.index as usize && c.start < root_start {
+                range = Some((range.map_or(c.start, |r| r.0), c.end));
+            }
+        }
+        range
     }
 
     pub fn element(&self, n: NodeId) -> Option<&'s crate::ast::Element<'s>> {
@@ -377,6 +383,8 @@ fn analyze_component<'s>(
         leading_comments: FxHashMap::default(),
         filename,
     };
+
+    comments::attach_all(&mut an);
 
     // create synthetic bindings for store subscriptions
     let mut legacy_checks: Vec<BindingId> = Vec::new();

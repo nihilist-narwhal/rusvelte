@@ -482,8 +482,8 @@ impl<'s> Analyzer<'s> {
                     break;
                 }
                 if let P::Js(AstKind::CallExpression(c)) = parent {
-                    let child = self.path.get(i + 1).copied().unwrap_or(p);
-                    if c.arguments.iter().any(|a| nodes::argument(a).is(child)) {
+                    let child = self.path.get(i + 1).copied();
+                    if child.is_some_and(|child| c.arguments.iter().any(|a| nodes::argument(a).is(child))) {
                         let rune = get_rune(&self.sc, Some(parent), st.scope);
                         if rune == Some("$state") || rune == Some("$state.raw") {
                             ty = "derived";
@@ -2720,7 +2720,7 @@ impl<'s> Analyzer<'s> {
                 return Err(e::bind_group_invalid_expression(loc));
             }
             let bytes = self.source.as_bytes();
-            let comments = self.leading_comment_range(ep);
+            let comments = self.leading_comment_range(expression, seq.span.start as usize);
             let mut i = seq.span.start as usize;
             loop {
                 if i == 0 {

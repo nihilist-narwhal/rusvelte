@@ -452,6 +452,21 @@ fn extract_identifiers_from_destructuring<'s>(p: P<'s>, out: &mut Vec<Id<'s>>) {
     }
 }
 
+/// acorn-typescript puts a binding's type annotation on the identifier, which then ends
+/// where the annotation ends
+pub fn with_type_annotation<'s>(
+    id: Id<'s>,
+    pattern: &BindingPattern,
+    annotation: &Option<oxc_allocator::Box<TSTypeAnnotation>>,
+) -> Id<'s> {
+    match (pattern, annotation, id.span) {
+        (BindingPattern::BindingIdentifier(b), Some(t), Some((start, _))) if b.span.start == start => {
+            Id { span: Some((start, t.span.end)), ..id }
+        }
+        _ => id,
+    }
+}
+
 /// `is_reference(node, parent)` from `is-reference`
 pub fn is_reference(node: P, parent: P) -> bool {
     use AstKind as K;
@@ -652,6 +667,7 @@ impl<'s> ScopeBuilder<'s, '_> {
                 }
             }
             for id in extract_identifiers(nodes::param(p)) {
+                let id = with_type_annotation(id, &p.pattern, &p.type_annotation);
                 self.scopes.declare(scope, id, Kind::Normal, DeclKind::Param, None)?;
             }
         }
@@ -797,6 +813,7 @@ impl<'s> ScopeBuilder<'s, '_> {
                     for declarator in &d.declarations {
                         let init = declarator.init.as_ref().map(nodes::expr);
                         for id in extract_identifiers(nodes::binding(&declarator.id)) {
+                            let id = with_type_annotation(id, &declarator.id, &declarator.type_annotation);
                             self.scopes.declare(scope, id, Kind::Normal, kind, init)?;
                         }
                     }
@@ -807,6 +824,7 @@ impl<'s> ScopeBuilder<'s, '_> {
                         let s = self.scopes.child(scope, true);
                         self.scopes.map.insert(p.key(), s);
                         for id in extract_identifiers(nodes::binding(&param.pattern)) {
+                            let id = with_type_annotation(id, &param.pattern, &param.type_annotation);
                             self.scopes.declare(s, id, Kind::Normal, DeclKind::Let, None)?;
                         }
                         self.next(p, s)
