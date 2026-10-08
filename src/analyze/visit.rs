@@ -1850,7 +1850,7 @@ fn extract_paths<'s>(p: P<'s>) -> smallvec::SmallVec<[(P<'s>, bool); 4]> {
 }
 
 fn dummy_id<'s>() -> Id<'s> {
-    Id { name: "", span: None, key: 0 }
+    Id { name: "", span: None, key: 0, svelte_loc: false }
 }
 
 pub fn has_bidi(s: &str) -> bool {

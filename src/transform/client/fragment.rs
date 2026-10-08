@@ -572,7 +572,7 @@ impl<'a, 's> Client<'a, 's> {
             let TNode::Element(el) = &ast.nodes[n] else { unreachable!() };
             let name = self.generate(st.scope, el.name);
             let mut id = b::id(name.as_str());
-            id.loc = Some(self.conv.location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32)));
+            id.loc = Some(self.conv.svelte_location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32)));
             self.visit_node(n, &State { node: id.clone(), ..state.clone() });
             let flags = if state.template.borrow().needs_import_node { TEMPLATE_USE_IMPORT_NODE } else { 0 };
             let template_name = self.transform_template(&state, "root", flags);
@@ -720,7 +720,7 @@ impl<'a, 's> Client<'a, 's> {
                 let (name, loc) = match n.map(|n| &ast.nodes[n]) {
                     Some(TNode::Element(el)) if el.kind == "RegularElement" => (
                         el.name,
-                        Some(self.conv.location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32))),
+                        Some(self.conv.svelte_location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32))),
                     ),
                     _ => ("node", None),
                 };

@@ -376,6 +376,7 @@ impl<'a> JsParser<'a> {
         base: usize,
         root_comments: &mut Vec<JsComment>,
     ) -> Result<JsProgram<'a>> {
+        self.loc.add_script(base, base + content.len());
         let (parsed, comments) = self
             .oxc_parse(content, base, Goal::Program, false)
             .map_err(|(pos, msg)| e::js_parse_error(pos, &msg))?;
@@ -397,6 +398,7 @@ impl<'a> JsParser<'a> {
         index: usize,
         root_comments: &mut Vec<JsComment>,
     ) -> Result<JsExpr<'a>> {
+        self.loc.add_expression(index);
         let text = source.from(index);
         // Usually the expression runs up to the `}` closing the tag: try that first, so the
         // common case is a single parse. Only accept it if what follows is a token that can't
@@ -483,6 +485,7 @@ impl<'a> JsParser<'a> {
         index: usize,
         root_comments: &mut Vec<JsComment>,
     ) -> Result<JsStatement<'a>> {
+        self.loc.add_expression(index);
         // find the end of the statement: the `}` closing the tag
         let rest = source.from(index);
         let end = crate::parser::utils::find_matching_bracket(rest, 0, b'{').map_or(source.len(), |e| e + index);

@@ -235,6 +235,8 @@ fn deprecated_option_warnings(options: &options::CompileOptions, warnings: &mut 
 }
 
 fn compile_component(source: &str, options: &options::CompileOptions) -> Result<CompileOutput, CompileError> {
+    // `remove_bom(source)`
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let alloc = Allocator::default();
     let mut warnings: Vec<Warning> = Vec::new();
     deprecated_option_warnings(options, &mut warnings);
@@ -606,7 +608,7 @@ pub fn script_program_loc(
         .into_iter()
         .flatten()
         .find(|s| std::ptr::eq(&s.content.program, program))
-        .map(|s| conv.location(oxc_span::Span::new(s.start as u32, s.end as u32)))
+        .map(|s| conv.svelte_location(oxc_span::Span::new(s.start as u32, s.end as u32)))
 }
 
 /// The JS comments, as esrap gets them (`analysis.comments`)

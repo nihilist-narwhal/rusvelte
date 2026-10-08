@@ -21,6 +21,9 @@ pub struct Id<'s> {
     pub span: Option<(u32, u32)>,
     /// identity
     pub key: usize,
+    /// Built by Svelte's template parser (`read_identifier`), so its `loc` comes from Svelte's
+    /// locator rather than acorn's
+    pub svelte_loc: bool,
 }
 
 impl<'s> Id<'s> {
@@ -271,7 +274,7 @@ impl<'s> Scopes<'s> {
 
     pub fn synthetic_id(&mut self, name: &'s str) -> Id<'s> {
         self.next_synthetic += 1;
-        Id { name, span: None, key: self.next_synthetic << 1 | 1 }
+        Id { name, span: None, key: self.next_synthetic << 1 | 1, svelte_loc: false }
     }
 
     pub fn scope(&self, id: ScopeId) -> &Scope<'s> {
@@ -523,15 +526,15 @@ pub fn validate_identifier_name(binding: &Binding, function_depth: Option<u32>) 
 pub fn ident<'s>(p: P<'s>) -> Option<Id<'s>> {
     let span = |s: oxc_span::Span| Some((s.start, s.end));
     Some(match p {
-        P::Js(AstKind::IdentifierReference(i)) => Id { name: i.name.as_str(), span: span(i.span), key: nodes::addr(&AstKind::IdentifierReference(i)) },
-        P::Js(AstKind::BindingIdentifier(i)) => Id { name: i.name.as_str(), span: span(i.span), key: nodes::addr(&AstKind::BindingIdentifier(i)) },
-        P::Js(AstKind::IdentifierName(i)) => Id { name: i.name.as_str(), span: span(i.span), key: nodes::addr(&AstKind::IdentifierName(i)) },
-        P::Js(AstKind::LabelIdentifier(i)) => Id { name: i.name.as_str(), span: span(i.span), key: nodes::addr(&AstKind::LabelIdentifier(i)) },
+        P::Js(AstKind::IdentifierReference(i)) => Id { name: i.name.as_str(), span: span(i.span), key: nodes::addr(&AstKind::IdentifierReference(i)), svelte_loc: false },
+        P::Js(AstKind::BindingIdentifier(i)) => Id { name: i.name.as_str(), span: span(i.span), key: nodes::addr(&AstKind::BindingIdentifier(i)), svelte_loc: false },
+        P::Js(AstKind::IdentifierName(i)) => Id { name: i.name.as_str(), span: span(i.span), key: nodes::addr(&AstKind::IdentifierName(i)), svelte_loc: false },
+        P::Js(AstKind::LabelIdentifier(i)) => Id { name: i.name.as_str(), span: span(i.span), key: nodes::addr(&AstKind::LabelIdentifier(i)), svelte_loc: false },
         P::TplExpr(Expr::Ident { name, start, end, .. }) => {
-            Id { name: name.as_str(), span: Some((*start as u32, *end as u32)), key: p.key() }
+            Id { name: name.as_str(), span: Some((*start as u32, *end as u32)), key: p.key(), svelte_loc: true }
         }
         P::PatIdent(Pattern::Ident { name, start, end, .. }) => {
-            Id { name: name.as_str(), span: Some((*start as u32, *end as u32)), key: p.key() }
+            Id { name: name.as_str(), span: Some((*start as u32, *end as u32)), key: p.key(), svelte_loc: true }
         }
         _ => return None,
     })

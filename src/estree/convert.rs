@@ -39,6 +39,10 @@ pub struct Converter<'l> {
     pub ts: bool,
     /// Keep `ParenthesizedExpression`s (acorn's `preserveParens`)
     pub preserve_parens: bool,
+    /// The expression being converted is an operand (of a unary, binary, logical or `as`
+    /// expression, or a conditional's test): acorn reads it with `parseMaybeUnary`, not
+    /// `parseMaybeAssign`. Consumed by [`Converter::expression`].
+    operand: std::cell::Cell<bool>,
 }
 
 #[inline]
@@ -53,7 +57,7 @@ fn is_empty(node: &Node) -> bool {
 impl<'l> Converter<'l> {
     /// `locator` must be over the source the oxc spans point into
     pub fn new(locator: &'l Locator<'l>, ts: bool) -> Self {
-        Converter { locator, ts, preserve_parens: false }
+        Converter { locator, ts, preserve_parens: false, operand: std::cell::Cell::new(false) }
     }
 
     fn pos(&self, offset: u32) -> Position {
@@ -63,6 +67,16 @@ impl<'l> Converter<'l> {
 
     pub fn location(&self, span: oxc_span::Span) -> SourceLocation {
         SourceLocation { start: self.pos(span.start), end: self.pos(span.end) }
+    }
+
+    /// A `loc` written with Svelte's locator (`\n` line breaks only), like the ones the
+    /// template parser builds itself (`read_tag`, `read_identifier`, a script's `Program`)
+    pub fn svelte_location(&self, span: oxc_span::Span) -> SourceLocation {
+        let pos = |offset: u32| {
+            let (line, column, _) = self.locator.line_column(offset as usize);
+            Position { line: line as u32, column: column as u32 }
+        };
+        SourceLocation { start: pos(span.start), end: pos(span.end) }
     }
 
     fn node(&self, kind: NodeKind, span: oxc_span::Span, origin: usize) -> Node {
@@ -1044,8 +1058,15 @@ impl<'l> Converter<'l> {
 
     /// An expression. TypeScript wrappers (`as`, `satisfies`, `!`, `<T>x`, `x<T>`) become their
     /// expression.
+    /// [`Converter::expression`] for an operand (see `operand`)
+    fn operand(&self, e: &ox::Expression) -> Node {
+        self.operand.set(true);
+        self.expression(e)
+    }
+
     pub fn expression(&self, e: &ox::Expression) -> Node {
         use ox::Expression as E;
+        let operand = self.operand.replace(false);
         match e {
             E::BooleanLiteral(l) => self.node(
                 NodeKind::Literal(Literal {
@@ -1141,15 +1162,15 @@ impl<'l> Converter<'l> {
                 addr(&**a),
             ),
             E::AwaitExpression(a) => self.node(
-                NodeKind::AwaitExpression(Argument { argument: Box::new(self.expression(&a.argument)) }),
+                NodeKind::AwaitExpression(Argument { argument: Box::new(self.operand(&a.argument)) }),
                 a.span,
                 addr(&**a),
             ),
             E::BinaryExpression(b) => self.node(
                 NodeKind::BinaryExpression(BinaryExpression {
                     operator: b.operator,
-                    left: Box::new(self.expression(&b.left)),
-                    right: Box::new(self.expression(&b.right)),
+                    left: Box::new(self.operand(&b.left)),
+                    right: Box::new(self.operand(&b.right)),
                 }),
                 b.span,
                 addr(&**b),
@@ -1158,7 +1179,7 @@ impl<'l> Converter<'l> {
                 NodeKind::BinaryExpression(BinaryExpression {
                     operator: BinaryOperator::In,
                     left: Box::new(self.private_identifier(&p.left)),
-                    right: Box::new(self.expression(&p.right)),
+                    right: Box::new(self.operand(&p.right)),
                 }),
                 p.span,
                 addr(&**p),
@@ -1175,7 +1196,7 @@ impl<'l> Converter<'l> {
             E::ClassExpression(c) => self.class(c, false),
             E::ConditionalExpression(c) => self.node(
                 NodeKind::ConditionalExpression(ConditionalExpression {
-                    test: Box::new(self.expression(&c.test)),
+                    test: Box::new(self.operand(&c.test)),
                     consequent: Box::new(self.expression(&c.consequent)),
                     alternate: Box::new(self.expression(&c.alternate)),
                 }),
@@ -1194,8 +1215,8 @@ impl<'l> Converter<'l> {
             E::LogicalExpression(l) => self.node(
                 NodeKind::LogicalExpression(LogicalExpression {
                     operator: l.operator,
-                    left: Box::new(self.expression(&l.left)),
-                    right: Box::new(self.expression(&l.right)),
+                    left: Box::new(self.operand(&l.left)),
+                    right: Box::new(self.operand(&l.right)),
                 }),
                 l.span,
                 addr(&**l),
@@ -1264,7 +1285,7 @@ impl<'l> Converter<'l> {
             E::UnaryExpression(u) => self.node(
                 NodeKind::UnaryExpression(UnaryExpression {
                     operator: u.operator,
-                    argument: Box::new(self.expression(&u.argument)),
+                    argument: Box::new(self.operand(&u.argument)),
                 }),
                 u.span,
                 addr(&**u),
@@ -1298,9 +1319,30 @@ impl<'l> Converter<'l> {
                 let property = self.ident("target", oxc_span::Span::new(m.span.end - 6, m.span.end), a + 2);
                 self.node(NodeKind::MetaProperty(MetaProperty { meta: Box::new(meta), property: Box::new(property) }), m.span, a)
             }
-            E::TSAsExpression(e) => self.expression(&e.expression),
-            E::TSSatisfiesExpression(e) => self.expression(&e.expression),
-            E::TSTypeAssertion(e) => self.expression(&e.expression),
+            E::TSAsExpression(e) => self.operand(&e.expression),
+            E::TSSatisfiesExpression(e) => self.operand(&e.expression),
+            E::TSTypeAssertion(e) => {
+                let mut node = self.operand(&e.expression);
+                // Where acorn reads an assignment expression, acorn-typescript first tries
+                // `<T>` as type parameters and takes what follows if it is an arrow function,
+                // parentheses or not (it doesn't check for them): `<T>(() => x)` becomes a
+                // generic arrow function starting at the `<`
+                if !operand && !self.preserve_parens && reads_as_type_parameters(&e.type_annotation) {
+                    let mut inner = &e.expression;
+                    while let E::ParenthesizedExpression(p) = inner {
+                        inner = &p.expression;
+                    }
+                    if let (E::ArrowFunctionExpression(_), NodeKind::ArrowFunctionExpression(_)) = (inner, &node.kind) {
+                        if let Some(span) = &mut node.span {
+                            span.start = e.span.start;
+                        }
+                        if let Some(loc) = &mut node.loc {
+                            loc.start = self.pos(e.span.start);
+                        }
+                    }
+                }
+                node
+            }
             E::TSNonNullExpression(e) => self.expression(&e.expression),
             E::TSInstantiationExpression(e) => self.expression(&e.expression),
             E::JSXElement(_) | E::JSXFragment(_) => panic!("JSX can't be converted to Svelte's ESTree"),
@@ -1379,4 +1421,25 @@ pub fn dedent(value: &str, indentation: &str) -> String {
         at_line_start = matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}');
     }
     out
+}
+
+/// Whether acorn-typescript's `tsParseTypeParameters` reads the type of a `<T>x` assertion as
+/// type parameters: a single name that isn't a reserved word
+fn reads_as_type_parameters(ty: &ox::TSType) -> bool {
+    use ox::TSType as T;
+    match ty {
+        T::TSTypeReference(r) => r.type_arguments.is_none() && matches!(r.type_name, ox::TSTypeName::IdentifierReference(_)),
+        T::TSAnyKeyword(_)
+        | T::TSUnknownKeyword(_)
+        | T::TSStringKeyword(_)
+        | T::TSNumberKeyword(_)
+        | T::TSBooleanKeyword(_)
+        | T::TSBigIntKeyword(_)
+        | T::TSSymbolKeyword(_)
+        | T::TSObjectKeyword(_)
+        | T::TSNeverKeyword(_)
+        | T::TSUndefinedKeyword(_)
+        | T::TSIntrinsicKeyword(_) => true,
+        _ => false,
+    }
 }

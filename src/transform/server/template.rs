@@ -413,7 +413,7 @@ impl<'a, 's> Server<'a, 's> {
                 let mut id = b::id(name.as_str());
                 id.span = Some(crate::estree::Span::new(*start as u32, *end as u32));
                 if matches!(loc, crate::ast::IdentLoc::Svelte) {
-                    id.loc = Some(self.conv.location(oxc_span::Span::new(*start as u32, *end as u32)));
+                    id.loc = Some(self.conv.svelte_location(oxc_span::Span::new(*start as u32, *end as u32)));
                 }
                 id.origin = Some(P::TplExpr(e).key());
                 id
@@ -659,7 +659,7 @@ impl<'a, 's> Server<'a, 's> {
             crate::ast::Pattern::Ident { name, start, end, .. } => {
                 let mut id = b::id(name.as_str());
                 id.span = Some(crate::estree::Span::new(*start as u32, *end as u32));
-                id.loc = Some(self.conv.location(oxc_span::Span::new(*start as u32, *end as u32)));
+                id.loc = Some(self.conv.svelte_location(oxc_span::Span::new(*start as u32, *end as u32)));
                 id.origin = Some(P::PatIdent(p).key());
                 id
             }

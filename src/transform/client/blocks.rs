@@ -48,7 +48,7 @@ impl<'a, 's> Client<'a, 's> {
             TNode::Element(el) => match el.kind {
                 "RegularElement" => self.regular_element(n, st),
                 "Component" => {
-                    let loc = Some(self.conv.location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32)));
+                    let loc = Some(self.conv.svelte_location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32)));
                     let component = self.build_component(n, el.name, loc, st);
                     st.init.borrow_mut().push(component);
                 }
@@ -57,7 +57,7 @@ impl<'a, 's> Client<'a, 's> {
                     st.init.borrow_mut().push(component);
                 }
                 "SvelteSelf" => {
-                    let loc = Some(self.conv.location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32)));
+                    let loc = Some(self.conv.svelte_location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32)));
                     let name = self.an.name.clone();
                     let component = self.build_component(n, &name, loc, st);
                     st.init.borrow_mut().push(component);
@@ -68,7 +68,7 @@ impl<'a, 's> Client<'a, 's> {
                 "TitleElement" => self.title_element(n, st),
                 "SvelteHead" => {
                     let mut head = b::id("$.head");
-                    head.loc = Some(self.conv.location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32)));
+                    head.loc = Some(self.conv.svelte_location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32)));
                     let block = self.visit_fragment(el.fragment, st);
                     let hash = super::super::hash(&self.filename);
                     st.init.borrow_mut().push(b::stmt(b::call(head, vec![b::literal(hash.as_str()), b::arrow(vec![b::id("$$anchor")], block)])));
@@ -100,7 +100,7 @@ impl<'a, 's> Client<'a, 's> {
             Pattern::Ident { name, start, end, .. } => {
                 let mut id = b::id(name.as_str());
                 id.span = Some(crate::estree::Span::new(*start as u32, *end as u32));
-                id.loc = Some(self.conv.location(oxc_span::Span::new(*start as u32, *end as u32)));
+                id.loc = Some(self.conv.svelte_location(oxc_span::Span::new(*start as u32, *end as u32)));
                 id.origin = Some(P::PatIdent(p).key());
                 id
             }
@@ -1261,7 +1261,7 @@ impl<'a, 's> Client<'a, 's> {
         let (value, has_state) = self.build_template_chunk(&values, &[], st, Memoize::Local, &mut memoizer);
         let evaluated = self.evaluate(&value, st.scope);
         let mut title = b::id("title");
-        title.loc = Some(self.conv.location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32)));
+        title.loc = Some(self.conv.svelte_location(oxc_span::Span::new(el.name_loc.start as u32, el.name_loc.end as u32)));
         let rhs = if evaluated.is_known {
             match &evaluated.value {
                 Some(v) => evaluated_literal(v),

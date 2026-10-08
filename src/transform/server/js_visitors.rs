@@ -59,7 +59,7 @@ impl<'a, 's> Server<'a, 's> {
         if let Some((start, end)) = id.span {
             n.span = Some(crate::estree::Span::new(start, end));
             if id.has_loc() {
-                n.loc = Some(self.conv.location(oxc_span::Span::new(start, end)));
+                n.loc = Some(if id.svelte_loc { self.conv.svelte_location(oxc_span::Span::new(start, end)) } else { self.conv.location(oxc_span::Span::new(start, end)) });
             }
         }
         n.origin = Some(id.key);

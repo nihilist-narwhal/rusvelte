@@ -193,7 +193,7 @@ impl<'a, 's> Client<'a, 's> {
                 id.span = Some(crate::estree::Span::new(*start as u32, *end as u32));
                 // the identifiers Svelte's parser makes for `bind:x` / `class:x` have no `loc`
                 if matches!(loc, crate::ast::IdentLoc::Svelte) {
-                    id.loc = Some(self.conv.location(oxc_span::Span::new(*start as u32, *end as u32)));
+                    id.loc = Some(self.conv.svelte_location(oxc_span::Span::new(*start as u32, *end as u32)));
                 }
                 id.origin = Some(P::TplExpr(e).key());
                 id

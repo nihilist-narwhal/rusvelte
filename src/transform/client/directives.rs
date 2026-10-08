@@ -252,7 +252,7 @@ impl<'a, 's> Client<'a, 's> {
             let assignment = self.visit_js(&raw_assignment, st);
             if self.dev {
                 let mut get_id = b::id("get");
-                get_id.loc = Some(self.conv.location(oxc_span::Span::new(name_loc.start as u32, name_loc.end as u32)));
+                get_id.loc = Some(self.conv.svelte_location(oxc_span::Span::new(name_loc.start as u32, name_loc.end as u32)));
                 let mut set_id = b::id("set");
                 set_id.loc = get_id.loc;
                 get = b::r#function(get_id, vec![], b::block(vec![b::r#return(expression.clone())]));
@@ -364,9 +364,11 @@ impl<'a, 's> Client<'a, 's> {
 
 /// The identifiers a `let:x={{ y, z }}` destructures (`scope.get_bindings(node)` order)
 fn collect_let_ids(e: &Node, out: &mut Vec<Node>) {
+    // `extract_identifiers_from_destructuring`, which (unlike the scope's own pattern walk)
+    // skips defaults (`AssignmentExpression`) and array rest elements (`SpreadElement`)
     match &e.kind {
         NodeKind::Identifier(_) => out.push(e.clone()),
-        NodeKind::ObjectExpression(o) | NodeKind::ObjectPattern(o) => {
+        NodeKind::ObjectExpression(o) => {
             for p in &o.properties {
                 match &p.kind {
                     NodeKind::Property(p) => collect_let_ids(&p.value, out),
@@ -375,14 +377,11 @@ fn collect_let_ids(e: &Node, out: &mut Vec<Node>) {
                 }
             }
         }
-        NodeKind::ArrayExpression(a) | NodeKind::ArrayPattern(a) => {
+        NodeKind::ArrayExpression(a) => {
             for el in a.elements.iter().flatten() {
                 collect_let_ids(el, out);
             }
         }
-        NodeKind::AssignmentPattern(a) => collect_let_ids(&a.left, out),
-        NodeKind::AssignmentExpression(a) => collect_let_ids(&a.left, out),
-        NodeKind::SpreadElement(s) | NodeKind::RestElement(s) => collect_let_ids(&s.argument, out),
         _ => {}
     }
 }

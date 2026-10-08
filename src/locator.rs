@@ -3,8 +3,15 @@
 //! Svelte's own locator (`locate-character`) only breaks lines on `\n`, while acorn also
 //! breaks on `\r`, ` ` and ` ` (treating `\r\n` as one break). Both are kept so
 //! JS nodes get acorn's numbering and template nodes get Svelte's.
+//!
+//! Where acorn starts counting matters when not every line break is a `\n`:
+//! - a `<script>` is parsed with everything before it replaced by spaces except the `\n`s
+//!   (`read_script`): only the `\n`s before its start count;
+//! - a template expression is parsed with `parseExpressionAt(template, index)`, which starts
+//!   at the line after the last `\n` before `index` (`lastIndexOf("\n")`), counting acorn's
+//!   line breaks up to that `\n` but not the ones between it and `index`.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 
 use serde_json::{json, Value};
 
@@ -18,6 +25,11 @@ pub struct Locator<'s> {
     acorn_lines: OnceCell<Vec<usize>>,
     /// For non-ASCII sources: UTF-16 offset of every byte offset (built on first use)
     utf16: OnceCell<Vec<u32>>,
+    /// When not every line break is a `\n`: the `<script>` contents (byte ranges)
+    scripts: RefCell<Vec<(usize, usize)>>,
+    /// When not every line break is a `\n`: where each template expression's parse started
+    /// (sorted)
+    expressions: RefCell<Vec<usize>>,
 }
 
 /// Whether the source contains `\u2028` or `\u2029` (E2 80 A8 / E2 80 A9)
@@ -45,6 +57,8 @@ impl<'s> Locator<'s> {
             lf_lines: OnceCell::new(),
             acorn_lines: OnceCell::new(),
             utf16: OnceCell::new(),
+            scripts: RefCell::new(Vec::new()),
+            expressions: RefCell::new(Vec::new()),
         }
     }
 
@@ -149,12 +163,61 @@ impl<'s> Locator<'s> {
 
     /// acorn's position as numbers: (line, column in UTF-16 units) with acorn's line breaks
     pub fn acorn_line_column(&self, byte: usize) -> (usize, usize) {
+        if !self.lf_only {
+            let script = self.scripts.borrow().iter().find(|&&(s, e)| s <= byte && byte <= e).map(|&(s, _)| s);
+            if let Some(start) = script {
+                return self.parse_line_col(start, true, byte);
+            }
+            let expressions = self.expressions.borrow();
+            let i = expressions.partition_point(|&s| s <= byte);
+            if i > 0 {
+                return self.parse_line_col(expressions[i - 1], false, byte);
+            }
+        }
         self.line_col(self.acorn_lines(), byte)
+    }
+
+    /// Registers the contents of a `<script>` (`start..end`), which acorn sees with what
+    /// precedes it blanked out
+    pub fn add_script(&self, start: usize, end: usize) {
+        if !self.lf_only && start > 0 {
+            self.scripts.borrow_mut().push((start, end));
+        }
+    }
+
+    /// Registers where acorn starts parsing a template expression or statement
+    /// (`parseExpressionAt(template, index)`)
+    pub fn add_expression(&self, index: usize) {
+        if !self.lf_only {
+            let mut expressions = self.expressions.borrow_mut();
+            if let Err(i) = expressions.binary_search(&index) {
+                expressions.insert(i, index);
+            }
+        }
+    }
+
+    /// acorn's position of `byte` in a parse that started at `start`. acorn starts at the line
+    /// after the last `\n` before `start`, numbered by the line breaks before it: only the
+    /// `\n`s for a script (the rest is blanked out), acorn's for a template expression
+    fn parse_line_col(&self, start: usize, script: bool, byte: usize) -> (usize, usize) {
+        let lf = self.lf_lines();
+        let lf_line = match lf.binary_search(&start) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        };
+        let line_start = lf[lf_line];
+        let acorn = self.acorn_lines();
+        let base = if script { lf_line + 1 } else { acorn.partition_point(|&l| l <= line_start) };
+        let first = acorn.partition_point(|&l| l <= start);
+        let upto = acorn.partition_point(|&l| l <= byte);
+        let breaks = upto.saturating_sub(first);
+        let line_start = if breaks > 0 { acorn[upto - 1] } else { line_start };
+        (base + breaks, self.utf16(byte) - self.utf16(line_start))
     }
 
     /// acorn's position: `{ line, column }` with acorn's line breaks
     pub fn acorn_position(&self, byte: usize) -> Value {
-        let (line, column) = self.line_col(self.acorn_lines(), byte);
+        let (line, column) = self.acorn_line_column(byte);
         json!({ "line": line, "column": column })
     }
 

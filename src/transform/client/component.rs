@@ -175,7 +175,7 @@ impl<'a, 's> Client<'a, 's> {
                             let assignment = b::assignment("=", raw.clone(), b::id("$$value"));
                             let assigned = self.visit_js(&assignment, st);
                             let mut set = b::set(name, vec![b::stmt(assigned)]);
-                            let key_loc = Some(self.conv.location(oxc_span::Span::new(name_loc.start as u32, name_loc.end as u32)));
+                            let key_loc = Some(self.conv.svelte_location(oxc_span::Span::new(name_loc.start as u32, name_loc.end as u32)));
                             for p in [&mut get, &mut set] {
                                 if let NodeKind::Property(p) = &mut p.kind {
                                     p.key.loc = key_loc;
