@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{json, Map, Value};
 
+use crate::svelte2tsx::rewrite_imports::RewriteExternalImports;
 use crate::svelte2tsx::{svelte2tsx_full, Svelte2TsxOptions};
 use map::{Code, Diagnostic, Position, Range};
 use tsc::Severity;
@@ -191,6 +192,11 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
                         filename: Some(path.to_string_lossy().to_string()),
                         is_ts_file: is_ts,
                         emit_jsdoc: true,
+                        rewrite_external_imports: Some(RewriteExternalImports {
+                            source_path: path.clone(),
+                            generated_path: out_path.clone(),
+                            workspace_path: workspace.clone(),
+                        }),
                         ..Default::default()
                     };
                     // svelte2tsx errors are left to the compiler diagnostics
@@ -249,7 +255,7 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
         if opts.timings {
             eprintln!("[timing] tsgo (from start): {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
         }
-        let mapped = timed(opts.timings, "map diagnostics", || map_ts_diagnostics(&diags, &entries, &tsconfig_path, opts.threads));
+        let mapped = timed(opts.timings, "map diagnostics", || map_ts_diagnostics(&diags, &entries, &workspace, &tsconfig_path, opts.threads));
         for (path, text, diags) in mapped {
             match index.get(&path) {
                 Some(&i) => by_file[i].diagnostics.extend(diags),
@@ -416,7 +422,7 @@ fn add_subpath_import_paths(paths: &mut Map<String, Value>, workspace: &Path, ov
 }
 
 /// `mapCliDiagnosticsToLsp`: group by file, map the ones in generated files
-fn map_ts_diagnostics(diags: &[tsc::CliDiagnostic], entries: &[Entry], tsconfig: &Path, threads: usize) -> Vec<(PathBuf, String, Vec<Diagnostic>)> {
+fn map_ts_diagnostics(diags: &[tsc::CliDiagnostic], entries: &[Entry], workspace: &Path, tsconfig: &Path, threads: usize) -> Vec<(PathBuf, String, Vec<Diagnostic>)> {
     let by_out: HashMap<&Path, &Entry> = entries.iter().map(|e| (e.out_path.as_path(), e)).collect();
     let mut groups: Vec<(PathBuf, Vec<&tsc::CliDiagnostic>)> = Vec::new();
     let mut pos: HashMap<PathBuf, usize> = HashMap::new();
@@ -439,7 +445,7 @@ fn map_ts_diagnostics(diags: &[tsc::CliDiagnostic], entries: &[Entry], tsconfig:
                 let Some((path, file_diags)) = groups.get(i) else { break };
                 let owned: Vec<tsc::CliDiagnostic> = file_diags.iter().map(|d| (*d).clone()).collect();
                 let r = match by_out.get(path.as_path()) {
-                    Some(entry) => (entry.source_path.clone(), entry.source.clone(), map_entry(entry, &owned)),
+                    Some(entry) => (entry.source_path.clone(), entry.source.clone(), map_entry(entry, workspace, &owned)),
                     None => {
                         let text = std::fs::read_to_string(path).unwrap_or_default();
                         let source = if is_typescript_file(path) { "ts" } else { "js" };
@@ -459,7 +465,7 @@ fn is_typescript_file(p: &Path) -> bool {
 
 /// Map one component's diagnostics (re-running svelte2tsx for the source map, as the
 /// language server does)
-fn map_entry(entry: &Entry, diags: &[tsc::CliDiagnostic]) -> Vec<Diagnostic> {
+fn map_entry(entry: &Entry, workspace: &Path, diags: &[tsc::CliDiagnostic]) -> Vec<Diagnostic> {
     let verbatim = crate::svelte2tsx::htmlx::find_verbatim_elements(&entry.source);
     let script_lang = |module: bool| {
         verbatim.iter().filter(|v| !v.is_style).find_map(|v| {
@@ -476,7 +482,17 @@ fn map_entry(entry: &Entry, diags: &[tsc::CliDiagnostic]) -> Vec<Diagnostic> {
         .iter()
         .flatten()
         .any(|l| matches!(l.as_str(), "ts" | "typescript" | "text/ts" | "text/typescript"));
-    let o = Svelte2TsxOptions { filename: Some(entry.source_path.to_string_lossy().to_string()), is_ts_file: is_ts, emit_jsdoc: true, ..Default::default() };
+    let o = Svelte2TsxOptions {
+        filename: Some(entry.source_path.to_string_lossy().to_string()),
+        is_ts_file: is_ts,
+        emit_jsdoc: true,
+        rewrite_external_imports: Some(RewriteExternalImports {
+            source_path: entry.source_path.clone(),
+            generated_path: entry.out_path.clone(),
+            workspace_path: workspace.to_path_buf(),
+        }),
+        ..Default::default()
+    };
     let Ok(r) = svelte2tsx_full(&entry.source, &o, true) else { return Vec::new() };
     let script_content = verbatim
         .iter()

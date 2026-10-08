@@ -162,3 +162,58 @@ pub fn span_of<T: GetSpan>(n: &T) -> oxc_span::Span {
 pub fn js_trim(s: &str) -> &str {
     s.trim_matches(|c: char| crate::parser::utils::is_whitespace_char(c) || c == '\u{feff}')
 }
+
+/// `rewriteExternalImportsInNode`'s edit: the specifier's contents, rewritten
+pub fn rewrite_specifier(out: &mut Out, off: usize, span: oxc_span::Span, value: &str, o: Option<&crate::svelte2tsx::rewrite_imports::RewriteExternalImports>) -> Result<()> {
+    let Some(o) = o else { return Ok(()) };
+    if let Some(r) = crate::svelte2tsx::rewrite_imports::external_import_rewrite(value, o) {
+        out.ms.overwrite(span.start as usize + off + 1, span.end as usize + off - 1, &r.rewritten, false)?;
+    }
+    Ok(())
+}
+
+/// The module specifier a node imports, the way `rewriteExternalImportsInNode` finds them:
+/// import/export declarations, `import()`/`require()` with a literal, import types
+pub fn import_specifier<'r>(kind: &oxc_ast::AstKind<'r>) -> Option<(oxc_span::Span, &'r str)> {
+    use oxc_ast::AstKind;
+    let lit = |e: &'r Expression| match e {
+        Expression::StringLiteral(s) => Some((s.span, s.value.as_str())),
+        Expression::TemplateLiteral(t) if t.expressions.is_empty() && t.quasis.len() == 1 => {
+            t.quasis[0].value.cooked.as_ref().map(|c| (t.span, c.as_str()))
+        }
+        _ => None,
+    };
+    match kind {
+        AstKind::ImportDeclaration(i) => Some((i.source.span, i.source.value.as_str())),
+        AstKind::ExportFromDeclaration(e) => Some((e.source.span, e.source.value.as_str())),
+        AstKind::ExportAllDeclaration(e) => Some((e.source.span, e.source.value.as_str())),
+        AstKind::ImportExpression(i) => lit(&i.source),
+        AstKind::CallExpression(c) => match &c.callee {
+            Expression::Identifier(id) if id.name == "require" => c.arguments.first().and_then(|a| a.as_expression()).and_then(lit),
+            _ => None,
+        },
+        AstKind::TSImportType(t) => Some((t.source.span, t.source.value.as_str())),
+        _ => None,
+    }
+}
+
+/// Import types in JSDoc comments (`@type {import('../x').T}`)
+pub fn rewrite_jsdoc_imports(out: &mut Out, ast: &ts::ScriptAst, o: Option<&crate::svelte2tsx::rewrite_imports::RewriteExternalImports>) -> Result<()> {
+    let Some(o) = o else { return Ok(()) };
+    static IMPORT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"import\(\s*(?:'([^'\n]*)'|"([^"\n]*)")"#).unwrap());
+    for c in &ast.program.comments {
+        let (s, e) = (c.span.start as usize, c.span.end as usize);
+        let text = &ast.text[s..e];
+        if !text.starts_with("/**") || text.starts_with("/**/") {
+            continue;
+        }
+        for m in IMPORT.captures_iter(text) {
+            let v = m.get(1).or(m.get(2)).unwrap();
+            if let Some(r) = crate::svelte2tsx::rewrite_imports::external_import_rewrite(v.as_str(), o) {
+                let start = s + v.start() + ast.offset;
+                out.ms.overwrite(start, start + v.len(), &r.rewritten, false)?;
+            }
+        }
+    }
+    Ok(())
+}

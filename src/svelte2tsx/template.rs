@@ -30,6 +30,7 @@ pub struct Options {
     /// `mode === 'ts'`
     pub mode_ts: bool,
     pub accessors: bool,
+    pub rewrite_external_imports: Option<super::rewrite_imports::RewriteExternalImports>,
 }
 
 static SVG_ATTRIBUTES: std::sync::LazyLock<HashSet<&'static str>> =
@@ -204,6 +205,14 @@ impl EsHandler for Converter<'_, '_, '_> {
             self.is_runes = true;
         }
     }
+
+    fn import_expression(&mut self, start: usize, end: usize, value: &str) {
+        if let Some(o) = &self.opts.rewrite_external_imports {
+            if let Some(r) = super::rewrite_imports::external_import_rewrite(value, o) {
+                let _ = self.str.overwrite(start + 1, end - 1, &r.rewritten, false);
+            }
+        }
+    }
 }
 
 impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
@@ -243,6 +252,7 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
     // --- walking -------------------------------------------------------------------------
 
     pub fn convert(&mut self, root: &'m LegacyRoot<'m, 'a>, verbatim: &'m [Verbatim<'a>]) -> Result<()> {
+        self.rewrite_comment_imports(verbatim)?;
         for child in &root.children {
             self.node(child, Parent::Root)?;
         }
@@ -255,6 +265,38 @@ impl<'s, 'm, 'a> Converter<'s, 'm, 'a> {
         }
         if !self.opts.mode_ts {
             self.blank_other_script_tags(root, verbatim)?;
+        }
+        Ok(())
+    }
+
+    /// `rewriteImportsInComment` for the template's JS comments
+    fn rewrite_comment_imports(&mut self, verbatim: &[Verbatim]) -> Result<()> {
+        let Some(o) = &self.opts.rewrite_external_imports else { return Ok(()) };
+        static IMPORT: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new(r#"import\(\s*(['"])([^'"]+)(['"])\s*\)"#).unwrap());
+        for c in self.comments {
+            // (the blanked scripts and styles have `/**/` comments of their own)
+            if verbatim.iter().any(|v| v.start <= c.start && c.end <= v.end) {
+                continue;
+            }
+            let original = &self.original()[c.start..c.end];
+            let mut changed = false;
+            let rewritten = IMPORT.replace_all(original, |m: &regex::Captures| {
+                if m[1] != m[3] {
+                    return m[0].to_string();
+                }
+                match super::rewrite_imports::external_import_rewrite(&m[2], o) {
+                    Some(r) => {
+                        changed = true;
+                        format!("import({}{}{})", &m[1], r.rewritten, &m[1])
+                    }
+                    None => m[0].to_string(),
+                }
+            });
+            if changed {
+                let rewritten = rewritten.into_owned();
+                self.str.overwrite(c.start, c.end, &rewritten, false)?;
+            }
         }
         Ok(())
     }

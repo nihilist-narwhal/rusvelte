@@ -22,6 +22,7 @@ fn main() {
         is_ts_file: false,
         mode_ts: false,
         accessors: false,
+        rewrite_external_imports: None,
     };
     let (mut pass, mut fail) = (0, 0);
     let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -48,6 +49,11 @@ fn main() {
                     namespace_foreign: o["namespace"].as_str() == Some("foreign"),
                     emit_jsdoc: o["emitJsDoc"].as_bool().unwrap_or(false),
                     svelte5_plus: true,
+                    rewrite_external_imports: o.get("rewriteExternalImports").map(|r| svelte_rs::svelte2tsx::rewrite_imports::RewriteExternalImports {
+                        source_path: o["filename"].as_str().unwrap().into(),
+                        generated_path: r["generatedPath"].as_str().unwrap().into(),
+                        workspace_path: r["workspacePath"].as_str().unwrap().into(),
+                    }),
                 };
                 svelte2tsx(&source, &s2t)
             } else {

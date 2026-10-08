@@ -40,6 +40,8 @@ pub trait EsHandler {
     fn set_declaration(&mut self, value: bool);
     /// `in_function`: there's a function between the await and the template
     fn await_expression(&mut self, in_function: bool);
+    /// `import('...')` with a string literal: its span and value
+    fn import_expression(&mut self, _start: usize, _end: usize, _value: &str) {}
 }
 
 pub struct EsWalker<'h, H: EsHandler> {
@@ -113,6 +115,11 @@ impl<'a, H: EsHandler> Visit<'a> for EsWalker<'_, H> {
             | AstKind::TSMethodSignature(_) => self.params_owner.push(false),
             AstKind::VariableDeclarator(_) => self.h.set_declaration(true),
             AstKind::AwaitExpression(_) => self.h.await_expression(self.fn_depth > 0),
+            AstKind::ImportExpression(i) => {
+                if let Expression::StringLiteral(s) = &i.source {
+                    self.h.import_expression(s.span.start as usize, s.span.end as usize, &s.value);
+                }
+            }
             _ => {}
         }
     }

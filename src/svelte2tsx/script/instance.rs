@@ -70,6 +70,7 @@ struct Walker<'w, 'r, 'a, 's> {
     ast: &'r ScriptAst<'a>,
     off: usize,
     script_start: usize,
+    rewrite: Option<&'w crate::svelte2tsx::rewrite_imports::RewriteExternalImports>,
     exported: &'w mut ExportedNames<'r, 'a>,
     events: &'w mut ComponentEvents,
     implicit: &'w mut ImplicitStoreValues,
@@ -106,8 +107,10 @@ pub fn process_instance_script_content<'r, 'a>(
     mode_ts: bool,
     module_ast: Option<&ScriptAst>,
     svelte5_plus: bool,
+    rewrite: Option<&crate::svelte2tsx::rewrite_imports::RewriteExternalImports>,
 ) -> Result<InstanceResult> {
     let off = ast.offset;
+    rewrite_jsdoc_imports(out, ast, rewrite)?;
     if let Some(m) = module_ast {
         for stmt in &m.program.body {
             exported.hoistable.analyze_module_script_node(stmt);
@@ -118,6 +121,7 @@ pub fn process_instance_script_content<'r, 'a>(
         ast,
         off,
         script_start: script.start,
+        rewrite,
         exported,
         events,
         implicit,
@@ -336,6 +340,9 @@ impl<'w, 'r, 'a, 's> Walker<'w, 'r, 'a, 's> {
 
     /// What `walk` does when entering a TS node
     fn on_enter(&mut self, kind: AstKind<'a>) -> Result<()> {
+        if let Some((span, value)) = import_specifier(&kind) {
+            rewrite_specifier(self.out, self.off, span, value, self.rewrite)?;
+        }
         let depth = self.parents.len();
         let parent = self.parents.last().copied();
         let ast = self.ast;

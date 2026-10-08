@@ -21,6 +21,13 @@ function isTsSvelte(text) {
 	return false;
 }
 
+function svelteCheckOutPath(workspace, sourcePath, isTsFile) {
+	const relPath = path.relative(workspace, sourcePath);
+	const emitDir = path.join(workspace, fs.existsSync(path.join(workspace, '.svelte-kit')) ? '.svelte-kit/.svelte-check' : '.svelte-check', 'svelte');
+	const base = path.join(emitDir, relPath.replace(/\.svelte$/, `.svelte.${isTsFile ? 'ts' : 'js'}`));
+	return path.join(path.dirname(base), `++${path.basename(base)}`).replace(/\\/g, '/');
+}
+
 function options(rel, source) {
 	if (mode === 'samples') {
 		const sample = rel.split('/')[0];
@@ -33,6 +40,20 @@ function options(rel, source) {
 			accessors: sample.startsWith('accessors-config'),
 			emitJsDoc: sample.startsWith('jsdoc-'),
 			emitOnTemplateError: false
+		};
+	}
+	if (mode === 'svelte-check') {
+		// exactly what svelte-check --tsgo passes (the corpus dir is the workspace)
+		const workspace = path.resolve(corpus);
+		const sourcePath = path.join(workspace, rel);
+		const isTsFile = isTsSvelte(source);
+		return {
+			filename: sourcePath,
+			isTsFile,
+			mode: 'ts',
+			emitOnTemplateError: false,
+			emitJsDoc: true,
+			rewriteExternalImports: { workspacePath: workspace, generatedPath: svelteCheckOutPath(workspace, sourcePath, isTsFile) }
 		};
 	}
 	return {

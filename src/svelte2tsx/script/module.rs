@@ -12,11 +12,18 @@ use super::*;
 use crate::svelte2tsx::htmlx::Verbatim;
 use crate::svelte2tsx::transform::{index_of, last_index_of};
 
-pub fn process_module_script_tag(out: &mut Out, ast: &ScriptAst, script: &Verbatim, implicit: &mut ImplicitStoreValues) -> Result<()> {
+pub fn process_module_script_tag(
+    out: &mut Out,
+    ast: &ScriptAst,
+    script: &Verbatim,
+    implicit: &mut ImplicitStoreValues,
+    rewrite: Option<&crate::svelte2tsx::rewrite_imports::RewriteExternalImports>,
+) -> Result<()> {
+    rewrite_jsdoc_imports(out, ast, rewrite)?;
     if Generics::new(Some(script)).generics_attr.is_some() {
         return Err(MagicStringError("The generics attribute is only allowed on the instance script".into()));
     }
-    let mut w = ModuleWalker { out, off: ast.offset, implicit, parents: Vec::new(), err: None };
+    let mut w = ModuleWalker { out, off: ast.offset, implicit, rewrite, parents: Vec::new(), err: None };
     for stmt in &ast.program.body {
         w.visit_statement(stmt);
         if let Some(e) = w.err.take() {
@@ -37,12 +44,16 @@ struct ModuleWalker<'w, 's, 'a> {
     out: &'w mut Out<'s>,
     off: usize,
     implicit: &'w mut ImplicitStoreValues,
+    rewrite: Option<&'w crate::svelte2tsx::rewrite_imports::RewriteExternalImports>,
     parents: Vec<AstKind<'a>>,
     err: Option<MagicStringError>,
 }
 
 impl ModuleWalker<'_, '_, '_> {
     fn on_enter(&mut self, kind: AstKind) -> Result<()> {
+        if let Some((span, value)) = import_specifier(&kind) {
+            rewrite_specifier(self.out, self.off, span, value, self.rewrite)?;
+        }
         match kind {
             AstKind::VariableDeclarator(d) => {
                 let end = match self.parents.last() {

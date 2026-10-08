@@ -82,6 +82,7 @@ pub struct Svelte2TsxOptions {
     pub namespace_foreign: bool,
     pub emit_jsdoc: bool,
     pub svelte5_plus: bool,
+    pub rewrite_external_imports: Option<rewrite_imports::RewriteExternalImports>,
 }
 
 impl Default for Svelte2TsxOptions {
@@ -95,6 +96,7 @@ impl Default for Svelte2TsxOptions {
             namespace_foreign: false,
             emit_jsdoc: false,
             svelte5_plus: true,
+            rewrite_external_imports: None,
         }
     }
 }
@@ -134,6 +136,7 @@ pub fn svelte2tsx_full(source: &str, o: &Svelte2TsxOptions, with_map: bool) -> R
         is_ts_file: o.is_ts_file,
         mode_ts: o.mode_ts,
         accessors: o.accessors,
+        rewrite_external_imports: o.rewrite_external_imports.clone(),
     };
     let verbatim = htmlx::find_verbatim_elements(source);
     let blanked = htmlx::blank_verbatim_content(source, &verbatim);
@@ -207,6 +210,7 @@ pub fn svelte2tsx_full(source: &str, o: &Svelte2TsxOptions, with_map: bool) -> R
             o.mode_ts,
             module_ast.as_ref(),
             o.svelte5_plus,
+            o.rewrite_external_imports.as_ref(),
         )?;
         uses_props |= res.uses_props;
         uses_rest_props |= res.uses_rest_props;
@@ -248,7 +252,7 @@ pub fn svelte2tsx_full(source: &str, o: &Svelte2TsxOptions, with_map: bool) -> R
     if let (Some(m), Some(ast)) = (module_tag, &module_ast) {
         let mut module_implicit =
             ImplicitStoreValues::new(implicit.accessed_stores(), render_function_start, o.svelte5_plus, script_tag.is_none() && !o.mode_ts);
-        script::module::process_module_script_tag(&mut out, ast, m, &mut module_implicit)?;
+        script::module::process_module_script_tag(&mut out, ast, m, &mut module_implicit, o.rewrite_external_imports.as_ref())?;
         if script_tag.is_none() {
             for stmt in &ast.program.body {
                 exported.hoistable.analyze_module_script_node(stmt);
