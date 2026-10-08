@@ -230,6 +230,16 @@ pub(crate) struct State<'s> {
     pub derived_function_depth: i64,
     /// index into `Analyzer::reactive_statements`
     pub reactive_statement: Option<u32>,
+    /// `async_consts` of the fragment being visited: index into `Analyzer::async_runs`
+    pub async_consts: u32,
+}
+
+/// `state.async_consts` of the analysis (`{ id, declaration_count }`)
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AsyncRun {
+    /// index into `Analyzer::promise_ids`
+    pub id: u32,
+    pub declaration_count: u32,
 }
 
 pub(crate) struct ReactiveStatement {
@@ -259,8 +269,8 @@ pub(crate) struct StateField {
 pub enum Tracing {
     /// the trace's argument (its key)
     Expression(usize),
-    /// `label (location)`
-    Label(String),
+    /// `label (location)`: the label and the start of the function (located by the transform)
+    Label { label: String, start: usize },
 }
 
 pub(crate) struct Analyzer<'s> {
@@ -348,6 +358,14 @@ pub(crate) struct Analyzer<'s> {
     pub scope_tracing: FxHashMap<ScopeId, Tracing>,
     /// `analysis.tracing`
     pub tracing: bool,
+    /// the `async_consts` of each fragment visit (see `State::async_consts`)
+    pub async_runs: Vec<Option<AsyncRun>>,
+    /// the names of the `promises` ids of async `{@const}`/declaration tags
+    pub promise_ids: Vec<String>,
+    /// `metadata.promises_id` of `{@const}` and declaration tags: index into `promise_ids`
+    pub promises_id: FxHashMap<NodeId, u32>,
+    /// the next blocker identity
+    pub next_blocker: u32,
     pub reactive_statements: Vec<ReactiveStatement>,
     /// the per-slot fragments `visit_component` creates: (fragment, nodes)
     pub slot_fragments: Vec<(FragId, Vec<NodeId>)>,
@@ -640,6 +658,10 @@ pub(crate) fn analyze_component<'s>(
         legacy_indirect_bindings: FxHashMap::default(),
         scope_tracing: FxHashMap::default(),
         tracing: false,
+        async_runs: vec![None],
+        promise_ids: Vec::new(),
+        promises_id: FxHashMap::default(),
+        next_blocker: 1 << 20,
         reactive_statements: Vec::new(),
         slot_fragments: Vec::new(),
         emptied_fragment: None,
@@ -824,6 +846,7 @@ pub(crate) fn analyze_component<'s>(
             function_depth: an.sc.scope(scope).function_depth,
             derived_function_depth: -1,
             reactive_statement: None,
+            async_consts: 0,
         };
         an.has_props_rune = false;
         an.component_slots.push(FxHashSet::default());

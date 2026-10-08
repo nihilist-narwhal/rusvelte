@@ -994,7 +994,7 @@ impl<'a, 's> Client<'a, 's> {
 
     fn block_statement(&mut self, node: &Node, st: &State) -> Node {
         self.add_state_transformers(st);
-        let tracing = self.an.scope_tracing.get(&st.scope).cloned();
+        let tracing = if self.dev { self.an.scope_tracing.get(&st.scope).cloned() } else { None };
         if let Some(tracing) = tracing {
             let NodeKind::BlockStatement(bl) = &node.kind else { unreachable!() };
             let is_async = match self.parent_js().map(|p| &p.kind) {
@@ -1004,7 +1004,10 @@ impl<'a, 's> Client<'a, 's> {
             };
             let tracing = match tracing {
                 crate::analyze::Tracing::Expression(key) => b::thunk(self.js_node_by_key(key).unwrap_or_else(b::void0)),
-                crate::analyze::Tracing::Label(l) => b::thunk(b::literal(l.as_str())),
+                crate::analyze::Tracing::Label { label, start } => {
+                    let loc = self.locate_node(start);
+                    b::thunk(b::literal(format!("{label} ({loc})")))
+                }
             };
             let body: Vec<Node> = bl.body.iter().map(|n| self.visit_in(node, n, st)).collect();
             let call = b::call("$.trace", vec![tracing, b::thunk_with(b::block(body), is_async)]);

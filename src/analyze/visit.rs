@@ -213,7 +213,72 @@ impl<'s> Analyzer<'s> {
                 Ok(())
             }
             P::Empty => Ok(()),
+            P::Fragment(_) | P::SlotFragment(_) => {
+                // the `Fragment` visitor: `async_consts: undefined`
+                self.async_runs.push(None);
+                let slot = (self.async_runs.len() - 1) as u32;
+                self.next(p, &State { async_consts: slot, ..*st })
+            }
             _ => self.next(p, st),
+        }
+    }
+
+    /// `get_function_label(nodes)`
+    fn get_function_label(&self, nodes: &[P<'s>]) -> Option<String> {
+        let f = *nodes.last()?;
+        if let P::Js(AstKind::Function(func)) = f {
+            if let Some(id) = &func.id {
+                return Some(id.name.to_string());
+            }
+        }
+        let parent = *nodes.get(nodes.len().checked_sub(2)?)?;
+        match parent {
+            P::Js(AstKind::CallExpression(c)) => {
+                let span = oxc_span::GetSpan::span(&c.callee);
+                let (start, end) = nodes::estree_span(nodes::expr(&c.callee).js_kind()?);
+                let _ = span;
+                Some(format!("{}(...)", &self.source[start..end]))
+            }
+            P::Js(AstKind::ObjectProperty(p)) if !p.computed => get_name(nodes::property_key(&p.key)),
+            P::Js(AstKind::VariableDeclarator(d)) => match &d.id {
+                BindingPattern::BindingIdentifier(i) => Some(i.name.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `mark_async_declaration(context, metadata, declarations)`
+    pub(crate) fn mark_async_declaration(&mut self, n: NodeId, meta: u32, bindings: &[BindingId], st: &State<'s>) {
+        let has_await = self.metas[meta as usize].has_await;
+        let current = self.async_runs[st.async_consts as usize].map(|r| r.id);
+        let blockers = self.metas[meta as usize]
+            .references
+            .iter()
+            .filter_map(|&r| self.binding(r).blocker)
+            .filter(|b| current.is_none() || b.object != current)
+            .count();
+        if has_await || current.is_some() || blockers > 0 {
+            let run = match self.async_runs[st.async_consts as usize] {
+                Some(r) => r,
+                None => {
+                    let id = self.sc.unique("promises");
+                    self.promise_ids.push(id);
+                    let r = super::AsyncRun { id: (self.promise_ids.len() - 1) as u32, declaration_count: 0 };
+                    self.async_runs[st.async_consts as usize] = Some(r);
+                    r
+                }
+            };
+            self.promises_id.insert(n, run.id);
+            let length = run.declaration_count + if blockers > 0 { 1 } else { 0 };
+            if let Some(r) = self.async_runs[st.async_consts as usize].as_mut() {
+                r.declaration_count += if blockers > 0 { 2 } else { 1 };
+            }
+            self.next_blocker += 1;
+            let blocker = super::blockers::Blocker { index: length, id: self.next_blocker, object: Some(run.id) };
+            for &b in bindings {
+                self.sc.binding_mut(b).blocker = Some(blocker);
+            }
         }
     }
 
@@ -857,6 +922,16 @@ impl<'s> Analyzer<'s> {
                         return Err(e::inspect_trace_generator(loc));
                     }
                 }
+                // `scope.tracing` (the transform only uses it in dev)
+                let tracing = match c.arguments.first() {
+                    Some(arg) => super::Tracing::Expression(nodes::argument(arg).key()),
+                    None => {
+                        let label = self.get_function_label(&self.path[..n - 2]).unwrap_or_else(|| "trace".into());
+                        super::Tracing::Label { label, start: func.and_then(|f| f.start(self.ast)).unwrap_or(0) }
+                    }
+                };
+                self.scope_tracing.insert(st.scope, tracing);
+                self.tracing = true;
             }
             Some(_) => {}
         }
@@ -2221,7 +2296,10 @@ impl<'s> Analyzer<'s> {
             p,
             nodes::template_expr(init),
             &State { expression: Some(meta), function_depth: depth, derived_function_depth: i64::from(depth), ..*st },
-        )
+        )?;
+        let bindings: Vec<BindingId> = scope::extract_identifiers(nodes::pattern_p(id)).iter().filter_map(|i| self.get(st.scope, i.name)).collect();
+        self.mark_async_declaration(n, meta, &bindings, st);
+        Ok(())
     }
 
     fn declaration_tag(&mut self, p: P<'s>, _n: NodeId, declaration: &'s crate::ast::Declaration<'s>, st: &State<'s>) -> Res {
@@ -2248,7 +2326,19 @@ impl<'s> Analyzer<'s> {
             p,
             decl,
             &State { in_declaration_tag: true, function_depth: depth, expression: Some(meta), ..*st },
-        )
+        )?;
+        let mut bindings: Vec<BindingId> = Vec::new();
+        if let Statement::VariableDeclaration(v) = &stmt.stmt {
+            for d in &v.declarations {
+                for i in scope::extract_identifiers(nodes::binding(&d.id)) {
+                    if let Some(b) = self.get(st.scope, i.name) {
+                        bindings.push(b);
+                    }
+                }
+            }
+        }
+        self.mark_async_declaration(_n, meta, &bindings, st);
+        Ok(())
     }
 
     fn render_tag(&mut self, p: P<'s>, n: NodeId, expression: &'s Expr<'s>, st: &State<'s>) -> Res {

@@ -418,7 +418,7 @@ impl<'a, 's> Client<'a, 's> {
 
     /// `metadata.blockers()`
     pub fn meta_blockers_array(&self, meta: u32) -> Node {
-        b::array(self.an.meta_blockers(meta).into_iter().map(blocker_expression).collect::<Vec<_>>())
+        b::array(self.an.meta_blockers(meta).into_iter().map(|bl| self.blocker_expression(bl)).collect::<Vec<_>>())
     }
 
     /// `node.metadata.expression` of a template node
@@ -474,9 +474,15 @@ pub const TRANSITION_IN: u32 = 1;
 pub const TRANSITION_OUT: u32 = 1 << 1;
 pub const TRANSITION_GLOBAL: u32 = 1 << 2;
 
-/// `$$promises[i]`
-pub fn blocker_expression(bl: crate::analyze::blockers::Blocker) -> Node {
-    b::member_with(b::id("$$promises"), b::literal(bl.index as f64), true, false)
+impl<'a, 's> Client<'a, 's> {
+    /// A blocker: `$$promises[i]`, or `promises[i]` for async `{@const}` tags
+    pub fn blocker_expression(&self, bl: crate::analyze::blockers::Blocker) -> Node {
+        let object = match bl.object {
+            Some(o) => self.an.promise_ids[o as usize].clone(),
+            None => "$$promises".to_string(),
+        };
+        b::member_with(b::id(object.as_str()), b::literal(bl.index as f64), true, false)
+    }
 }
 
 /// `{ type: 'Program', sourceType: 'module', body }`
@@ -920,7 +926,7 @@ pub fn client_component(c: &mut Client, inject_css: Option<(String, String)>) ->
     if !c.an.runes {
         body.insert(0, b::imports(&[], "svelte/internal/flags/legacy"));
     }
-    if c.an.tracing {
+    if c.dev && c.an.tracing {
         body.insert(0, b::imports(&[], "svelte/internal/flags/tracing"));
     }
     if c.options.disclose_version {

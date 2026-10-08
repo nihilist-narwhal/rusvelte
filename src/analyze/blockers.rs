@@ -19,6 +19,9 @@ pub struct Blocker {
     pub index: u32,
     /// object identity
     pub id: u32,
+    /// the array: `None` for `$$promises`, otherwise the `promises` of async `{@const}` tags
+    /// (index into `Analyzer::promise_ids`)
+    pub object: Option<u32>,
 }
 
 /// An entry of `instance_body.sync`
@@ -194,7 +197,7 @@ pub(crate) fn calculate_blockers(an: &mut Analyzer<'_>) {
     let mut next_id = 0u32;
     let mut new_blocker = |index: u32| {
         next_id += 1;
-        Blocker { index, id: next_id }
+        Blocker { index, id: next_id, object: None }
     };
     // (binding, blocker) assignments, applied in order
     let mut assigned: Vec<(BindingId, Blocker)> = Vec::new();

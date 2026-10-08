@@ -9,7 +9,7 @@ use crate::estree::builders as b;
 use crate::estree::{LiteralValue, Node, NodeKind};
 
 use super::super::js::{self, PathNode};
-use super::{blocker_expression, Client, State};
+use super::{Client, State};
 
 /// An entry of the memoizer
 #[derive(Clone)]
@@ -73,11 +73,11 @@ impl Memoizer {
             .collect()
     }
 
-    pub fn blockers(&self) -> Option<Node> {
+    pub fn blockers(&self, c: &Client) -> Option<Node> {
         if self.blockers.is_empty() {
             None
         } else {
-            Some(b::array(self.blockers.iter().map(|bl| blocker_expression(*bl)).collect::<Vec<_>>()))
+            Some(b::array(self.blockers.iter().map(|bl| c.blocker_expression(*bl)).collect::<Vec<_>>()))
         }
     }
 
@@ -319,7 +319,7 @@ impl<'a, 's> Client<'a, 's> {
         };
         b::stmt(b::call(
             "$.template_effect",
-            vec![Some(b::arrow(ids, body)), memoizer.sync_values(), memoizer.async_values(self), memoizer.blockers()],
+            vec![Some(b::arrow(ids, body)), memoizer.sync_values(), memoizer.async_values(self), memoizer.blockers(self)],
         ))
     }
 

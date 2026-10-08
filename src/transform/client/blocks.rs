@@ -653,7 +653,7 @@ impl<'a, 's> Client<'a, 's> {
                 expression = b::call("$.tag", vec![expression, b::literal(name.as_str())]);
             }
             st.transform.borrow_mut().insert(name, Transform::read(get_value_fn()));
-            self.add_const_declaration(st, pattern, expression);
+            self.add_const_declaration(n, st, pattern, expression);
         } else {
             let identifiers: Vec<Node> = js::extract_identifiers(&pattern).into_iter().cloned().collect();
             let tmp = b::id(self.generate(st.scope, "computed_const"));
@@ -683,7 +683,7 @@ impl<'a, 's> Client<'a, 's> {
             if self.dev {
                 expression = b::call("$.tag", vec![expression, b::literal("[@const]")]);
             }
-            self.add_const_declaration(st, tmp.clone(), expression);
+            self.add_const_declaration(n, st, tmp.clone(), expression);
             for i in identifiers {
                 let tmp = tmp.clone();
                 st.transform
@@ -694,11 +694,62 @@ impl<'a, 's> Client<'a, 's> {
     }
 
     /// `add_const_declaration(context, id, expression, metadata)`
-    fn add_const_declaration(&mut self, st: &State, id: Node, expression: Node) {
-        // TODO: async `{@const}` (`metadata.promises_id`)
+    fn add_const_declaration(&mut self, n: NodeId, st: &State, id: Node, expression: Node) {
         let after = if self.dev { vec![b::stmt(b::call("$.get", vec![id.clone()]))] } else { vec![] };
-        st.consts.borrow_mut().push(b::r#const(id, expression));
-        st.consts.borrow_mut().extend(after);
+        if self.an.promises_id.contains_key(&n) {
+            let assignment = b::stmt(b::assignment("=", id.clone(), expression));
+            self.add_async_declaration(n, st, vec![id], vec![assignment], "let");
+        } else {
+            st.consts.borrow_mut().push(b::r#const(id, expression));
+            st.consts.borrow_mut().extend(after);
+        }
+    }
+
+    /// `add_async_declaration(context, metadata, ids, assignments, kind)`
+    fn add_async_declaration(&mut self, n: NodeId, st: &State, ids: Vec<Node>, assignments: Vec<Node>, kind: &str) {
+        let promises = self.an.promises_id[&n];
+        let promises_name = self.an.promise_ids[promises as usize].clone();
+        if st.async_consts.borrow().is_none() {
+            *st.async_consts.borrow_mut() = Some(super::AsyncConsts { id: b::id(promises_name.as_str()), thunks: Vec::new() });
+        }
+        for id in &ids {
+            let name = js::ident(id).unwrap_or("");
+            st.consts.borrow_mut().push(if kind == "var" { b::var(b::id(name), None) } else { b::r#let(b::id(name), None) });
+        }
+        let current = st.async_consts.borrow().as_ref().map(|a| js::ident(&a.id).unwrap_or("").to_string());
+        let meta = self.meta_of_node(n);
+        let blockers: Vec<Node> = self.an.metas[meta as usize]
+            .references
+            .iter()
+            .filter_map(|&r| self.binding(r).blocker)
+            .filter(|bl| {
+                let obj = match bl.object {
+                    Some(o) => self.an.promise_ids[o as usize].as_str(),
+                    None => "$$promises",
+                };
+                current.as_deref() != Some(obj)
+            })
+            .map(|bl| self.blocker_expression(bl))
+            .collect();
+        let mut thunks = Vec::new();
+        if blockers.len() == 1 {
+            thunks.push(b::thunk(b::member(blockers.into_iter().next().unwrap(), "promise")));
+        } else if !blockers.is_empty() {
+            thunks.push(b::thunk(b::call("$.wait", vec![b::array(blockers)])));
+        }
+        let has_await = self.an.metas[meta as usize].has_await || assignments.iter().any(b::has_await_expression);
+        let body = if assignments.len() == 1 {
+            match assignments[0].kind.clone() {
+                NodeKind::ExpressionStatement(e) => *e.expression,
+                kind => Node::new(kind),
+            }
+        } else {
+            b::block(assignments)
+        };
+        thunks.push(if has_await { self.async_thunk(body, meta) } else { b::thunk(body) });
+        if let Some(ac) = st.async_consts.borrow_mut().as_mut() {
+            ac.thunks.extend(thunks);
+        }
     }
 
     fn declaration_tag(&mut self, n: NodeId, st: &State) {
@@ -708,7 +759,33 @@ impl<'a, 's> Client<'a, 's> {
         let crate::ast::Declaration::Js(stmt) = declaration else { return };
         let node = self.conv.statement(&stmt.stmt);
         let visited = self.visit_js(&node, st);
-        // TODO: async declarations (`metadata.promises_id`)
+        if self.an.promises_id.contains_key(&n) && node.is("VariableDeclaration") {
+            if let NodeKind::VariableDeclaration(v) = &visited.kind {
+                // `build_async_declaration_parts(declaration)`
+                let mut ids: Vec<Node> = Vec::new();
+                for d in &v.declarations {
+                    let NodeKind::VariableDeclarator(d) = &d.kind else { continue };
+                    for id in js::extract_identifiers(&d.id) {
+                        let name = js::ident(id).unwrap_or("");
+                        match ids.iter_mut().find(|x| js::ident(x) == Some(name)) {
+                            Some(x) => *x = id.clone(),
+                            None => ids.push(id.clone()),
+                        }
+                    }
+                }
+                let assignments: Vec<Node> = v
+                    .declarations
+                    .iter()
+                    .filter_map(|d| match &d.kind {
+                        NodeKind::VariableDeclarator(d) => d.init.as_ref().map(|i| b::stmt(b::assignment("=", (*d.id).clone(), (**i).clone()))),
+                        _ => None,
+                    })
+                    .collect();
+                let kind = v.kind.as_str();
+                self.add_async_declaration(n, st, ids, assignments, kind);
+                return;
+            }
+        }
         st.consts.borrow_mut().push(visited);
     }
 
@@ -726,7 +803,7 @@ impl<'a, 's> Client<'a, 's> {
         let mut blockers = Vec::new();
         for id in &ids {
             if let Some(bl) = js::ident(id).and_then(|name| self.get(st.scope, name)).and_then(|b| self.binding(b).blocker) {
-                blockers.push(super::blocker_expression(bl));
+                blockers.push(self.blocker_expression(bl));
             }
         }
         let mut props = Vec::new();
@@ -800,7 +877,7 @@ impl<'a, 's> Client<'a, 's> {
             statements.push(self.add_svelte_meta(call, Some(start), "render", None));
         }
         let async_values = memoizer.async_values(self);
-        let blockers = memoizer.blockers();
+        let blockers = memoizer.blockers(self);
         if async_values.is_some() || blockers.is_some() {
             let mut params = vec![st.node.clone()];
             params.extend(memoizer.async_ids());
@@ -951,7 +1028,7 @@ impl<'a, 's> Client<'a, 's> {
         };
         statements.push(b::stmt(b::call("$.slot", vec![st.node.clone(), b::id("$$props"), name, props_expression, fallback])));
         let async_values = memoizer.async_values(self);
-        let blockers = memoizer.blockers();
+        let blockers = memoizer.blockers(self);
         if async_values.is_some() || blockers.is_some() {
             let mut params = vec![st.node.clone()];
             params.extend(memoizer.async_ids());
@@ -1201,7 +1278,7 @@ impl<'a, 's> Client<'a, 's> {
             let ids = memoizer.apply(self);
             st.after_update.borrow_mut().push(b::stmt(b::call(
                 "$.deferred_template_effect",
-                vec![Some(b::arrow(ids, b::block(vec![statement]))), memoizer.sync_values(), memoizer.async_values(self), memoizer.blockers()],
+                vec![Some(b::arrow(ids, b::block(vec![statement]))), memoizer.sync_values(), memoizer.async_values(self), memoizer.blockers(self)],
             )));
         } else {
             st.after_update.borrow_mut().push(b::stmt(b::call("$.effect", vec![b::thunk(b::block(vec![statement]))])));

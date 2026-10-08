@@ -130,6 +130,14 @@ impl<'s> P<'s> {
         })
     }
 
+    /// The oxc node, for JS nodes
+    pub fn js_kind(&self) -> Option<AstKind<'s>> {
+        match *self {
+            P::Js(k) => Some(k),
+            _ => None,
+        }
+    }
+
     pub fn node(&self) -> Option<NodeId> {
         match *self {
             P::Node(n) => Some(n),

@@ -454,7 +454,13 @@ impl<'a> Parser<'a> {
     }
 
     pub fn pop(&mut self) -> Option<Open> {
-        self.fragments.pop();
+        if let Some(f) = self.fragments.pop() {
+            // a fragment with declaration tags gets its own scope
+            let fragment = &self.ast.fragments[f];
+            if fragment.transparent && fragment.nodes.iter().any(|&n| matches!(self.ast.nodes[n], crate::ast::Node::DeclarationTag { .. })) {
+                self.ast.fragments[f].transparent = false;
+            }
+        }
         self.stack.pop()
     }
 

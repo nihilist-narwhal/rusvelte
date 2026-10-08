@@ -225,7 +225,7 @@ impl<'a, 's> Client<'a, 's> {
                 Some(b::arrow(ids, b::object(values))),
                 memoizer.sync_values(),
                 memoizer.async_values(self),
-                memoizer.blockers(),
+                memoizer.blockers(self),
                 if scoped { Some(b::literal(self.css_hash.as_str())) } else { None },
                 if should_remove_defaults { Some(b::r#true()) } else { None },
                 if ignored { Some(b::r#true()) } else { None },
@@ -819,7 +819,7 @@ impl<'a, 's> Client<'a, 's> {
             let ids = memoizer.apply(self);
             b::call(
                 "$.template_effect",
-                vec![Some(b::arrow(ids, call)), memoizer.sync_values(), memoizer.async_values(self), memoizer.blockers()],
+                vec![Some(b::arrow(ids, call)), memoizer.sync_values(), memoizer.async_values(self), memoizer.blockers(self)],
             )
         } else {
             call

@@ -363,7 +363,7 @@ impl<'a, 's> Client<'a, 's> {
 
         memoizer.apply(self);
         let async_values = memoizer.async_values(self);
-        let blockers = memoizer.blockers();
+        let blockers = memoizer.blockers(self);
         if async_values.is_some() || blockers.is_some() {
             let mut params = vec![b::id("$$anchor")];
             params.extend(memoizer.async_ids());
