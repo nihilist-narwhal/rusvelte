@@ -8,6 +8,7 @@
 //   hand: hand-written cases for each lint rule and parser feature
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const [outRoot, ...which] = process.argv.slice(2);
 if (!outRoot) {
@@ -16,17 +17,19 @@ if (!outRoot) {
 }
 const want = (k) => which.length === 0 || which.includes(k);
 
+// the checkouts and apps of the parity setup (see README); missing ones are skipped
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const NODE_MODULES = [
-    '/path/to/rusvelte/experiments/windmill/frontend/node_modules',
-    '/path/to/rusvelte/experiments/private-app/node_modules',
-    '/path/to/rusvelte/oracle/node_modules'
-];
+    'experiments/windmill/frontend/node_modules',
+    'experiments/private-app/node_modules',
+    'oracle/node_modules'
+].map((p) => path.join(ROOT, p)).filter((p) => fs.existsSync(p));
 const SVELTE_DIRS = [
-    '/path/to/rusvelte/svelte-upstream/packages/svelte/tests',
-    '/path/to/rusvelte/experiments/windmill/frontend/src',
-    '/path/to/rusvelte/experiments/private-app/src',
-    '/path/to/rusvelte/language-tools-upstream/packages'
-];
+    'svelte-upstream/packages/svelte/tests',
+    'experiments/windmill/frontend/src',
+    'experiments/private-app/src',
+    'language-tools-upstream/packages'
+].map((p) => path.join(ROOT, p)).filter((p) => fs.existsSync(p));
 
 // deterministic PRNG (mulberry32)
 const SEED = Number(process.env.SEED || 0);

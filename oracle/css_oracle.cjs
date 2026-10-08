@@ -9,7 +9,7 @@
 // `CSSPlugin.getDiagnostics`).
 //
 // usage: node oracle/css_oracle.cjs <out.json> <dir-or-file>...
-//   SVELTE_CHECK=/path/to/svelte-check/dist/src/index.js (default: private-app's 4.7.6)
+//   SVELTE_CHECK=/path/to/svelte-check/dist/src/index.js (default: experiments/private-app's 4.7.6)
 //
 // Output: { "<path relative to its input dir>": [ {range, severity, message, code, source}, ... ], ... }
 // for every file (files without diagnostics map to []).

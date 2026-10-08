@@ -6,8 +6,11 @@ const fs = require('fs');
 const path = require('path');
 const Module = require('module');
 
-const DEFAULT_BUNDLE =
-    '/path/to/rusvelte/experiments/private-app/node_modules/svelte-check/dist/src/index.js.orig';
+// svelte-check 4.7.6 as installed in an app under experiments/ (the `.orig` copy of the bundle)
+const DEFAULT_BUNDLE = path.join(
+    __dirname,
+    '../experiments/private-app/node_modules/svelte-check/dist/src/index.js.orig'
+);
 
 function loadSvelteCheck(bundlePath = process.env.SVELTE_CHECK || DEFAULT_BUNDLE) {
     let src = fs.readFileSync(bundlePath, 'utf8');

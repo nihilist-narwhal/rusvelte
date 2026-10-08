@@ -6,8 +6,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const [dir, oracleFile, bin = '/path/to/rusvelte/experiments/windmill/frontend/node_modules/svelte-check/bin/svelte-check'] =
+const [dir, oracleFile, bin = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../experiments/windmill/frontend/node_modules/svelte-check/bin/svelte-check')] =
     process.argv.slice(2);
 const out = spawnSync(
     'node',

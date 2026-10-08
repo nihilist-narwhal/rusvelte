@@ -14,6 +14,8 @@ original by diffing outputs over large corpora.
 
 ## Status
 
+"The private app" is a 171-component SvelteKit app that isn't public; Windmill, Immich and bits-ui are open source.
+
 | Part | Parity with the JS original |
 |---|---|
 | Parser | 4,567/4,567 Svelte test files (3 differ only in a JS error's position), the private app 171/171 |
@@ -39,7 +41,7 @@ recovers from, and 2 samples where npm 0.7.61 throws but the current language-to
 |---|---|---|
 | Parse the Svelte test corpus | 157 ms | 19 ms |
 | svelte2tsx, Windmill (1,982 files, warm) | 3,425 ms | 539 ms, 91 ms on 12 threads |
-| Full check, the private app (`svelte-check` vs `svelte-check-rs`) | 10.6 s | 1.7 s |
+| Full check, a private app (`svelte-check` vs `svelte-check-rs`) | 10.6 s | 1.7 s |
 | Full check, Windmill | 73.5 s (needs an 8 GB heap) | 9.3 s |
 | Incremental re-run, Windmill, no changes | 2.4 s (svelte-fast-check) | 2.0 s |
 | Print Windmill's compiled JS (3,964 files, 34 MB) with esrap / `estree::print` | 4,268 ms | 600 ms (360 ms without source maps) |
