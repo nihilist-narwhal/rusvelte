@@ -428,6 +428,32 @@ pub fn server_component(s: &mut Server, inject_css: Option<(String, String)>) ->
     program_node(body)
 }
 
+/// `server_module(analysis, options)`: a `.svelte.js` module
+pub fn server_module(s: &mut Server) -> Node {
+    let state = State {
+        scope: s.an.module_scope,
+        is_instance: false,
+        namespace: "html",
+        preserve_whitespace: false,
+        is_standalone: false,
+        init: shared(),
+        template: shared(),
+        async_consts: Default::default(),
+        state_fields: None,
+    };
+    let module = match s.an.module_program {
+        Some(p) => {
+            let program = s.convert_program(p);
+            s.visit_js(&program, &state)
+        }
+        None => program_node(vec![]),
+    };
+    let mut body = vec![b::import_all("$", "svelte/internal/server")];
+    body.extend(program_body(module));
+    program_node(body)
+}
+
+
 fn program_body(node: Node) -> Vec<Node> {
     match node.kind {
         NodeKind::Program(p) => p.body,
