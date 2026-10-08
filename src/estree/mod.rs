@@ -43,6 +43,8 @@
 pub mod builders;
 pub mod convert;
 pub mod print;
+#[cfg(test)]
+mod tests;
 
 pub use compact_str::CompactString as Atom;
 pub use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator};
