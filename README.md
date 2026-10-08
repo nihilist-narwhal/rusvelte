@@ -25,6 +25,7 @@ original by diffing outputs over large corpora.
 | svelte-check-rs, compiler warnings | identical to svelte-check on the private app and Windmill (89 warnings) |
 | svelte-check-rs, CSS diagnostics (`css`/`scss`/`less`) | identical to svelte-check on Windmill (96 warnings in all); the CSS linter matches svelte-check's on 4,567/4,567 Svelte tests, Windmill, the private app and 47,072 synthetic files |
 | CSS output (`css.code`, `css.hasGlobal`, injected styles) | byte-identical on every component of the code generation oracle (Svelte test suites 6,929 compilations, the private app 342, Windmill 3,964), plus `dev`/`css: 'injected'` variants and the CSS linter's 31,418 synthetic files (1 differs: oxc rejects a mangled TypeScript expression acorn accepts) |
+| JS printer (esrap 2.4.0 `ts({ comments })`) | byte-identical code and source map mappings on 20,190 JS files: Svelte's snapshot expectations 74/74, Svelte's sources 368/368, `node_modules` 4,747/4,747 (oracle and a Windmill sample, minified files included), and the compiler's output for every component of the code generation oracle re-parsed (Svelte test suites 6,975, the private app 342, Windmill 3,964) |
 
 The remaining svelte2tsx mismatches are 2 scripts that oxc can't parse but TypeScript
 recovers from, and 2 samples where npm 0.7.61 throws but the current language-tools source
@@ -39,6 +40,7 @@ recovers from, and 2 samples where npm 0.7.61 throws but the current language-to
 | Full check, the private app (`svelte-check` vs `svelte-check-rs`) | 10.6 s | 1.7 s |
 | Full check, Windmill | 73.5 s (needs an 8 GB heap) | 9.3 s |
 | Incremental re-run, Windmill, no changes | 2.4 s (svelte-fast-check) | 2.0 s |
+| Print Windmill's compiled JS (3,964 files, 34 MB) with esrap / `estree::print` | 4,268 ms | 600 ms (360 ms without source maps) |
 
 On Windmill the type-check itself (tsgo, about 8 s) is now most of the time; the project's
 PostCSS/Melt UI preprocessors run alongside it in Node.
@@ -126,6 +128,8 @@ first difference.
 | `oracle/gen_kit.mjs` | `compare_kit` (SvelteKit files) |
 | `oracle/css_oracle.cjs` (and `gen_css_samples.mjs` for synthetic corpora) | `compare_css` (CSS diagnostics) |
 | `oracle/gen_css_output.mjs <corpus> <out> [base options]`, or `gen_codegen.mjs` | `compare_css_output` (CSS output) |
+| `oracle/gen_esrap.mjs [--keep-minified] <dir\|@list> <out.json> [base]` | `compare_esrap` (JS printer; `BENCH=n` times it) |
+| `oracle/gen_builders.mjs` | expected output for the builder tests in `src/estree/tests.rs` |
 
 `tools/check_sanity.py <language-tools> <node_modules>` runs svelte-check's own sanity
 fixtures against svelte-check-rs.
@@ -152,6 +156,10 @@ fixtures against svelte-check-rs.
     walks TypeScript's.
   - `src/svelte2tsx/kit.rs`, `rewrite_imports.rs`: SvelteKit files and external imports.
 - **Code generation**
+  - `src/estree/`: the owned ESTree AST the transform builds (`Node`/`NodeKind`), with
+    `convert.rs` (oxc → acorn-shaped ESTree, TypeScript removed like
+    `remove_typescript_nodes`), `builders.rs` (port of `utils/builders.js`) and `print.rs`
+    (port of esrap 2.4.0 with its `ts` language, including comments and source map mappings).
   - `src/transform/`: port of `phases/3-transform`; so far `css/index.js` (`render_stylesheet`).
 - **CSS diagnostics**
   - `src/css_lint/`: port of vscode-css-languageservice's CSS/SCSS/LESS parsers and lint
