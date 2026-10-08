@@ -7,8 +7,8 @@ mod a11y;
 #[allow(clippy::all)]
 mod a11y_data;
 mod comments;
-mod css;
-mod acorn;
+pub(crate) mod css;
+pub(crate) mod acorn;
 mod nodes;
 mod scope;
 mod ts;
@@ -90,7 +90,7 @@ pub fn compile_diagnostics_with(
             let parse_error = scripts.iter().find_map(|s| acorn::check(&s.content.program, source, component.root.ts));
             let result = match parse_error {
                 Some(err) => Err(err),
-                None => analyze_component(&alloc, &component, source, filename, options, &mut warnings),
+                None => analyze_component(&alloc, &component, source, filename, options, &mut warnings).map(|_| ()),
             };
             (result, component.locator.clone())
         }
@@ -365,14 +365,25 @@ fn get_component_name(filename: &str) -> String {
 
 const RESERVED: &[&str] = &["$$props", "$$restProps", "$$slots"];
 
-fn analyze_component<'s>(
+/// What `analyze_component` returns (the parts of `ComponentAnalysis` ported so far)
+pub(crate) struct ComponentAnalysis<'s> {
+    /// `get_component_name(options.filename)`, which `cssHash` gets as `name`
+    pub component_name: String,
+    pub custom_element: bool,
+    /// The CSS analysis, when there's a `<style>`
+    pub css: Option<css::Meta<'s>>,
+    /// `analysis.css.has_global`
+    pub css_has_global: bool,
+}
+
+pub(crate) fn analyze_component<'s>(
     alloc: &'s Allocator,
     component: &'s crate::Component<'s>,
     source: &'s str,
     filename: &'s str,
     compile_options: &CompileOptions,
     warnings: &'s mut Vec<Warning>,
-) -> Result<()> {
+) -> Result<ComponentAnalysis<'s>> {
     let ast = &component.ast;
     let root = &component.root;
 
@@ -631,6 +642,7 @@ fn analyze_component<'s>(
     }
 
     visit::module_exports(&an)?;
+    let exports_snippet = exports_snippet(&an);
 
     if let (Some((start, end, name)), true) = (an.event_directive_node, an.uses_event_attributes) {
         return Err(e::mixed_event_handler_syntaxes((start, end), name));
@@ -664,11 +676,37 @@ fn analyze_component<'s>(
         return Err(e::slot_snippet_conflict(pos));
     }
 
-    if let Some(css) = &root.css {
-        css::analyze(&mut an, css)?;
-    }
+    let css = match &root.css {
+        Some(css) => Some(css::analyze(&mut an, css)?),
+        None => None,
+    };
 
-    Ok(())
+    Ok(ComponentAnalysis {
+        css_has_global: exports_snippet || css.as_ref().is_some_and(|c| c.has_global),
+        component_name,
+        custom_element: an.custom_element,
+        css,
+    })
+}
+
+/// Whether the module script exports a snippet (which sets `analysis.css.has_global`, so that
+/// bundlers keep the CSS when only the snippet is imported)
+fn exports_snippet(an: &Analyzer) -> bool {
+    use oxc_ast::ast::ModuleExportName;
+    let Some(program) = an.module_program else { return false };
+    nodes::children(program, an.ast).into_iter().any(|s| {
+        let P::Js(AstKind::ExportNamedDeclaration(d)) = s else { return false };
+        d.specifiers.iter().any(|spec| {
+                let name = match &spec.local {
+                    ModuleExportName::IdentifierReference(r) => r.name.as_str(),
+                    ModuleExportName::IdentifierName(r) => r.name.as_str(),
+                    ModuleExportName::StringLiteral(_) => return false,
+                };
+                an.get(an.module_scope, name).is_some_and(|b| {
+                    matches!(an.binding(b).initial, Some(P::Node(n)) if matches!(an.ast.nodes[n], Node::SnippetBlock { .. }))
+                })
+            })
+    })
 }
 
 fn instance_body<'s>(an: &Analyzer<'s>) -> Vec<P<'s>> {

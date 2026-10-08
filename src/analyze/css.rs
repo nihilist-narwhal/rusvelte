@@ -19,34 +19,47 @@ fn addr<T>(r: &T) -> usize {
     r as *const T as usize
 }
 
+/// The metadata the CSS analysis puts on the CSS nodes (and `analysis.css.keyframes` /
+/// `has_global`), for `render_stylesheet`. Node sets are keyed by node address.
 #[derive(Default)]
-struct Meta<'c> {
-    parent_rule: FxHashMap<usize, &'c Rule>,
-    is_global_block: FxHashSet<usize>,
-    has_global_selectors: FxHashSet<usize>,
+pub struct Meta<'c> {
+    pub parent_rule: FxHashMap<usize, &'c Rule>,
+    pub is_global_block: FxHashSet<usize>,
+    pub has_global_selectors: FxHashSet<usize>,
+    /// Rule `metadata.has_local_selectors`
+    pub has_local_selectors: FxHashSet<usize>,
     /// ComplexSelector → its rule
-    complex_rule: FxHashMap<usize, &'c Rule>,
+    pub complex_rule: FxHashMap<usize, &'c Rule>,
     /// ComplexSelector `metadata.is_global`
-    complex_is_global: FxHashSet<usize>,
-    used: FxHashSet<usize>,
+    pub complex_is_global: FxHashSet<usize>,
+    /// ComplexSelector `metadata.used`
+    pub used: FxHashSet<usize>,
     /// RelativeSelector `metadata.is_global` / `is_global_like`
-    rel_is_global: FxHashSet<usize>,
-    rel_is_global_like: FxHashSet<usize>,
+    pub rel_is_global: FxHashSet<usize>,
+    pub rel_is_global_like: FxHashSet<usize>,
+    /// RelativeSelector `metadata.scoped`
+    pub rel_scoped: FxHashSet<usize>,
+    /// elements with `metadata.scoped`
+    pub scoped_elements: FxHashSet<NodeId>,
+    /// `analysis.css.keyframes`
+    pub keyframes: Vec<String>,
+    /// `analysis.css.has_global` as the CSS analysis sets it (exported snippets also set it)
+    pub has_global: bool,
 }
 
 impl<'c> Meta<'c> {
-    fn parent_rule(&self, rule: &Rule) -> Option<&'c Rule> {
+    pub fn parent_rule(&self, rule: &Rule) -> Option<&'c Rule> {
         self.parent_rule.get(&addr(rule)).copied()
     }
 }
 
-pub fn analyze<'s>(an: &mut Analyzer<'s>, sheet: &'s StyleSheet<'s>) -> Result<()> {
+pub fn analyze<'s>(an: &mut Analyzer<'s>, sheet: &'s StyleSheet<'s>) -> Result<Meta<'s>> {
     let css = &sheet.css;
     let mut meta = Meta::default();
 
     // analyze_css
     {
-        let mut walker = AnalyzeWalker { meta: &mut meta, path: Vec::new() };
+        let mut walker = AnalyzeWalker { meta: &mut meta, path: Vec::new(), rules: Vec::new() };
         for child in &css.children {
             walker.block_child(child, None)?;
         }
@@ -77,7 +90,7 @@ pub fn analyze<'s>(an: &mut Analyzer<'s>, sheet: &'s StyleSheet<'s>) -> Result<(
             warner.block_child(child);
         }
     }
-    Ok(())
+    Ok(meta)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -128,6 +141,8 @@ enum CssP {
 struct AnalyzeWalker<'m, 'c> {
     meta: &'m mut Meta<'c>,
     path: Vec<CssP>,
+    /// the Rules in `path`
+    rules: Vec<&'c Rule>,
 }
 
 fn is_global_block_selector(s: &SimpleSelector) -> bool {
@@ -143,7 +158,20 @@ impl<'m, 'c> AnalyzeWalker<'m, 'c> {
         }
     }
 
+    /// `is_unscoped(path)`: every rule in the path has global selectors
+    fn is_unscoped(&self) -> bool {
+        self.rules.iter().all(|r| self.meta.has_global_selectors.contains(&addr(*r)))
+    }
+
     fn atrule(&mut self, a: &'c Atrule, rule: Option<&'c Rule>) -> Result<()> {
+        if is_keyframes(a) {
+            let is_global_name = a.prelude.starts_with("-global-");
+            if !is_global_name && !self.rules.iter().any(|r| self.meta.is_global_block.contains(&addr(*r))) {
+                self.meta.keyframes.push(a.prelude.clone());
+            } else if is_global_name {
+                self.meta.has_global |= self.is_unscoped();
+            }
+        }
         if let Some(block) = &a.block {
             self.path.push(CssP::Atrule);
             self.block(block, rule)?;
@@ -214,9 +242,19 @@ impl<'m, 'c> AnalyzeWalker<'m, 'c> {
         for complex in &node.prelude.children {
             if self.meta.complex_is_global.contains(&addr(complex)) {
                 self.meta.has_global_selectors.insert(key);
+            } else {
+                self.meta.has_local_selectors.insert(key);
             }
         }
+        if self.meta.has_global_selectors.contains(&key)
+            && node.block.children.iter().any(|c| matches!(c, BlockChild::Declaration(_)))
+            && self.is_unscoped()
+        {
+            self.meta.has_global = true;
+        }
+        self.rules.push(node);
         self.block(&node.block, Some(node))?;
+        self.rules.pop();
         self.path.pop();
         Ok(())
     }
@@ -570,6 +608,20 @@ impl<'c> Rel<'c> {
     }
 }
 
+/// `is_outer_global`: `:global` or `:global(...)` followed only by pseudo classes/elements
+fn is_outer_global(r: &Rel) -> bool {
+    let mut iter = r.iter();
+    match iter.next() {
+        Some(Sel::Real(SimpleSelector::PseudoClass { name, args, .. })) if name == "global" => {
+            args.is_none()
+                || r.iter().all(|s| {
+                    matches!(s, Sel::Real(SimpleSelector::PseudoClass { .. } | SimpleSelector::PseudoElement { .. }))
+                })
+        }
+        _ => false,
+    }
+}
+
 fn real_rel(r: &RelativeSelector) -> Rel<'_> {
     Rel { node: Some(r), combinator: r.combinator.as_ref().map(|c| c.name), selectors: SelSource::All(&r.selectors) }
 }
@@ -739,8 +791,17 @@ where
         let selector_index = if direction == FORWARD { from } else { to - 1 };
         let relative = rels[selector_index];
         let (rest_from, rest_to) = if direction == FORWARD { (from + 1, to) } else { (from, to - 1) };
-        self.relative_selector_might_apply_to_node(&relative, rule, element, direction)
-            && self.apply_combinator(&relative, rels, rest_from, rest_to, rule, element, direction)
+        let matched = self.relative_selector_might_apply_to_node(&relative, rule, element, direction)
+            && self.apply_combinator(&relative, rels, rest_from, rest_to, rule, element, direction);
+        if matched {
+            if let Some(node) = relative.node {
+                if !is_outer_global(&relative) {
+                    self.meta.rel_scoped.insert(addr(node));
+                }
+            }
+            self.meta.scoped_elements.insert(element);
+        }
+        matched
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -937,6 +998,18 @@ where
                                     mark_nested_used(s, self.meta, true);
                                 }
                             }
+                            if complex.children.len() > 1 {
+                                for r in self.truncate(complex) {
+                                    if let Some(node) = r.node {
+                                        self.meta.rel_scoped.insert(addr(node));
+                                    }
+                                }
+                                let mut el = Some(element);
+                                while let Some(e) = el {
+                                    self.meta.scoped_elements.insert(e);
+                                    el = self.get_element_parent(e);
+                                }
+                            }
                         }
                         continue;
                     }
@@ -955,6 +1028,11 @@ where
                             } else if complex.children.len() > 1 {
                                 self.meta.used.insert(addr(complex));
                                 matched = true;
+                                for r in &relative {
+                                    if let Some(node) = r.node {
+                                        self.meta.rel_scoped.insert(addr(node));
+                                    }
+                                }
                             }
                         }
                         if !matched {
