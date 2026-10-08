@@ -1,4 +1,5 @@
-# Publishes site/ to GitHub Pages (Settings → Pages → Source: GitHub Actions)
+# Publishes site/ to GitHub Pages (Settings → Pages → Source: GitHub Actions); runs on changes to
+# site/ or this file, or by hand (Actions → Pages → Run workflow)
 name: Pages
 
 on:
