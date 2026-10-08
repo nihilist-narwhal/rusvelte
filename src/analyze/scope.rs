@@ -94,9 +94,11 @@ pub type RefId = u32;
 #[derive(Debug, Clone, Copy)]
 pub struct Reference<'s> {
     pub node: Id<'s>,
-    /// range in `Scopes::path_arena`
-    pub path: (u32, u32),
+    /// the last node of the path in `Scopes::path_tree` (`NO_PATH` if empty)
+    pub path: u32,
 }
+
+pub const NO_PATH: u32 = u32::MAX;
 
 #[derive(Debug)]
 pub struct Scope<'s> {
@@ -208,7 +210,8 @@ pub struct Scopes<'s> {
     pub scopes: Vec<Scope<'s>>,
     pub bindings: Vec<Binding<'s>>,
     pub refs: Vec<Reference<'s>>,
-    pub path_arena: Vec<P<'s>>,
+    /// Reference paths, stored as a tree: (node, index of its parent entry)
+    pub path_tree: Vec<(P<'s>, u32)>,
     /// node → scope (`scopes.get(node)`)
     pub map: FxHashMap<usize, ScopeId>,
     pub conflicts: FxHashSet<&'s str>,
@@ -291,9 +294,22 @@ impl<'s> Scopes<'s> {
         }
     }
 
-    pub fn ref_path(&self, r: RefId) -> &[P<'s>] {
-        let (start, len) = self.refs[r as usize].path;
-        &self.path_arena[start as usize..(start + len) as usize]
+    /// The `path` of a reference (ancestors, root first)
+    pub fn ref_path(&self, r: RefId) -> Vec<P<'s>> {
+        let mut path = Vec::new();
+        let mut i = self.refs[r as usize].path;
+        while i != NO_PATH {
+            let (p, parent) = self.path_tree[i as usize];
+            path.push(p);
+            i = parent;
+        }
+        path.reverse();
+        path
+    }
+
+    pub fn push_path(&mut self, p: P<'s>, parent: u32) -> u32 {
+        self.path_tree.push((p, parent));
+        (self.path_tree.len() - 1) as u32
     }
 
     pub fn declare(
@@ -341,11 +357,9 @@ impl<'s> Scopes<'s> {
         Ok(id)
     }
 
-    /// `scope.reference(node, path)`
-    pub fn reference(&mut self, scope: ScopeId, node: Id<'s>, path: &[P<'s>]) {
-        let start = self.path_arena.len() as u32;
-        self.path_arena.extend_from_slice(path);
-        self.refs.push(Reference { node, path: (start, path.len() as u32) });
+    /// `scope.reference(node, path)`, `path` being an entry of `path_tree`
+    pub fn reference(&mut self, scope: ScopeId, node: Id<'s>, path: u32) {
+        self.refs.push(Reference { node, path });
         let r = (self.refs.len() - 1) as RefId;
         self.add_reference(scope, node.name, r);
     }
@@ -680,7 +694,10 @@ pub struct ScopeBuilder<'s, 'x> {
     pub scopes: &'x mut Scopes<'s>,
     pub ast: &'s Ast<'s>,
     path: Vec<P<'s>>,
-    references: Vec<(ScopeId, Id<'s>, u32, u32)>,
+    /// `path_tree` entries of `path[..materialized]`
+    path_entries: Vec<u32>,
+    materialized: usize,
+    references: Vec<(ScopeId, Id<'s>, u32)>,
     updates: Vec<(ScopeId, P<'s>)>,
     possible_implicit_declarations: Vec<Id<'s>>,
     allow_reactive_declarations: bool,
@@ -709,6 +726,8 @@ pub fn create_scopes<'s>(
         scopes,
         ast,
         path: Vec::new(),
+        path_entries: Vec::new(),
+        materialized: 0,
         references: Vec::new(),
         updates: Vec::new(),
         possible_implicit_declarations: Vec::new(),
@@ -733,8 +752,8 @@ pub fn create_scopes<'s>(
 
     let paths = std::mem::take(&mut b.path);
     drop(paths);
-    for (s, node, start, len) in std::mem::take(&mut b.references) {
-        b.scopes.refs.push(Reference { node, path: (start, len) });
+    for (s, node, path) in std::mem::take(&mut b.references) {
+        b.scopes.refs.push(Reference { node, path });
         let r = (b.scopes.refs.len() - 1) as RefId;
         b.scopes.add_reference(s, node.name, r);
     }
@@ -760,27 +779,50 @@ pub fn create_scopes<'s>(
 }
 
 impl<'s> ScopeBuilder<'s, '_> {
-    fn next(&mut self, p: P<'s>, scope: ScopeId) -> Res {
+    fn push(&mut self, p: P<'s>) {
         self.path.push(p);
-        nodes::each_child(p, self.ast, self, &mut |me: &mut Self, c| me.visit(c, scope))?;
+    }
+
+    fn pop(&mut self) {
         self.path.pop();
+        if self.materialized > self.path.len() {
+            self.materialized = self.path.len();
+            self.path_entries.truncate(self.materialized);
+        }
+    }
+
+    /// The `path_tree` entry for the current path (adding what's missing)
+    fn current_path(&mut self) -> u32 {
+        for i in self.materialized..self.path.len() {
+            let parent = if i == 0 { NO_PATH } else { self.path_entries[i - 1] };
+            let entry = self.scopes.push_path(self.path[i], parent);
+            self.path_entries.push(entry);
+        }
+        self.materialized = self.path.len();
+        self.path_entries.last().copied().unwrap_or(NO_PATH)
+    }
+
+    fn next(&mut self, p: P<'s>, scope: ScopeId) -> Res {
+        self.push(p);
+        nodes::each_child(p, self.ast, self, &mut |me: &mut Self, c| me.visit(c, scope))?;
+        self.pop();
         Ok(())
     }
 
     /// `context.visit(child, state)` from the visitor of `parent`
     fn visit_child(&mut self, parent: P<'s>, child: P<'s>, scope: ScopeId) -> Res {
-        self.path.push(parent);
+        self.push(parent);
         self.visit(child, scope)?;
-        self.path.pop();
+        self.pop();
         Ok(())
     }
 
     fn reference_now(&mut self, scope: ScopeId, id: Id<'s>, extra: Option<P<'s>>) {
-        let mut path = self.path.clone();
+        let mut path = self.current_path();
         if let Some(x) = extra {
-            path.push(x);
+            path = self.scopes.push_path(x, path);
         }
-        self.scopes.reference(scope, id, &path);
+        self.scopes.reference(scope, id, path);
     }
 
     fn add_params(&mut self, scope: ScopeId, params: &'s FormalParameters<'s>) -> Res {
@@ -831,9 +873,8 @@ impl<'s> ScopeBuilder<'s, '_> {
                 K::IdentifierReference(_) | K::BindingIdentifier(_) | K::IdentifierName(_) | K::LabelIdentifier(_) => {
                     if let Some(&parent) = self.path.last() {
                         if is_reference(p, parent) {
-                            let start = self.scopes.path_arena.len() as u32;
-                            self.scopes.path_arena.extend_from_slice(&self.path);
-                            self.references.push((scope, ident(p).unwrap(), start, self.path.len() as u32));
+                            let path = self.current_path();
+                            self.references.push((scope, ident(p).unwrap(), path));
                         }
                     }
                     Ok(())
@@ -964,9 +1005,8 @@ impl<'s> ScopeBuilder<'s, '_> {
             P::TplExpr(Expr::Ident { .. }) | P::PatIdent(_) => {
                 if let Some(&parent) = self.path.last() {
                     if is_reference(p, parent) {
-                        let start = self.scopes.path_arena.len() as u32;
-                        self.scopes.path_arena.extend_from_slice(&self.path);
-                        self.references.push((scope, ident(p).unwrap(), start, self.path.len() as u32));
+                        let path = self.current_path();
+                        self.references.push((scope, ident(p).unwrap(), path));
                     }
                 }
                 Ok(())
@@ -1006,7 +1046,9 @@ impl<'s> ScopeBuilder<'s, '_> {
                 let parent = *self.path.last().unwrap();
                 for id in ids {
                     self.scopes.declare(scope, id, Kind::Template, DeclKind::Const, None)?;
-                    self.scopes.reference(scope, id, &[parent, p]);
+                    let first = self.scopes.push_path(parent, NO_PATH);
+                    let path = self.scopes.push_path(p, first);
+                    self.scopes.reference(scope, id, path);
                 }
                 Ok(())
             }
