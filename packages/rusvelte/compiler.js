@@ -141,22 +141,23 @@ class JsSourceMap {
  */
 async function load_internals(real_url) {
 	const at = (path) => new URL(path, real_url).href;
-	const [state, { CompileDiagnostic }, { merge_with_preprocessor_map, get_source_name }] = await Promise.all([
+	const [state, { CompileDiagnostic }, { merge_with_preprocessor_map, get_source_name }, { validate_component_options }] = await Promise.all([
 		import(at('./state.js')),
 		import(at('./utils/compile_diagnostic.js')),
-		import(at('./utils/mapped_code.js'))
+		import(at('./utils/mapped_code.js')),
+		import(at('./validate-options.js'))
 	]);
 	const magic_string = createRequire(fileURLToPath(real_url)).resolve('magic-string');
 	// `require` resolves its CommonJS build, where `SourceMap` hangs off the default export
 	const magic = await import(pathToFileURL(magic_string).href);
 	const MagicSourceMap = magic.SourceMap ?? magic.default?.SourceMap;
-	for (const [name, value] of Object.entries({ CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap })) {
+	for (const [name, value] of Object.entries({ CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap, validate_component_options })) {
 		if (typeof value !== 'function') throw new Error(`${name} is not available`);
 	}
 	if (typeof state.reset !== 'function' || typeof state.set_source !== 'function' || typeof state.adjust !== 'function') {
 		throw new Error('svelte/compiler state has an unexpected shape');
 	}
-	return { state, CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap };
+	return { state, CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap, validate_component_options };
 }
 
 /**
@@ -180,7 +181,7 @@ export async function create(real, real_url) {
 	} catch (e) {
 		return use_real(`can't use the internals of the installed svelte/compiler (${e.message})`);
 	}
-	const { state, CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap } = internals;
+	const { state, CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap, validate_component_options } = internals;
 
 	/** results rusvelte produced (not the real compiler) */
 	const native_results = new WeakSet();
@@ -196,6 +197,8 @@ export async function create(real, real_url) {
 	function run(source, options, module) {
 		// `validate-options.js` defaults `rootDir` to the working directory
 		if (options.rootDir === undefined && typeof process !== 'undefined') options = { ...options, rootDir: process.cwd() };
+		// a lone surrogate doesn't survive the trip into Rust (its strings are valid UTF-8)
+		if (!source.isWellFormed()) return fell_back('the source has a lone surrogate'), null;
 		const bad = unsupported_option(options, module ? MODULE_OPTIONS : COMPONENT_OPTIONS);
 		if (bad) return fell_back(`option ${bad}`), null;
 		let result;
@@ -223,6 +226,7 @@ export async function create(real, real_url) {
 		const filter = options.warningFilter ?? (() => true);
 		const out = [];
 		for (const w of result.warnings) {
+			if (w.code.startsWith('options_deprecated_')) continue;
 			const warning = new CompileWarning(w.code, w.message, w.position ?? undefined);
 			if (filter(warning)) out.push(warning);
 		}
@@ -265,6 +269,14 @@ export async function create(real, real_url) {
 		const result = run(source, options, false);
 		if (!result) return real.compile(source, options);
 		set_state(source, options, result.runes);
+		// the option warnings (deprecated options) come from the installed compiler's own
+		// validation, so its once-per-instance memory and the warning filter apply as in compile
+		try {
+			validate_component_options(options, '');
+		} catch {
+			return real.compile(source, options);
+		}
+		const option_warnings = [...state.warnings];
 		// `validate_component_options` defaults the filename
 		options = { ...options, filename: options.filename ?? '(unknown)' };
 
@@ -287,7 +299,7 @@ export async function create(real, real_url) {
 			merge_with_preprocessor_map(css, options, css.map.sources[0]);
 		}
 
-		const warnings = warnings_of(result, options);
+		const warnings = [...option_warnings, ...warnings_of(result, options)];
 		let ast;
 		const compiled = {
 			js,

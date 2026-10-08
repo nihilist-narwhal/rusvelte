@@ -313,7 +313,7 @@ fn read_declaration(parser: &mut Parser) -> Result<Declaration> {
     let template = parser.template;
     let mut i = parser.index;
     while let Some(c) = char_at(template, i) {
-        if c == ':' || c.is_whitespace() || c == '\u{feff}' {
+        if c == ':' || crate::analyze::utils::is_js_whitespace(c) {
             break;
         }
         i += c.len_utf8();
@@ -415,7 +415,7 @@ fn read_attribute_value(parser: &mut Parser) -> Result<String> {
             escaped = true;
         } else if match quote_mark {
             Some(q) => c == q,
-            None => c == ']' || c.is_whitespace() || c == '\u{feff}',
+            None => c == ']' || crate::analyze::utils::is_js_whitespace(c),
         } {
             if let Some(q) = quote_mark {
                 parser.expect(&q.to_string())?;

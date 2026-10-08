@@ -152,12 +152,33 @@ pub struct JsStatement<'a> {
 }
 
 /// Shift every span by `delta`
-struct Rebase(i64);
+/// Shifts spans by `.0`, measuring the deepest nesting on the way (`.2`, see
+/// `JsParser::max_depth`) and noting strings with lone surrogates (`.3`)
+struct Rebase(i64, usize, usize, bool);
 
 impl<'a> VisitMut<'a> for Rebase {
     fn visit_span(&mut self, span: &mut Span) {
         span.start = (span.start as i64 + self.0) as u32;
         span.end = (span.end as i64 + self.0) as u32;
+    }
+
+    fn enter_node(&mut self, _: oxc_ast::AstType) {
+        self.1 += 1;
+        self.2 = self.2.max(self.1);
+    }
+
+    fn leave_node(&mut self, _: oxc_ast::AstType) {
+        self.1 -= 1;
+    }
+
+    fn visit_string_literal(&mut self, it: &mut oxc_ast::ast::StringLiteral<'a>) {
+        self.3 |= it.lone_surrogates;
+        oxc_ast_visit::walk_mut::walk_string_literal(self, it);
+    }
+
+    fn visit_template_element(&mut self, it: &mut oxc_ast::ast::TemplateElement<'a>) {
+        self.3 |= it.lone_surrogates;
+        oxc_ast_visit::walk_mut::walk_template_element(self, it);
     }
 }
 
@@ -178,11 +199,16 @@ pub struct JsParser<'a> {
     pub ts: bool,
     pub loc: std::rc::Rc<Locator<'a>>,
     alloc: &'a Allocator,
+    /// The deepest nesting of any JS parsed so far (the passes after parsing recurse over it)
+    pub max_depth: std::cell::Cell<usize>,
+    /// A string or template literal with a lone surrogate was parsed: oxc keeps its value in an
+    /// encoded form, and Rust strings can't hold the real one, so `compile` declines
+    pub lone_surrogates: std::cell::Cell<bool>,
 }
 
 impl<'a> JsParser<'a> {
     pub fn new(ts: bool, loc: std::rc::Rc<Locator<'a>>, alloc: &'a Allocator) -> Self {
-        JsParser { ts, loc, alloc }
+        JsParser { ts, loc, alloc, max_depth: std::cell::Cell::new(0), lone_surrogates: std::cell::Cell::new(false) }
     }
 
     pub fn alloc_str(&self, s: &str) -> &'a str {
@@ -208,7 +234,7 @@ impl<'a> JsParser<'a> {
     ) -> std::result::Result<(Parsed<'a>, Vec<JsComment>), (usize, String)> {
         let options = ParseOptions { preserve_parens, ..ParseOptions::default() };
         let parser = Parser::new(self.alloc, text, self.source_type()).with_options(options);
-        let mut rebase = Rebase(base as i64);
+        let mut rebase = Rebase(base as i64, 0, 0, false);
 
         match goal {
             Goal::Expression => {
@@ -227,6 +253,8 @@ impl<'a> JsParser<'a> {
                     }
                 };
                 rebase.visit_expression(&mut expr);
+                self.max_depth.set(self.max_depth.get().max(rebase.2));
+                self.lone_surrogates.set(self.lone_surrogates.get() || rebase.3);
                 // `parse_expression` doesn't hand out comments; if there might be any, get them
                 // from a program parse of `(<text>\n)`
                 let comments = if text.contains("//") || text.contains("/*") {
@@ -258,6 +286,8 @@ impl<'a> JsParser<'a> {
                 let mut program = ret.program;
                 if goal == Goal::Program {
                     rebase.visit_program(&mut program);
+                    self.max_depth.set(self.max_depth.get().max(rebase.2));
+                self.lone_surrogates.set(self.lone_surrogates.get() || rebase.3);
                     Ok((Parsed::Program(program), comments))
                 } else {
                     if program.body.is_empty() {
@@ -265,6 +295,8 @@ impl<'a> JsParser<'a> {
                     }
                     let mut stmt = program.body.remove(0);
                     rebase.visit_statement(&mut stmt);
+                    self.max_depth.set(self.max_depth.get().max(rebase.2));
+                self.lone_surrogates.set(self.lone_surrogates.get() || rebase.3);
                     Ok((Parsed::Statement(stmt), comments))
                 }
             }
@@ -287,7 +319,7 @@ impl<'a> JsParser<'a> {
         let Statement::ExpressionStatement(stmt) = body.remove(0) else { return None };
         let Expression::ParenthesizedExpression(paren) = stmt.unbox().expression else { return None };
         let mut expr = paren.unbox().expression;
-        Rebase(-1).visit_expression(&mut expr);
+        Rebase(-1, 0, 0, false).visit_expression(&mut expr);
         Some(expr)
     }
 

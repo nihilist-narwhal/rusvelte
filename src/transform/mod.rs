@@ -193,6 +193,14 @@ pub struct CompileOutput {
 /// recurse per level, and Svelte's own compiler already overflows its stack well before it
 pub const MAX_TEMPLATE_DEPTH: usize = 1000;
 
+/// The same for the nesting of the scripts' and template expressions' syntax trees (Svelte's
+/// compiler, through acorn, fails below 2000 levels of most shapes)
+pub const MAX_JS_DEPTH: usize = 2000;
+
+fn too_deep(what: &str, limit: usize) -> CompileError {
+    CompileError { code: "unsupported", message: format!("the {what} is nested more than {limit} levels deep"), position: None }
+}
+
 /// `compile(source, options)`
 pub fn compile(source: &str, options: &options::CompileOptions) -> Result<CompileOutput, CompileError> {
     analyze::evaluate::take_unrepresentable();
@@ -233,11 +241,13 @@ fn compile_component(source: &str, options: &options::CompileOptions) -> Result<
     let component = crate::parse_with_warnings(&alloc, source, &mut warnings)
         .map_err(|err| analyze::acorn::reword_parse_error(err, source))?;
     if component.ast.max_depth > MAX_TEMPLATE_DEPTH {
-        return Err(CompileError {
-            code: "unsupported",
-            message: format!("the template is nested more than {MAX_TEMPLATE_DEPTH} levels deep"),
-            position: None,
-        });
+        return Err(too_deep("template", MAX_TEMPLATE_DEPTH));
+    }
+    if component.ast.max_js_depth > MAX_JS_DEPTH {
+        return Err(too_deep("JavaScript", MAX_JS_DEPTH));
+    }
+    if component.ast.lone_surrogates {
+        return Err(unrepresentable());
     }
     let root = &component.root;
     let mut scripts: Vec<&crate::ast::Script> = [&root.instance, &root.module].into_iter().flatten().collect();
@@ -463,6 +473,12 @@ fn compile_module_inner(source: &str, options: &options::CompileOptions) -> Resu
     let parser = crate::js::JsParser::new(false, locator.clone(), &alloc);
     let mut js_comments = Vec::new();
     let content = parser.parse_program(source, 0, &mut js_comments)?;
+    if parser.max_depth.get() > MAX_JS_DEPTH {
+        return Err(too_deep("JavaScript", MAX_JS_DEPTH));
+    }
+    if parser.lone_surrogates.get() {
+        return Err(unrepresentable());
+    }
     if let Some(err) = analyze::acorn::check_module(&content.program, source) {
         return Err(err);
     }

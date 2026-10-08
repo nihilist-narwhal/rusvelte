@@ -321,6 +321,8 @@ fn parse_inner<'a>(
         }
     }
 
+    parser.ast.max_js_depth = parser.js.max_depth.get();
+    parser.ast.lone_surrogates = parser.js.lone_surrogates.get();
     Ok((parser.ast, parser.root, parser.warnings))
 }
 

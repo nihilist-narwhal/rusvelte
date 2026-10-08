@@ -28,28 +28,53 @@ pub fn compile_module(source: String, options: String) -> String {
     on_worker(source, options, true)
 }
 
-/// The analysis and transform recurse over the template and the scripts' syntax trees, and a
-/// stack overflow aborts the whole process (it can't be caught like a panic). So compilations
-/// run on one long-lived thread with a large stack; its memory is only committed as it's used.
-const WORKER_STACK: usize = 256 << 20;
+/// A stack overflow aborts the whole process (it can't be caught like a panic). Parsing (oxc)
+/// recurses once per level of nesting and needs at most about 2 KB per level, i.e. per source
+/// byte; the passes after it recurse too, but `compile` declines anything nested deeper than
+/// a few thousand levels before they run. So compilations run on one long-lived thread with a
+/// large stack (address space, committed only as it's used), and sources too large for it to
+/// parse even at worst-case nesting are declined.
+const WORKER_STACKS: [usize; 3] = [4 << 30, 1 << 30, 256 << 20];
+const STACK_BYTES_PER_SOURCE_BYTE: usize = 2048;
 
 type Job = (String, String, bool, Sender<String>);
 
-fn on_worker(source: String, options: String, module: bool) -> String {
-    static WORKER: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
-    let worker = WORKER.get_or_init(|| {
-        let (tx, rx) = channel::<Job>();
-        std::thread::Builder::new()
-            .name("rusvelte".into())
-            .stack_size(WORKER_STACK)
-            .spawn(move || {
-                for (source, options, module, reply) in rx {
-                    let _ = reply.send(run(&source, &options, module));
-                }
+/// The compile thread and the largest source it compiles
+struct Worker {
+    jobs: Mutex<Sender<Job>>,
+    max_source: usize,
+}
+
+fn worker() -> Option<&'static Worker> {
+    static WORKER: OnceLock<Option<Worker>> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            // the largest stack the system grants (a strict overcommit policy may refuse 4 GiB)
+            WORKER_STACKS.iter().find_map(|&stack| {
+                let (tx, rx) = channel::<Job>();
+                std::thread::Builder::new()
+                    .name("rusvelte".into())
+                    .stack_size(stack)
+                    .spawn(move || {
+                        for (source, options, module, reply) in rx {
+                            let _ = reply.send(run(&source, &options, module));
+                        }
+                    })
+                    .ok()?;
+                Some(Worker { jobs: Mutex::new(tx), max_source: stack / STACK_BYTES_PER_SOURCE_BYTE })
             })
-            .expect("spawn the rusvelte compile thread");
-        Mutex::new(tx)
-    });
+        })
+        .as_ref()
+}
+
+fn on_worker(source: String, options: String, module: bool) -> String {
+    let Some(worker) = worker() else {
+        return json!({ "unsupported": "the compile thread couldn't be started" }).to_string();
+    };
+    if source.len() > worker.max_source {
+        return json!({ "unsupported": format!("the source is larger than {} bytes", worker.max_source) }).to_string();
+    }
+    let worker = &worker.jobs;
     let (reply, result) = channel();
     let sent = worker.lock().map(|tx| tx.send((source, options, module, reply)).is_ok()).unwrap_or(false);
     match (sent, result.recv()) {

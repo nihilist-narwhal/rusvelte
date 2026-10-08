@@ -84,7 +84,7 @@ impl<'a, 's> Server<'a, 's> {
                     if textarea_newline {
                         data = format!("\n{data}");
                     }
-                    let data = if trim_whitespace { strict_ws_collapse(&data).trim().to_string() } else { data };
+                    let data = if trim_whitespace { crate::analyze::utils::js_trim(&strict_ws_collapse(&data)).to_string() } else { data };
                     b::literal(if is_component { data } else { escape_html(&data, true) }.as_str())
                 }
                 Chunk::Expression { expression, .. } => {
@@ -327,7 +327,7 @@ impl<'a, 's> Server<'a, 's> {
                     if name == "class" {
                         if let Some(h) = &css_hash {
                             let current = literal_value.clone().unwrap_or_else(|| "true".into());
-                            literal_value = Some(format!("{current} {h}").trim().to_string());
+                            literal_value = Some(crate::analyze::utils::js_trim(&format!("{current} {h}")).to_string());
                         }
                     }
                     let truthy = literal_value.as_ref().is_none_or(|v| !v.is_empty());
@@ -349,7 +349,7 @@ impl<'a, 's> Server<'a, 's> {
                             let mut s = s.to_string();
                             if name == "class" {
                                 if let Some(h) = &css_hash {
-                                    s = format!("{s} {h}").trim().to_string();
+                                    s = crate::analyze::utils::js_trim(&format!("{s} {h}")).to_string();
                                 }
                             }
                             st.template.borrow_mut().push(b::literal(format!(" {name}=\"{}\"", escape_html(&s, true)).as_str()));
@@ -544,7 +544,7 @@ impl<'a, 's> Server<'a, 's> {
             match &mut expression.kind {
                 NodeKind::Literal(l) if matches!(l.value, LiteralValue::String(_)) => {
                     if let LiteralValue::String(s) = &l.value {
-                        let v = format!("{s} {h}").trim().to_string();
+                        let v = crate::analyze::utils::js_trim(&format!("{s} {h}")).to_string();
                         l.value = LiteralValue::String(v.as_str().into());
                         l.raw = None;
                     }

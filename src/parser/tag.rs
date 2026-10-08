@@ -543,6 +543,8 @@ fn close(parser: &mut Parser) -> Result<()> {
             parser.expect("}")?;
             while matches!(parser.ast.nodes[block_id], Node::IfBlock { elseif: true, .. }) {
                 parser.ast.nodes[block_id].set_end(parser.index);
+                // popped directly, so `Parser::pop` doesn't see this depth
+                parser.ast.max_depth = parser.ast.max_depth.max(parser.stack.len());
                 parser.stack.pop();
                 let Open::Node(id) = parser.current() else { unreachable!() };
                 block_id = id;

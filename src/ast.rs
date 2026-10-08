@@ -495,6 +495,10 @@ pub struct Ast<'a> {
     /// The deepest nesting of template nodes the parser saw (its stack is explicit; the passes
     /// after it recurse, so `transform::compile` declines templates nested deeper than it can)
     pub max_depth: usize,
+    /// The deepest nesting in the component's scripts and template expressions
+    pub max_js_depth: usize,
+    /// A JS string or template literal has a lone surrogate (see `JsParser::lone_surrogates`)
+    pub lone_surrogates: bool,
 }
 
 impl<'a> Ast<'a> {

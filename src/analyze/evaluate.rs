@@ -544,9 +544,38 @@ fn compare_bigint_number(x: i128, y: f64) -> Option<std::cmp::Ordering> {
     }
 }
 
+/// `StringToBigInt` of a string compared with a BigInt
+enum StringBigInt {
+    /// a SyntaxError: comparisons are `undefined`, equality false
+    Invalid,
+    Value(i128),
+    /// valid, but beyond 128 bits (`true` if negative)
+    Huge(bool),
+}
+
+fn string_bigint(s: &str) -> StringBigInt {
+    match string_to_bigint(s) {
+        Some(v) => StringBigInt::Value(v),
+        None => {
+            // valid but too large? (the same syntax check, without the range)
+            let t = crate::analyze::utils::js_trim(s);
+            let negative = t.starts_with('-');
+            let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+            let radix_digits = [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)]
+                .iter()
+                .find_map(|&(p, radix)| t.strip_prefix(p).map(|d| (d, radix)));
+            let valid = match radix_digits {
+                Some((d, radix)) => !d.is_empty() && d.chars().all(|c| c.is_digit(radix)),
+                None => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+            };
+            if valid { StringBigInt::Huge(negative && radix_digits.is_none()) } else { StringBigInt::Invalid }
+        }
+    }
+}
+
 /// `StringToBigInt`: `None` where it's a SyntaxError (or beyond what's represented)
 fn string_to_bigint(s: &str) -> Option<i128> {
-    let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let s = crate::analyze::utils::js_trim(s);
     if s.is_empty() {
         return Some(0);
     }
@@ -569,6 +598,20 @@ fn less_than(a: &Val, b: &Val) -> Option<bool> {
     }
     match (&a, &b) {
         (Val::BigInt(x), Val::BigInt(y)) => return Some(x < y),
+        (Val::BigInt(x), Val::Str(y)) => {
+            return match string_bigint(y) {
+                StringBigInt::Invalid => None,
+                StringBigInt::Value(y) => Some(*x < y),
+                StringBigInt::Huge(negative) => Some(!negative),
+            };
+        }
+        (Val::Str(x), Val::BigInt(y)) => {
+            return match string_bigint(x) {
+                StringBigInt::Invalid => None,
+                StringBigInt::Value(x) => Some(x < *y),
+                StringBigInt::Huge(negative) => Some(negative),
+            };
+        }
         (Val::BigInt(x), _) => {
             let y = b.to_number()?;
             return compare_bigint_number(*x, y).map(|o| o == std::cmp::Ordering::Less);
@@ -675,14 +718,19 @@ fn math1(args: &[Val], f: fn(f64) -> f64) -> Option<Val> {
 }
 
 /// `Math.round`: rounds half up, keeping -0 for -0.5 <= x < 0
+/// `Math.round`: compares the fraction exactly (`x + 0.5` can itself round)
 fn js_round(x: f64) -> f64 {
     if !x.is_finite() || x == 0.0 {
         return x;
     }
-    if (-0.5..0.0).contains(&x) {
-        return -0.0;
+    let floor = x.floor();
+    // exact: within 1 of each other, or `x` is already an integer (|x| >= 2^52)
+    let fraction = x - floor;
+    if fraction == 0.0 {
+        return x;
     }
-    (x + 0.5).floor()
+    let r = if fraction >= 0.5 { floor + 1.0 } else { floor };
+    if r == 0.0 && x < 0.0 { -0.0 } else { r }
 }
 
 fn js_sign(x: f64) -> f64 {
@@ -714,7 +762,7 @@ fn f16round(x: f64) -> f64 {
 
 /// `parseFloat`
 fn parse_float(s: &str) -> f64 {
-    let t = s.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let t = s.trim_start_matches(crate::analyze::utils::is_js_whitespace);
     for prefix in ["Infinity", "+Infinity"] {
         if t.starts_with(prefix) {
             return f64::INFINITY;
@@ -759,7 +807,7 @@ fn parse_float(s: &str) -> f64 {
 
 /// `parseInt`
 fn parse_int(s: &str, radix: Option<f64>) -> f64 {
-    let t = s.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let t = s.trim_start_matches(crate::analyze::utils::is_js_whitespace);
     let (neg, mut t) = match t.as_bytes().first() {
         Some(b'-') => (true, &t[1..]),
         Some(b'+') => (false, &t[1..]),
@@ -781,14 +829,33 @@ fn parse_int(s: &str, radix: Option<f64>) -> f64 {
         t = &t[2..];
         r = 16;
     }
-    let digits: Vec<u32> = t.chars().map_while(|c| c.to_digit(r as u32)).collect();
+    let end = t.char_indices().find(|&(_, c)| c.to_digit(r as u32).is_none()).map_or(t.len(), |(i, _)| i);
+    let digits = &t[..end];
     if digits.is_empty() {
         return f64::NAN;
     }
-    let mut n = 0f64;
-    for d in digits {
-        n = n * f64::from(r) + f64::from(d);
-    }
+    // exactly, then rounded once: base 10 through Rust's correctly rounded parser, other bases
+    // through a 128-bit integer
+    let n = if r == 10 {
+        match digits.parse::<f64>() {
+            Ok(n) => n,
+            Err(_) => return unrepresentable().unwrap_or(f64::NAN),
+        }
+    } else {
+        let mut v: u128 = 0;
+        for c in digits.chars() {
+            match v.checked_mul(r as u128).and_then(|v| v.checked_add(c.to_digit(r as u32).unwrap() as u128)) {
+                Some(next) => v = next,
+                None => return unrepresentable().unwrap_or(f64::NAN),
+            }
+        }
+        // powers of two round correctly from the exact value; other bases only stay exact below
+        // 2^53 (beyond it, engines accumulate in floating point and their rounding varies)
+        if !(r as u32).is_power_of_two() && v > (1u128 << 53) {
+            return unrepresentable().unwrap_or(f64::NAN);
+        }
+        v as f64
+    };
     if neg { -n } else { n }
 }
 
