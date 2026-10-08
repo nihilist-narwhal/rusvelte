@@ -91,6 +91,9 @@ pub fn start(exe: &Path, tsconfig: &Path, cwd: &Path, build_info: Option<&Path>)
     }
     cmd
         .current_dir(cwd)
+        // Go's working directory comes from an inherited `PWD` that names the same directory,
+        // which would make the paths it prints relative to a symlinked path
+        .env("PWD", cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

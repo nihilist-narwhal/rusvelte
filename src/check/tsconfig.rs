@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 pub struct ParsedConfig {
-    /// The root config's own JSON (`parsed.raw`)
+    /// The root config's JSON with the `include`/`exclude`/`files` it inherits (relative to
+    /// its directory), like TypeScript's `parsed.raw`
     pub raw: Map<String, Value>,
     /// `options.rootDirs`, absolute
     pub root_dirs: Option<Vec<PathBuf>>,
@@ -18,6 +19,9 @@ pub struct ParsedConfig {
     /// whether `outDir` / `rootDir` are set anywhere in the chain
     pub has_out_dir: bool,
     pub has_root_dir: bool,
+    /// `options.outDir` / `options.declarationDir`, absolute (TypeScript's default `exclude`)
+    pub out_dir: Option<PathBuf>,
+    pub declaration_dir: Option<PathBuf>,
 }
 
 /// Strip comments and trailing commas so serde_json accepts the text
@@ -139,58 +143,184 @@ fn resolve_extends(spec: &str, dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Merge the compiler options we care about, base configs first
-fn collect(path: &Path, root_dir: &Path, depth: usize, out: &mut ParsedConfig) -> Result<Map<String, Value>, String> {
-    let config = read_config(path)?;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    if depth < 32 {
-        let extends: Vec<String> = match config.get("extends") {
+/// The longest `extends` chain followed (TypeScript only stops at cycles; this is far beyond
+/// any real project)
+const MAX_EXTENDS_DEPTH: usize = 64;
+
+/// The spec properties a config inherits from the ones it extends
+const SPEC_PROPERTIES: [&str; 3] = ["include", "exclude", "files"];
+
+/// JavaScript truthiness, which TypeScript uses to decide whether a config sets a property
+fn truthy(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().is_some_and(|n| n != 0.0),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(_) | Value::Object(_)) => true,
+    }
+}
+
+/// `combinePaths(relativeDifference, spec)` with `.`/`..` segments resolved where they can be
+fn rebase_spec(rel_dir: &str, spec: &str) -> String {
+    let joined = if rel_dir.is_empty() || rel_dir == "." { spec.to_string() } else { format!("{rel_dir}/{spec}") };
+    let mut out: Vec<&str> = Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "." | "" => {}
+            ".." if out.last().is_some_and(|p| *p != "..") => {
+                out.pop();
+            }
+            _ => out.push(part),
+        }
+    }
+    if out.is_empty() {
+        ".".into()
+    } else {
+        out.join("/")
+    }
+}
+
+/// One config with everything it inherits applied
+struct Resolved {
+    /// its JSON, with inherited `include`/`exclude`/`files` (relative to its own directory)
+    raw: Map<String, Value>,
+    root_dirs: Option<Vec<PathBuf>>,
+    paths: Option<(Map<String, Value>, PathBuf)>,
+    base_url: Option<PathBuf>,
+    has_out_dir: bool,
+    has_root_dir: bool,
+    out_dir: Option<PathBuf>,
+    declaration_dir: Option<PathBuf>,
+}
+
+/// Follows `extends` chains: each config is read once (by canonical path), cycles are errors
+struct Resolver {
+    /// the root config's directory (`${configDir}`)
+    root_dir: PathBuf,
+    done: std::collections::HashMap<PathBuf, std::rc::Rc<Resolved>>,
+    /// the chain being resolved, for cycle detection
+    stack: Vec<PathBuf>,
+}
+
+impl Resolver {
+    fn resolve(&mut self, path: &Path) -> Result<std::rc::Rc<Resolved>, String> {
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| normalize(path));
+        if let Some(r) = self.done.get(&key) {
+            return Ok(r.clone());
+        }
+        if self.stack.contains(&key) {
+            let chain: Vec<String> = self.stack.iter().chain([&key]).map(|p| p.display().to_string()).collect();
+            return Err(format!("Circularity detected while resolving configuration: {}", chain.join(" -> ")));
+        }
+        if self.stack.len() >= MAX_EXTENDS_DEPTH {
+            return Err(format!("The tsconfig 'extends' chain is deeper than {MAX_EXTENDS_DEPTH} configs at '{}'", path.display()));
+        }
+        self.stack.push(key.clone());
+        let r = self.resolve_uncached(path);
+        self.stack.pop();
+        let r = std::rc::Rc::new(r?);
+        self.done.insert(key, r.clone());
+        Ok(r)
+    }
+
+    /// Base configs first, then the config's own options (`parseConfig`)
+    fn resolve_uncached(&mut self, path: &Path) -> Result<Resolved, String> {
+        let mut raw = read_config(path)?;
+        let dir = normalize(path.parent().unwrap_or(Path::new(".")));
+        let root_dir = self.root_dir.to_string_lossy().to_string();
+        let mut r = Resolved { raw: Map::new(), root_dirs: None, paths: None, base_url: None, has_out_dir: false, has_root_dir: false, out_dir: None, declaration_dir: None };
+        let extends: Vec<String> = match raw.get("extends") {
             Some(Value::String(s)) => vec![s.clone()],
             Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
             _ => Vec::new(),
         };
+        let mut inherited: [Option<Value>; 3] = Default::default();
         for e in extends {
-            let e = e.replace("${configDir}", &root_dir.to_string_lossy());
-            if let Some(base) = resolve_extends(&e, dir) {
-                collect(&base, root_dir, depth + 1, out)?;
+            let e = e.replace("${configDir}", &root_dir);
+            let Some(base_path) = resolve_extends(&e, &dir) else { continue };
+            let base = self.resolve(&base_path)?;
+            r.root_dirs = base.root_dirs.clone().or(r.root_dirs.take());
+            r.paths = base.paths.clone().or(r.paths.take());
+            r.base_url = base.base_url.clone().or(r.base_url.take());
+            r.out_dir = base.out_dir.clone().or(r.out_dir.take());
+            r.declaration_dir = base.declaration_dir.clone().or(r.declaration_dir.take());
+            r.has_out_dir |= base.has_out_dir;
+            r.has_root_dir |= base.has_root_dir;
+            // `include`/`exclude`/`files` the config doesn't set come from the last base that
+            // does, relative to that base's directory (`applyExtendedConfig`)
+            let base_dir = normalize(base_path.parent().unwrap_or(Path::new(".")));
+            let rel_dir = relative_posix(&dir, &base_dir);
+            for (slot, prop) in inherited.iter_mut().zip(SPEC_PROPERTIES) {
+                if truthy(raw.get(prop)) || !truthy(base.raw.get(prop)) {
+                    continue;
+                }
+                let rebase = |v: &Value| match v.as_str() {
+                    Some(s) if !s.starts_with("${configDir}") && !Path::new(s).is_absolute() => Value::String(rebase_spec(&rel_dir, s)),
+                    _ => v.clone(),
+                };
+                *slot = Some(match &base.raw[prop] {
+                    Value::Array(a) => Value::Array(a.iter().map(rebase).collect()),
+                    v => rebase(v),
+                });
             }
         }
-    }
-    let resolve = |p: &str| -> PathBuf {
-        let p = p.replace("${configDir}", &root_dir.to_string_lossy());
-        normalize(&dir.join(p))
-    };
-    if let Some(Value::Object(opts)) = config.get("compilerOptions") {
-        if let Some(Value::Array(dirs)) = opts.get("rootDirs") {
-            out.root_dirs = Some(dirs.iter().filter_map(Value::as_str).map(resolve).collect());
+        for (slot, prop) in inherited.into_iter().zip(SPEC_PROPERTIES) {
+            if let Some(v) = slot {
+                raw.insert(prop.into(), v);
+            }
         }
-        out.has_out_dir |= opts.get("outDir").is_some_and(|v| !v.is_null());
-        out.has_root_dir |= opts.get("rootDir").is_some_and(|v| !v.is_null());
-        if let Some(Value::String(b)) = opts.get("baseUrl") {
-            out.base_url = Some(resolve(b));
-        }
-        if let Some(Value::Object(paths)) = opts.get("paths") {
-            let mut paths = paths.clone();
-            for v in paths.values_mut() {
-                if let Value::Array(a) = v {
-                    for s in a.iter_mut() {
-                        if let Value::String(st) = s {
-                            *st = st.replace("${configDir}", &root_dir.to_string_lossy());
+        let resolve = |p: &str| -> PathBuf { normalize(&dir.join(p.replace("${configDir}", &root_dir))) };
+        if let Some(Value::Object(opts)) = raw.get("compilerOptions") {
+            if let Some(Value::Array(dirs)) = opts.get("rootDirs") {
+                r.root_dirs = Some(dirs.iter().filter_map(Value::as_str).map(resolve).collect());
+            }
+            r.has_out_dir |= opts.get("outDir").is_some_and(|v| !v.is_null());
+            r.has_root_dir |= opts.get("rootDir").is_some_and(|v| !v.is_null());
+            if let Some(Value::String(d)) = opts.get("outDir") {
+                r.out_dir = Some(resolve(d));
+            }
+            if let Some(Value::String(d)) = opts.get("declarationDir") {
+                r.declaration_dir = Some(resolve(d));
+            }
+            if let Some(Value::String(b)) = opts.get("baseUrl") {
+                r.base_url = Some(resolve(b));
+            }
+            if let Some(Value::Object(paths)) = opts.get("paths") {
+                let mut paths = paths.clone();
+                for v in paths.values_mut() {
+                    if let Value::Array(a) = v {
+                        for s in a.iter_mut() {
+                            if let Value::String(st) = s {
+                                *st = st.replace("${configDir}", &root_dir);
+                            }
                         }
                     }
                 }
+                r.paths = Some((paths, dir.clone()));
             }
-            out.paths = Some((paths, dir.to_path_buf()));
         }
+        r.raw = raw;
+        Ok(r)
     }
-    Ok(config)
 }
 
 pub fn parse_config(path: &Path) -> Result<ParsedConfig, String> {
-    let root_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let mut out = ParsedConfig { raw: Map::new(), root_dirs: None, paths: None, base_url: None, has_out_dir: false, has_root_dir: false };
-    out.raw = collect(path, &root_dir, 0, &mut out)?;
-    Ok(out)
+    let root_dir = normalize(path.parent().unwrap_or(Path::new(".")));
+    let mut resolver = Resolver { root_dir, done: Default::default(), stack: Vec::new() };
+    let r = resolver.resolve(path)?;
+    drop(resolver);
+    let r = std::rc::Rc::try_unwrap(r).unwrap_or_else(|_| unreachable!("the resolver is gone"));
+    Ok(ParsedConfig {
+        raw: r.raw,
+        root_dirs: r.root_dirs,
+        paths: r.paths,
+        base_url: r.base_url,
+        has_out_dir: r.has_out_dir,
+        has_root_dir: r.has_root_dir,
+        out_dir: r.out_dir,
+        declaration_dir: r.declaration_dir,
+    })
 }
 
 /// `path.resolve`-style normalization (no symlink resolution)
@@ -209,19 +339,17 @@ pub fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-/// `path.relative(from, to)` with `/` separators, `.` for the same path
+/// `path.relative(from, to)` with `/` separators, `.` for the same path; across Windows drives
+/// (no relative path) the absolute target
 pub fn relative_posix(from: &Path, to: &Path) -> String {
-    let from = normalize(from);
-    let to = normalize(to);
-    let f: Vec<_> = from.components().collect();
-    let t: Vec<_> = to.components().collect();
-    let common = f.iter().zip(&t).take_while(|(a, b)| a == b).count();
-    let mut parts: Vec<String> = vec!["..".to_string(); f.len() - common];
-    parts.extend(t[common..].iter().map(|c| c.as_os_str().to_string_lossy().to_string()));
-    if parts.is_empty() {
-        ".".into()
-    } else {
-        parts.join("/")
+    relative_posix_str(&normalize(from).to_string_lossy(), &normalize(to).to_string_lossy(), cfg!(windows))
+}
+
+fn relative_posix_str(from: &str, to: &str, windows: bool) -> String {
+    match crate::svelte2tsx::rewrite_imports::relative_parts(from, to, windows) {
+        Ok(parts) if parts.is_empty() => ".".into(),
+        Ok(parts) => parts.join("/"),
+        Err(absolute) => absolute,
     }
 }
 
@@ -240,5 +368,78 @@ mod tests {
     fn relative() {
         assert_eq!(relative_posix(Path::new("/a/b/c"), Path::new("/a/d")), "../../d");
         assert_eq!(relative_posix(Path::new("/a"), Path::new("/a")), ".");
+    }
+
+    #[test]
+    fn relative_across_windows_drives() {
+        assert_eq!(relative_posix_str(r"C:\p\.svelte-check", r"C:\p\src\x.ts", true), "../src/x.ts");
+        assert_eq!(relative_posix_str(r"C:\p\.svelte-check", r"D:\lib\tsconfig.json", true), "D:/lib/tsconfig.json");
+        assert_eq!(relative_posix_str(r"C:\p", r"c:\P", true), ".");
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rusvelte-tsconfig-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        normalize(&std::fs::canonicalize(&d).unwrap())
+    }
+
+    #[test]
+    fn extends_cycles_are_errors() {
+        let d = temp_dir("cycle");
+        std::fs::write(d.join("tsconfig.json"), r#"{ "extends": "./a.json" }"#).unwrap();
+        std::fs::write(d.join("a.json"), r#"{ "extends": "./b.json" }"#).unwrap();
+        std::fs::write(d.join("b.json"), r#"{ "extends": "./a.json" }"#).unwrap();
+        let e = parse_config(&d.join("tsconfig.json")).err().unwrap();
+        assert!(e.starts_with("Circularity detected"), "{e}");
+        assert!(e.contains("a.json -> ") && e.ends_with("a.json"), "{e}");
+        // a config extending itself, twice: an error, not 2^n reads
+        std::fs::write(d.join("self.json"), r#"{ "extends": ["./self.json", "./self.json"] }"#).unwrap();
+        assert!(parse_config(&d.join("self.json")).err().unwrap().starts_with("Circularity detected"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn extends_diamond_and_depth() {
+        let d = temp_dir("diamond");
+        // every level extends the next one twice: read once each thanks to the cache
+        for i in 0..40 {
+            let next = format!("./c{}.json", i + 1);
+            std::fs::write(d.join(format!("c{i}.json")), format!(r#"{{ "extends": ["{next}", "{next}"] }}"#)).unwrap();
+        }
+        std::fs::write(d.join("c40.json"), r#"{ "compilerOptions": { "outDir": "out" }, "include": ["src"] }"#).unwrap();
+        let p = parse_config(&d.join("c0.json")).unwrap();
+        assert_eq!(p.out_dir, Some(d.join("out")));
+        assert_eq!(p.raw["include"], serde_json::json!(["src"]));
+        // too long a chain is reported
+        for i in 0..70 {
+            std::fs::write(d.join(format!("l{i}.json")), format!(r#"{{ "extends": "./l{}.json" }}"#, i + 1)).unwrap();
+        }
+        std::fs::write(d.join("l70.json"), "{}").unwrap();
+        assert!(parse_config(&d.join("l0.json")).err().unwrap().contains("deeper than"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn inherited_specs() {
+        let d = temp_dir("inherit");
+        std::fs::create_dir_all(d.join(".svelte-kit")).unwrap();
+        std::fs::create_dir_all(d.join("base")).unwrap();
+        std::fs::write(
+            d.join(".svelte-kit/tsconfig.json"),
+            r#"{ "include": ["ambient.d.ts", "./types/**/$types.d.ts", "../src/**/*.svelte", "${configDir}/x.ts"], "exclude": ["../node_modules/**"] }"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("base/tsconfig.json"), r#"{ "files": ["a.ts"], "exclude": ["dist"] }"#).unwrap();
+        // the last base that sets a property wins; the config's own properties win over both
+        std::fs::write(d.join("tsconfig.json"), r#"{ "extends": ["./.svelte-kit/tsconfig.json", "./base/tsconfig.json"], "files": [] }"#).unwrap();
+        let p = parse_config(&d.join("tsconfig.json")).unwrap();
+        assert_eq!(
+            p.raw["include"],
+            serde_json::json!([".svelte-kit/ambient.d.ts", ".svelte-kit/types/**/$types.d.ts", "src/**/*.svelte", "${configDir}/x.ts"])
+        );
+        assert_eq!(p.raw["exclude"], serde_json::json!(["base/dist"]));
+        assert_eq!(p.raw["files"], serde_json::json!([]));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
