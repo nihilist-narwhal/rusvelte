@@ -11,6 +11,14 @@ use crate::js::{CommentCtx, JsComment};
 /// Attach comments for every JS AST of the component (if any comment is a `svelte-ignore`)
 pub fn attach_all<'s>(an: &mut Analyzer<'s>) {
     let root = an.root;
+    // the HTML comment before a `<script>` is its Program's `leadingComments` (upstream gives it
+    // no position; the comment's own text stands in for the offset of its codes)
+    for script in [&root.instance, &root.module].into_iter().flatten() {
+        if let Some((start, data)) = &script.leading_comment {
+            let program = P::Js(AstKind::Program(&script.content.program));
+            an.leading_comments.entry(program.key()).or_default().push((start + 4 - 2, data.as_str()));
+        }
+    }
     if !root.comments.iter().any(|c| c.value.contains("svelte-ignore")) {
         return;
     }

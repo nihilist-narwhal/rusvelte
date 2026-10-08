@@ -455,9 +455,9 @@ pub struct Script<'a> {
     pub context: &'static str,
     pub content: JsProgram<'a>,
     pub attributes: Vec<Attr<'a>>,
-    /// The HTML comment right before the `<script>`, which Svelte stores as the
-    /// Program's `leadingComments`
-    pub leading_comment: Option<String>,
+    /// The HTML comment right before the `<script>` (its start and data), which Svelte stores
+    /// as the Program's `leadingComments`
+    pub leading_comment: Option<(usize, String)>,
 }
 
 #[derive(Debug)]
@@ -806,7 +806,7 @@ impl Script<'_> {
                 "loc".into(),
                 json!({ "start": cx.loc.position(self.start), "end": cx.loc.position(self.end) }),
             );
-            if let Some(data) = &self.leading_comment {
+            if let Some((_, data)) = &self.leading_comment {
                 m.insert("leadingComments".into(), json!([{ "type": "Line", "value": data }]));
             }
         }

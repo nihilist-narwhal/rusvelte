@@ -360,7 +360,7 @@ pub fn element(parser: &mut Parser) -> Result<()> {
 
         if tag_name == "script" {
             let mut script = read_script(parser, start, element.attributes)?;
-            script.leading_comment = prev_comment.map(|(_, _, data)| data);
+            script.leading_comment = prev_comment.map(|(start, _, data)| (start, data));
             if script.context == "module" {
                 if parser.root.module.is_some() {
                     return Err(e::script_duplicate(start));
