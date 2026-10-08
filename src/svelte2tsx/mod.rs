@@ -4,6 +4,7 @@
 mod elements;
 mod eswalk;
 pub mod htmlx;
+pub mod kit;
 pub mod rewrite_imports;
 pub mod script;
 mod periscope;

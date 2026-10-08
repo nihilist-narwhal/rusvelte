@@ -1,0 +1,1 @@
+/** @type {import('./$types.js').PageLoad} */ export function load(e) { return e; }
