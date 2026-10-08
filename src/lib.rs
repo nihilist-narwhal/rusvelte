@@ -1,5 +1,7 @@
 //! A Rust port of the Svelte 5 compiler. So far: the parser (`parse(source, { modern: true })`).
 
+#![forbid(unsafe_code)]
+
 pub mod analyze;
 pub mod ast;
 pub mod check;
