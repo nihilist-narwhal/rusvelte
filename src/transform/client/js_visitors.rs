@@ -629,12 +629,6 @@ impl<'a, 's> Client<'a, 's> {
         result
     }
 
-    /// The converted node of a script node by its key
-    pub fn js_node_by_key(&self, key: usize) -> Option<Node> {
-        // SAFETY: see `js_node`
-        self.js_nodes.get(&key).map(|&n| unsafe { (*n).clone() })
-    }
-
     fn labeled_statement(&mut self, node: &Node, st: &State) -> Node {
         let NodeKind::LabeledStatement(l) = &node.kind else { unreachable!() };
         if self.an.runes || self.path.len() > 1 || js::ident(&l.label) != Some("$") {

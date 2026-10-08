@@ -346,6 +346,8 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
         }
         options::Generate::Client => {
             let conv = crate::estree::convert::Converter::new(&locator, root.ts);
+            // the scripts, converted once
+            let scripts = client::Scripts::convert(&analysis.an, &conv);
             let mut c = client::Client {
                 error: Default::default(),
                 an: &mut analysis.an,
@@ -366,8 +368,8 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
                 dev: options.dev,
                 synthetic_class,
                 synthetic_style,
-                js_nodes: Default::default(),
-                programs: Vec::new(),
+                js_nodes: scripts.index(),
+                scripts: &scripts,
                 is_controlled: Default::default(),
                 needs_mutation_validation: false,
                 needs_props: false,
@@ -474,6 +476,7 @@ pub fn compile_module(source: &str, options: &options::CompileOptions) -> Result
         }
         options::Generate::Client => {
             let conv = crate::estree::convert::Converter::new(&locator, false);
+            let scripts = client::Scripts::convert(&an, &conv);
             let mut c = client::Client {
                 error: Default::default(),
                 an: &mut an,
@@ -494,8 +497,8 @@ pub fn compile_module(source: &str, options: &options::CompileOptions) -> Result
                 dev: options.dev,
                 synthetic_class: Default::default(),
                 synthetic_style: Default::default(),
-                js_nodes: Default::default(),
-                programs: Vec::new(),
+                js_nodes: scripts.index(),
+                scripts: &scripts,
                 is_controlled: Default::default(),
                 needs_mutation_validation: false,
                 needs_props: false,
