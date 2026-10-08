@@ -1,6 +1,6 @@
-# svelte-rs
+# rust-velte
 
-An experimental Rust port of Svelte 5 tooling, aimed at a faster `svelte-check`. JavaScript
+An experimental Rust port of the Svelte 5 compiler and tooling, including a faster `svelte-check`. Not affiliated with the Svelte team; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the projects it ports. The project page lives in `site/` and deploys to GitHub Pages. JavaScript
 inside components is parsed with [oxc](https://oxc.rs). Every layer is checked against the JS
 original by diffing outputs over large corpora.
 
@@ -171,3 +171,7 @@ fixtures against svelte-check-rs.
 - **The checker**
   - `src/check/`: the overlay, tsconfig handling, tsgo, diagnostic mapping and filtering,
     output writers, watch mode.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The ported code keeps its original notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

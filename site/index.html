@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rust-velte</title>
+<meta name="description" content="An experimental Rust port of the Svelte 5 compiler and svelte-check, verified byte-for-byte against the official tools.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ff3e00'/%3E%3Cpath d='M9 22V10h7a4 4 0 0 1 0 8h-7m7 0 5 4' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #fbfaf8;
+  --surface: #ffffff;
+  --text: #1d1b19;
+  --muted: #6b655f;
+  --line: #e7e2dc;
+  --accent: #ff3e00;
+  --accent-2: #b7410e;
+  --good: #1f7a4d;
+  --good-bg: #e6f4ec;
+  --warn: #8a5a00;
+  --warn-bg: #fbf1dc;
+  --bar-js: #c9c2ba;
+  --code-bg: #f3efea;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141210;
+    --surface: #1c1916;
+    --text: #efebe6;
+    --muted: #a39b92;
+    --line: #2e2a26;
+    --accent: #ff5a24;
+    --accent-2: #f08a5d;
+    --good: #6fd19d;
+    --good-bg: #16291f;
+    --warn: #f0c36a;
+    --warn-bg: #2c2414;
+    --bar-js: #4a443e;
+    --code-bg: #24201c;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #141210;
+  --surface: #1c1916;
+  --text: #efebe6;
+  --muted: #a39b92;
+  --line: #2e2a26;
+  --accent: #ff5a24;
+  --accent-2: #f08a5d;
+  --good: #6fd19d;
+  --good-bg: #16291f;
+  --warn: #f0c36a;
+  --warn-bg: #2c2414;
+  --bar-js: #4a443e;
+  --code-bg: #24201c;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 var(--sans);
+}
+a { color: var(--accent-2); }
+code { font-family: var(--mono); font-size: 0.9em; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; }
+.wrap { max-width: 920px; margin: 0 auto; padding: 0 16px; }
+header.top { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; }
+.brand { font-weight: 700; letter-spacing: -0.01em; display: flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; }
+.brand .dot { width: 22px; height: 22px; border-radius: 6px; background: var(--accent); display: inline-block; }
+.top nav a { color: var(--muted); text-decoration: none; margin-left: 18px; font-size: 15px; }
+.top nav a:hover { color: var(--text); }
+
+.hero { padding: 56px 0 40px; }
+.tag { display: inline-block; font-size: 13px; font-weight: 600; color: var(--warn); background: var(--warn-bg); padding: 3px 10px; border-radius: 999px; margin-bottom: 18px; }
+h1 { font-size: clamp(34px, 6vw, 54px); line-height: 1.08; letter-spacing: -0.025em; margin: 0 0 18px; }
+h1 em { font-style: normal; color: var(--accent); }
+.lede { font-size: clamp(17px, 2.2vw, 20px); color: var(--muted); max-width: 680px; margin: 0 0 28px; }
+.cta { display: flex; gap: 12px; flex-wrap: wrap; }
+.btn { display: inline-block; padding: 10px 18px; border-radius: 8px; font-weight: 600; text-decoration: none; font-size: 15px; }
+.btn.primary { background: var(--accent); color: #fff; }
+.btn.ghost { border: 1px solid var(--line); color: var(--text); background: var(--surface); }
+
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 8px 0 56px; }
+.stat { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+.stat b { display: block; font-size: 28px; letter-spacing: -0.02em; line-height: 1.2; }
+.stat span { color: var(--muted); font-size: 14px; }
+
+section { padding: 8px 0 48px; }
+h2 { font-size: 26px; letter-spacing: -0.015em; margin: 0 0 8px; }
+.sub { color: var(--muted); margin: 0 0 22px; max-width: 700px; }
+
+.table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 15px; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+td.num { font-family: var(--mono); font-size: 14px; }
+.full { color: var(--good); background: var(--good-bg); padding: 2px 8px; border-radius: 6px; }
+.part { color: var(--warn); background: var(--warn-bg); padding: 2px 8px; border-radius: 6px; }
+.group td { font-weight: 600; background: var(--code-bg); font-size: 13px; color: var(--muted); }
+
+.bars { display: grid; gap: 18px; }
+.bar-row .label { display: flex; justify-content: space-between; gap: 12px; font-size: 15px; margin-bottom: 6px; }
+.bar-row .label span:last-child { color: var(--muted); font-family: var(--mono); font-size: 13px; white-space: nowrap; }
+.bar { height: 12px; border-radius: 6px; margin: 3px 0; }
+.bar.js { background: var(--bar-js); }
+.bar.rs { background: var(--accent); }
+.legend { display: flex; gap: 18px; font-size: 13px; color: var(--muted); margin-bottom: 16px; }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; }
+.note { font-size: 14px; color: var(--muted); margin-top: 14px; }
+
+.cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+.card h3 { margin: 0 0 6px; font-size: 17px; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+ol.steps { padding-left: 20px; margin: 0; }
+ol.steps li { margin-bottom: 8px; }
+pre { background: var(--code-bg); border-radius: 10px; padding: 14px 16px; overflow-x: auto; font: 14px/1.5 var(--mono); margin: 0 0 14px; }
+pre code { background: none; padding: 0; }
+
+ul.plain { padding-left: 20px; margin: 0; }
+ul.plain li { margin-bottom: 6px; }
+footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--muted); font-size: 14px; }
+
+@media (max-width: 680px) {
+  .stats, .cards { grid-template-columns: 1fr; }
+  .top nav a:not(.gh) { display: none; }
+  .hero { padding-top: 32px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="#"><span class="dot"></span>rust-velte</a>
+    <nav>
+      <a href="#parity">Parity</a>
+      <a href="#speed">Speed</a>
+      <a href="#how">How it's verified</a>
+      <a class="gh repo-link" href="#">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="hero">
+      <span class="tag">Experimental · not affiliated with the Svelte team</span>
+      <h1>The Svelte 5 compiler, in Rust.<br><em>Byte for byte.</em></h1>
+      <p class="lede">rust-velte is a port of the Svelte 5 compiler and svelte-check to Rust. Every layer is checked against the official JavaScript tools: on four real-world codebases its compiled output is identical, character for character, to Svelte 5.57.2's.</p>
+      <div class="cta">
+        <a class="btn primary repo-link" href="#">View the source</a>
+        <a class="btn ghost" href="#parity">See the numbers</a>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><b>5,786 / 5,786</b><span>real-world compilations byte-identical (client and server)</span></div>
+      <div class="stat"><b>3.8× – 5.9×</b><span>faster compile than the official compiler, single-threaded</span></div>
+      <div class="stat"><b>7.9×</b><span>faster full <code>svelte-check</code> on a 1,982-component app</span></div>
+    </div>
+
+    <section id="parity">
+      <h2>Parity with the official compiler</h2>
+      <p class="sub">Each number counts compilations whose <code>js.code</code> is exactly the text <code>svelte/compiler</code> 5.57.2 produces with the same options, including <code>.svelte.ts</code> modules (<code>compileModule</code>).</p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Corpus</th><th>Files</th><th>Client</th><th>Server</th></tr></thead>
+          <tbody>
+            <tr class="group"><td colspan="4">Real-world code</td></tr>
+            <tr><td><a href="https://github.com/windmill-labs/windmill">Windmill</a> frontend</td><td class="num">1,982</td><td class="num"><span class="full">1,982</span></td><td class="num"><span class="full">1,982</span></td></tr>
+            <tr><td><a href="https://github.com/immich-app/immich">Immich</a> web (incl. 45 modules)</td><td class="num">456</td><td class="num"><span class="full">456</span></td><td class="num"><span class="full">456</span></td></tr>
+            <tr><td><a href="https://github.com/huntabyte/bits-ui">bits-ui</a> (incl. 58 modules)</td><td class="num">284</td><td class="num"><span class="full">284</span></td><td class="num"><span class="full">284</span></td></tr>
+            <tr><td>A private SvelteKit app</td><td class="num">171</td><td class="num"><span class="full">171</span></td><td class="num"><span class="full">171</span></td></tr>
+            <tr class="group"><td colspan="4">Svelte's own test suites</td></tr>
+            <tr><td>runtime-runes</td><td class="num">1,428</td><td class="num"><span class="full">1,428</span></td><td class="num"><span class="full">1,428</span></td></tr>
+            <tr><td>runtime-legacy</td><td class="num">1,658</td><td class="num"><span class="full">1,658</span></td><td class="num"><span class="part">1,590</span></td></tr>
+            <tr><td>hydration</td><td class="num">98</td><td class="num"><span class="full">98</span></td><td class="num"><span class="full">98</span></td></tr>
+            <tr><td>snapshot</td><td class="num">36</td><td class="num"><span class="full">36</span></td><td class="num"><span class="full">36</span></td></tr>
+            <tr><td>css</td><td class="num">188</td><td class="num"><span class="part">187</span></td><td class="num"><span class="part">187</span></td></tr>
+            <tr><td>server-side-rendering</td><td class="num">159</td><td class="num">n/a</td><td class="num"><span class="part">153</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note">The one css sample left uses a custom <code>cssHash</code> function the test harness can't call yet. Seven Immich modules are excluded because their TypeScript (enums) can't be type-stripped, so the official compiler can't compile them either.</p>
+
+      <div class="table-scroll" style="margin-top:22px">
+        <table>
+          <thead><tr><th>Other layers</th><th>Parity</th></tr></thead>
+          <tbody>
+            <tr><td>Parser (modern and legacy AST)</td><td>4,567 / 4,567 Svelte test files</td></tr>
+            <tr><td>Compiler warnings and errors</td><td>4,564 / 4,567 Svelte test files; all of Immich and bits-ui; svelte-check's warnings on Windmill</td></tr>
+            <tr><td>CSS output (<code>css.code</code>)</td><td>byte-identical on every compilation above</td></tr>
+            <tr><td>JS printer (port of esrap)</td><td>byte-identical code and source map mappings on 16,470 JS files</td></tr>
+            <tr><td>svelte2tsx</td><td>Windmill 1,982 / 1,982; Svelte tests 4,566 / 4,567</td></tr>
+            <tr><td>svelte-check-rs diagnostics</td><td>identical to <code>svelte-check --tsgo</code> on Windmill (7,922 diagnostics)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="speed">
+      <h2>Speed</h2>
+      <p class="sub">Same machine, warm runs. Compile times exclude file reading and use one thread; the compiler hasn't been profiled or tuned yet.</p>
+      <div class="legend"><span><i style="background:var(--bar-js)"></i>Official (Node)</span><span><i style="background:var(--accent)"></i>rust-velte</span></div>
+      <div class="bars">
+        <div class="bar-row">
+          <div class="label"><span>Compile Windmill, client (1,982 components)</span><span>6.0 s → 1.6 s</span></div>
+          <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:26%"></div>
+        </div>
+        <div class="bar-row">
+          <div class="label"><span>Compile Windmill, server</span><span>5.1 s → 0.87 s</span></div>
+          <div class="bar js" style="width:85%"></div><div class="bar rs" style="width:14.5%"></div>
+        </div>
+        <div class="bar-row">
+          <div class="label"><span>Full <code>svelte-check</code>, Windmill</span><span>73.5 s → 9.3 s</span></div>
+          <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:12.7%"></div>
+        </div>
+        <div class="bar-row">
+          <div class="label"><span>Print Windmill's compiled JS (esrap)</span><span>4.3 s → 0.6 s</span></div>
+          <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:14%"></div>
+        </div>
+      </div>
+      <p class="note">On Windmill, most of svelte-check-rs's 9.3 s is the TypeScript 7 type-check itself. In a real Vite build, bundling and other plugins take part of the time, so whole builds won't speed up by the full factor; measuring that is on the roadmap.</p>
+    </section>
+
+    <section id="how">
+      <h2>How it's verified</h2>
+      <p class="sub">The port follows the official source function by function, and nothing counts as done until it matches.</p>
+      <div class="cards">
+        <div class="card"><h3>An oracle for every layer</h3><p>Node scripts run the official tool over a corpus and record its exact output, options included: ASTs, warnings, generated JS and CSS, TypeScript overlays, diagnostics.</p></div>
+        <div class="card"><h3>Diff, group, fix</h3><p>A Rust binary per layer reruns the same inputs, compares byte for byte and groups mismatches by their first differing line, so the biggest gap is always next.</p></div>
+        <div class="card"><h3>Real code, not just tests</h3><p>Svelte's own suites cover the edge cases. Windmill, Immich and bits-ui cover what people actually write: legacy components, runes classes, snippets, async.</p></div>
+        <div class="card"><h3>Variants for coverage</h3><p>Corpora are recompiled with <code>dev</code>, <code>hmr</code>, custom elements, injected CSS, runes forced on or off and TypeScript, to push the code down every path.</p></div>
+      </div>
+    </section>
+
+    <section id="status">
+      <h2>What's there, what's next</h2>
+      <div class="cards">
+        <div class="card">
+          <h3>Working</h3>
+          <ul class="plain">
+            <li>Parser, analysis, warnings and errors</li>
+            <li><code>compile</code> (client and server) and <code>compileModule</code></li>
+            <li>CSS output, scoping and pruning</li>
+            <li>svelte2tsx and <code>svelte-check-rs</code> (with TypeScript 7)</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Not yet</h3>
+          <ul class="plain">
+            <li>Source maps for compiled JS</li>
+            <li>A Node binding, as a drop-in for vite-plugin-svelte</li>
+            <li>Timing real <code>vite build</code>s; then a native Rolldown plugin</li>
+            <li>Preprocessors still run in Node</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="try">
+      <h2>Try svelte-check-rs</h2>
+      <p class="sub">The project needs TypeScript 7 (<code>@typescript/native-preview</code> or <code>typescript@7</code>), as with <code>svelte-check --tsgo</code>.</p>
+<pre><code>cargo build --release --bin svelte-check-rs
+cd my-app
+/path/to/svelte-check-rs --tsconfig ./tsconfig.json</code></pre>
+      <p class="note">Options follow svelte-check: <code>--workspace</code>, <code>--output</code>, <code>--threshold</code>, <code>--watch</code>, <code>--incremental</code>, <code>--fail-on-warnings</code> and more. See the README.</p>
+    </section>
+  </main>
+
+  <footer>
+    rust-velte ports code from <a href="https://github.com/sveltejs/svelte">Svelte</a>, <a href="https://github.com/sveltejs/language-tools">Svelte language tools</a>, <a href="https://github.com/sveltejs/esrap">esrap</a>, <a href="https://github.com/Rich-Harris/magic-string">magic-string</a> and <a href="https://github.com/microsoft/vscode-css-languageservice">vscode-css-languageservice</a>, and parses JavaScript with <a href="https://oxc.rs">oxc</a>. MIT licensed. It is an independent project, not affiliated with or endorsed by the Svelte team.
+  </footer>
+</div>
+<script>
+  // On GitHub Pages (<owner>.github.io/<repo>/), link to the repository.
+  (function () {
+    var host = location.hostname, seg = location.pathname.split('/').filter(Boolean)[0];
+    if (/\.github\.io$/.test(host) && seg) {
+      var url = 'https://github.com/' + host.split('.')[0] + '/' + seg;
+      document.querySelectorAll('.repo-link').forEach(function (a) { a.href = url; });
+    }
+  })();
+</script>
+</body>
+</html>
