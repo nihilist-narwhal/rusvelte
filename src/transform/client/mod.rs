@@ -2,7 +2,8 @@
 //! program `compile(..., { generate: 'client' })` prints.
 //!
 //! Visitors follow zimmerframe like the server transform does (see `server/mod.rs`): each
-//! visitor gets the original node, with `self.path` holding its ancestors, and returns its
+//! visitor gets the original node, with its ancestors (`context.path`: the `js::Ancestors`
+//! parameter of the JS visitors, after the template nodes in `tpl_path`), and returns its
 //! replacement. The JS `state` is [`State`], copied where the JS spreads it; the objects the
 //! JS shares between state copies (the statement arrays, the template, the memoizer, the
 //! `transform` record) are reference-counted here and copied where the JS copies them.
@@ -31,7 +32,6 @@ use crate::estree::builders as b;
 use crate::estree::convert::Converter;
 use crate::estree::{Node, NodeKind};
 
-use super::js::PathNode;
 use super::options::CompileOptions;
 
 pub use template::Template;
@@ -145,7 +145,8 @@ pub struct Client<'a, 's> {
     /// `analysis.css.hash` (empty without `<style>`) and the elements the CSS scopes
     pub css_hash: String,
     pub scoped: FxHashSet<crate::ast::NodeId>,
-    pub path: Vec<PathNode<'s>>,
+    /// The template nodes of `context.path` (the JS nodes are the visitors' `js::Ancestors`)
+    pub tpl_path: Vec<P<'s>>,
     /// `state.hoisted`
     pub hoisted: Vec<Node>,
     /// `state.templates`: deduplicated templates

@@ -2,7 +2,8 @@
 //! program `compile(..., { generate: 'server' })` prints.
 //!
 //! The JS parts are walked the way zimmerframe walks them: each visitor gets the original node
-//! (with `self.path` holding its ancestors) and returns its replacement; nodes without a
+//! (with its ancestors: `context.path` is the `js::Ancestors` parameter of the JS visitors,
+//! after the template nodes in `tpl_path`) and returns its replacement; nodes without a
 //! visitor get their children visited ([`Server::next`]). Template nodes are visited by
 //! [`Server::visit_node`] and friends. `state` is copied like the JS spreads it; the arrays the
 //! JS shares between state copies (`init`, `template`) are shared [`Shared`] vectors here.
@@ -25,7 +26,6 @@ use crate::estree::builders as b;
 use crate::estree::convert::Converter;
 use crate::estree::{Node, NodeKind};
 
-use super::js::PathNode;
 use super::options::CompileOptions;
 
 /// An array the JS shares between copies of `state`
@@ -77,7 +77,8 @@ pub struct Server<'a, 's> {
     /// `analysis.css.hash` and the elements the CSS scopes
     pub css_hash: String,
     pub scoped: rustc_hash::FxHashSet<crate::ast::NodeId>,
-    pub path: Vec<PathNode<'s>>,
+    /// The template nodes of `context.path` (the JS nodes are the visitors' `js::Ancestors`)
+    pub tpl_path: Vec<P<'s>>,
     /// `state.hoisted`
     pub hoisted: Vec<Node>,
     /// `state.legacy_reactive_statements`: LabeledStatement start → transformed statement

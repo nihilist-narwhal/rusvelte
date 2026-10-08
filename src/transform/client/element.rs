@@ -4,7 +4,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::analyze::nodes::P;
-use super::super::js::PathNode;
 use crate::ast::{Attr, AttrValue, Chunk, Node as TNode, NodeId};
 use crate::estree::builders as b;
 use crate::estree::{LiteralValue, Node, NodeKind};
@@ -56,8 +55,8 @@ impl<'a, 's> Client<'a, 's> {
         if !is_synthetic {
             return None;
         }
-        self.path.iter().rev().find_map(|p| match p {
-            PathNode::Tpl(P::Node(n)) if self.an.textarea_values.contains(n) => Some(*n),
+        self.tpl_path.iter().rev().find_map(|p| match p {
+            P::Node(n) if self.an.textarea_values.contains(n) => Some(*n),
             _ => None,
         })
     }

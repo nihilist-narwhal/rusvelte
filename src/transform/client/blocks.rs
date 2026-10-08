@@ -12,7 +12,7 @@ use crate::ast::{Attr, AttrValue, Expr, Node as TNode, NodeId, Pattern};
 use crate::estree::builders as b;
 use crate::estree::{Node, NodeKind};
 
-use super::super::js::{self, PathNode};
+use super::super::js;
 use super::fragment::is_text_attribute;
 use super::utils::{ChunkRef, Memoize};
 use super::{
@@ -32,7 +32,7 @@ impl<'a, 's> Client<'a, 's> {
             _ => st,
         };
         let ast = self.ast();
-        self.path.push(PathNode::Tpl(P::Node(n)));
+        self.tpl_path.push(P::Node(n));
         match &ast.nodes[n] {
             TNode::Comment { data, .. } => st.template.borrow_mut().push_comment(Some(data.to_string())),
             TNode::IfBlock { .. } => self.if_block(n, st),
@@ -91,7 +91,7 @@ impl<'a, 's> Client<'a, 's> {
             },
             _ => {}
         }
-        self.path.pop();
+        self.tpl_path.pop();
     }
 
     /// A template pattern (`{#each}` context, `{:then}` value, `{@const}` id) as ESTree
@@ -389,11 +389,11 @@ impl<'a, 's> Client<'a, 's> {
                 }
             }
             // the each blocks around this one
-            let len = self.path.len();
-            let parents: Vec<NodeId> = self.path[..len.saturating_sub(1)]
+            let len = self.tpl_path.len();
+            let parents: Vec<NodeId> = self.tpl_path[..len.saturating_sub(1)]
                 .iter()
                 .filter_map(|p| match p {
-                    PathNode::Tpl(P::Node(e)) if matches!(ast.nodes[*e], TNode::EachBlock { .. }) => Some(*e),
+                    P::Node(e) if matches!(ast.nodes[*e], TNode::EachBlock { .. }) => Some(*e),
                     _ => None,
                 })
                 .collect();
@@ -962,7 +962,7 @@ impl<'a, 's> Client<'a, 's> {
         let name = self.convert_expr(expression);
         let declaration = b::r#const(name, snippet);
         // top-level snippets are hoisted so that the `<script>` can reference them
-        let top_level = self.path.len() == 2 && matches!(self.path[0], PathNode::Tpl(P::Fragment(_)));
+        let top_level = self.tpl_path.len() == 2 && matches!(self.tpl_path[0], P::Fragment(_));
         if top_level {
             if self.an.node_meta.get(&n).is_some_and(|m| m.can_hoist) {
                 self.module_level_snippets.push(declaration);

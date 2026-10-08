@@ -401,9 +401,9 @@ impl<'a, 's> Server<'a, 's> {
     fn visit_attribute_discarding(&mut self, a: &'s Attr<'s>, st: &State) {
         match a {
             Attr::Directive { expression: Some(e), .. } | Attr::Attach { expression: e, .. } => {
-                self.path.push(super::super::js::PathNode::Tpl(P::Attr(a)));
+                self.tpl_path.push(P::Attr(a));
                 let _ = self.visit_expr_here(e, st);
-                self.path.pop();
+                self.tpl_path.pop();
             }
             _ => {}
         }
@@ -514,9 +514,9 @@ impl<'a, 's> Server<'a, 's> {
                     props.push(b::prop("init", b::key(&name), value));
                 }
                 ElAttr::Attr(a @ Attr::Spread { expression, .. }) => {
-                    self.path.push(super::super::js::PathNode::Tpl(P::Attr(a)));
+                    self.tpl_path.push(P::Attr(a));
                     let e = self.visit_expr_here(expression, st);
-                    self.path.pop();
+                    self.tpl_path.pop();
                     let meta = self.attr_meta(a);
                     props.push(b::spread(opt.transform(self, e, meta)));
                 }
