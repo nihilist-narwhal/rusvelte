@@ -1,6 +1,7 @@
 //! A port of Svelte's code generation (`phases/3-transform`). So far: the CSS output
 //! (`css/index.js`), through [`compile_css`].
 
+pub mod client;
 pub mod css;
 pub mod js;
 pub mod options;
@@ -303,7 +304,53 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
             };
             server::server_component(&mut s)
         }
-        _ => return Err(CompileError { code: "unsupported", message: "only generate: 'server' is implemented".into(), position: None }),
+        options::Generate::Client => {
+            // styles injected into the JS (`css: 'injected'`, custom elements)
+            let inject_css = match (&root.css, &analysis.css) {
+                (Some(sheet), Some(meta)) if combined.css_injected || analysis.custom_element => {
+                    let code = css::render_stylesheet(source, &sheet.css, meta, &css::RenderOptions { hash: &css_hash, minify: !options.dev, dev: options.dev })
+                        .map_err(|e| CompileError { code: "magic_string", message: e.0, position: None })?;
+                    Some((css_hash.clone(), code))
+                }
+                _ => None,
+            };
+            let conv = crate::estree::convert::Converter::new(&locator, root.ts);
+            let mut c = client::Client {
+                an: &mut analysis.an,
+                options: &combined,
+                conv,
+                locator: &locator,
+                css_hash,
+                scoped,
+                path: Vec::new(),
+                hoisted: Vec::new(),
+                templates: Default::default(),
+                legacy_reactive_imports: Vec::new(),
+                legacy_reactive_statements: Vec::new(),
+                events: Vec::new(),
+                instance_level_snippets: Vec::new(),
+                module_level_snippets: Vec::new(),
+                filename: state_filename,
+                dev: options.dev,
+                synthetic_class,
+                synthetic_style,
+                js_nodes: Default::default(),
+                programs: Vec::new(),
+                is_controlled: Default::default(),
+                needs_mutation_validation: false,
+                needs_props: false,
+                memo_names: Default::default(),
+                next_memo: 0,
+                store_cache: Default::default(),
+                immutable: false,
+                accessors: false,
+            };
+            c.needs_props = c.an.needs_props;
+            c.immutable = c.an.runes || combined.immutable;
+            c.accessors = c.an.custom_element || (!c.an.runes && combined.accessors) || combined.component_api_4;
+            client::client_component(&mut c, inject_css)
+        }
+        _ => return Err(CompileError { code: "unsupported", message: "generate: false is not supported".into(), position: None }),
     };
     let printed = crate::estree::print::print(&program, &crate::estree::print::PrintOptions { comments: &comments, ..Default::default() });
     Ok(CompileOutput { js: printed.code, css })

@@ -1250,13 +1250,18 @@ impl<'s> Analyzer<'s> {
                         }
                     }
                     let node_start = node.start(an.ast).unwrap_or(0);
+                    let value_key = value.map(|v| v.key()).unwrap_or(0);
+                    let private_key = if name.starts_with('#') { name[1..].to_string() } else { String::new() };
                     match state_fields.iter_mut().find(|f| f.name == name) {
                         Some(f) => {
                             f.node_key = node.key();
                             f.node_start = node_start;
                             f.is_assignment = is_assignment;
+                            f.rune = rune;
+                            f.value_key = value_key;
+                            f.key = private_key;
                         }
-                        None => state_fields.push(StateField { name, node_key: node.key(), node_start, is_assignment }),
+                        None => state_fields.push(StateField { name, node_key: node.key(), node_start, is_assignment, rune, key: private_key, value_key }),
                     }
                 }
             }
@@ -1357,8 +1362,45 @@ impl<'s> Analyzer<'s> {
             }
         }
 
+        // the private backing fields of public state fields
+        let mut private_ids: Vec<String> = Vec::new();
+        for child in &body.body {
+            match child {
+                ClassElement::MethodDefinition(m) => {
+                    if let PropertyKey::PrivateIdentifier(pi) = &m.key {
+                        private_ids.push(pi.name.to_string());
+                    }
+                }
+                ClassElement::PropertyDefinition(d) => {
+                    if let PropertyKey::PrivateIdentifier(pi) = &d.key {
+                        private_ids.push(pi.name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        for f in state_fields.iter_mut() {
+            if f.name.starts_with('#') {
+                continue;
+            }
+            let mut deconflicted: String = f
+                .name
+                .char_indices()
+                .map(|(i, c)| {
+                    let ok = c.is_ascii_alphabetic() || c == '_' || c == '$' || (i > 0 && c.is_ascii_digit());
+                    if ok { c } else { '_' }
+                })
+                .collect();
+            while private_ids.contains(&deconflicted) {
+                deconflicted.insert(0, '_');
+            }
+            private_ids.push(deconflicted.clone());
+            f.key = deconflicted;
+        }
+
         self.state_fields.push(state_fields);
         let idx = (self.state_fields.len() - 1) as u32;
+        self.classes.insert(p.key(), idx);
         self.next(p, &State { state_fields: idx, ..*st })
     }
 
@@ -1565,6 +1607,23 @@ impl<'s> Analyzer<'s> {
             }
 
             if rune == Some("$props") {
+                if let BindingPattern::ObjectPattern(o) = &d.id {
+                    if let Some(r) = &o.rest {
+                        if let BindingPattern::BindingIdentifier(ri) = &r.argument {
+                            if let Some(b) = self.get(st.scope, ri.name.as_str()) {
+                                if self.binding(b).kind == Kind::RestProp {
+                                    let keys: Vec<String> = o
+                                        .properties
+                                        .iter()
+                                        .map(|prop| get_name(nodes::property_key(&prop.key)).unwrap_or_default())
+                                        .collect();
+                                    let key = self.binding(b).node.key;
+                                    self.exclude_props.insert(key, keys);
+                                }
+                            }
+                        }
+                    }
+                }
                 let is_object = matches!(d.id, BindingPattern::ObjectPattern(_));
                 let is_ident = matches!(d.id, BindingPattern::BindingIdentifier(_));
                 if !is_object && !is_ident {

@@ -832,3 +832,296 @@ fn global_fn(keypath: &str) -> Option<(Val, Option<GlobalFn>)> {
         _ => None,
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Evaluating the ESTree nodes the transform builds
+
+use crate::estree::{LiteralValue as ELit, Node as ENode, NodeKind as EK};
+
+impl<'s> Scopes<'s> {
+    /// `scope.evaluate(expression)` on an ESTree node of the transform (identifiers fall back
+    /// to their bindings' initial values in the analysed tree)
+    pub fn evaluate_estree(&self, ast: &'s Ast<'s>, expression: &ENode, scope: ScopeId) -> Evaluation {
+        let mut cx = Ctx { scopes: self, ast, current: Vec::new() };
+        let mut values = Vec::new();
+        cx.evaluate_node(expression, scope, &mut values);
+        summarize(values)
+    }
+}
+
+/// `get_global_keypath` on an ESTree callee
+fn estree_keypath(scopes: &Scopes, node: &ENode, scope: ScopeId) -> Option<String> {
+    let mut n = node;
+    let mut joined = String::new();
+    while let EK::MemberExpression(m) = &n.kind {
+        if m.computed {
+            return None;
+        }
+        let EK::Identifier(p) = &m.property.kind else { return None };
+        joined.insert_str(0, p.name.as_str());
+        joined.insert(0, '.');
+        n = &m.object;
+    }
+    if let EK::CallExpression(c) = &n.kind {
+        if matches!(c.callee.kind, EK::Identifier(_)) {
+            joined.insert_str(0, "()");
+            n = &c.callee;
+        }
+    }
+    let EK::Identifier(id) = &n.kind else { return None };
+    if scopes.get(scope, id.name.as_str()).is_some() {
+        return None;
+    }
+    Some(format!("{}{}", id.name, joined))
+}
+
+impl<'a, 's> Ctx<'a, 's> {
+    fn eval_node(&mut self, n: &ENode, scope: ScopeId) -> Evaluation {
+        let mut values = Vec::new();
+        if self.evaluate_node(n, scope, &mut values) {
+            summarize(values)
+        } else {
+            summarize(Vec::new())
+        }
+    }
+
+    fn evaluate_node(&mut self, n: &ENode, scope: ScopeId, values: &mut Vec<Val>) -> bool {
+        // identity of ESTree nodes: their address, tagged to keep them apart from `P` keys
+        let key = (n as *const ENode as usize) | (1 << 63);
+        if self.current.contains(&key) {
+            return false;
+        }
+        self.current.push(key);
+        self.evaluate_node_inner(n, scope, values);
+        self.current.pop();
+        true
+    }
+
+    fn evaluate_node_inner(&mut self, n: &ENode, scope: ScopeId, values: &mut Vec<Val>) {
+        match &n.kind {
+            EK::Literal(l) => add(
+                values,
+                match &l.value {
+                    ELit::String(s) => Val::Str(s.to_string()),
+                    ELit::Number(x) => Val::Num(*x),
+                    ELit::Boolean(b) => Val::Bool(*b),
+                    ELit::Null => Val::Null,
+                    ELit::BigInt(b) => b.parse::<i128>().map_or(Val::Unknown, Val::BigInt),
+                    ELit::RegExp(r) => Val::RegExp(n as *const ENode as usize, format!("/{}/{}", r.pattern, r.flags)),
+                },
+            ),
+            EK::Identifier(id) => {
+                let Some(b) = self.scopes.get(scope, id.name.as_str()) else {
+                    add(values, if id.name == "undefined" { Val::Undefined } else { Val::Unknown });
+                    return;
+                };
+                self.binding_value(b, id.name.as_str(), scope, values);
+            }
+            EK::BinaryExpression(e) => {
+                let a = self.eval_node(&e.left, scope);
+                let b = self.eval_node(&e.right, scope);
+                if a.is_known && b.is_known {
+                    let av = a.value.clone().unwrap_or(Val::Undefined);
+                    let bv = b.value.clone().unwrap_or(Val::Undefined);
+                    add(values, binary(e.operator, &av, &bv).unwrap_or(Val::Unknown));
+                    return;
+                }
+                use BinaryOperator as O;
+                match e.operator {
+                    O::Inequality | O::StrictInequality | O::LessThan | O::LessEqualThan | O::GreaterThan | O::GreaterEqualThan | O::Equality | O::StrictEquality | O::In | O::Instanceof => {
+                        add(values, Val::Bool(true));
+                        add(values, Val::Bool(false));
+                    }
+                    O::Addition => {
+                        if a.is_string || b.is_string {
+                            add(values, Val::String);
+                        } else if a.is_number && b.is_number {
+                            add(values, Val::Number);
+                        } else {
+                            add(values, Val::String);
+                            add(values, Val::Number);
+                        }
+                    }
+                    _ => add(values, Val::Number),
+                }
+            }
+            EK::ConditionalExpression(e) => {
+                let test = self.eval_node(&e.test, scope);
+                let consequent = self.eval_node(&e.consequent, scope);
+                let alternate = self.eval_node(&e.alternate, scope);
+                if test.is_known {
+                    let taken = if test.value.as_ref().is_some_and(Val::to_boolean) { consequent } else { alternate };
+                    for v in taken.values {
+                        add(values, v);
+                    }
+                } else {
+                    for v in consequent.values.into_iter().chain(alternate.values) {
+                        add(values, v);
+                    }
+                }
+            }
+            EK::LogicalExpression(e) => {
+                let a = self.eval_node(&e.left, scope);
+                let b = self.eval_node(&e.right, scope);
+                let av = a.value.clone().unwrap_or(Val::Undefined);
+                if a.is_known {
+                    if b.is_known {
+                        let bv = b.value.clone().unwrap_or(Val::Undefined);
+                        let r = match e.operator {
+                            LogicalOperator::And => if av.to_boolean() { bv } else { av },
+                            LogicalOperator::Or => if av.to_boolean() { av } else { bv },
+                            LogicalOperator::Coalesce => if matches!(av, Val::Null | Val::Undefined) { bv } else { av },
+                        };
+                        add(values, r);
+                        return;
+                    }
+                    let short = match e.operator {
+                        LogicalOperator::And => !av.to_boolean(),
+                        LogicalOperator::Or => av.to_boolean(),
+                        LogicalOperator::Coalesce => !matches!(av, Val::Null | Val::Undefined),
+                    };
+                    if short {
+                        add(values, av);
+                    } else {
+                        for v in b.values {
+                            add(values, v);
+                        }
+                    }
+                    return;
+                }
+                for v in a.values.into_iter().chain(b.values) {
+                    add(values, v);
+                }
+            }
+            EK::UnaryExpression(e) => {
+                let arg = self.eval_node(&e.argument, scope);
+                if arg.is_known {
+                    let v = arg.value.clone().unwrap_or(Val::Undefined);
+                    add(values, unary(e.operator, &v));
+                    return;
+                }
+                match e.operator {
+                    UnaryOperator::LogicalNot | UnaryOperator::Delete => {
+                        add(values, Val::Bool(false));
+                        add(values, Val::Bool(true));
+                    }
+                    UnaryOperator::UnaryPlus | UnaryOperator::UnaryNegation | UnaryOperator::BitwiseNot => add(values, Val::Number),
+                    UnaryOperator::Typeof => add(values, Val::String),
+                    UnaryOperator::Void => add(values, Val::Undefined),
+                }
+            }
+            EK::CallExpression(c) => {
+                let Some(keypath) = estree_keypath(self.scopes, &c.callee, scope) else {
+                    add(values, Val::Unknown);
+                    return;
+                };
+                if super::utils::is_rune(&keypath).is_some() {
+                    let arg = c.arguments.first();
+                    match keypath.as_str() {
+                        "$state" | "$state.raw" | "$derived" => match arg {
+                            Some(a) => {
+                                self.evaluate_node(a, scope, values);
+                            }
+                            None => add(values, Val::Undefined),
+                        },
+                        "$props.id" => add(values, Val::String),
+                        "$effect.tracking" => {
+                            add(values, Val::Bool(false));
+                            add(values, Val::Bool(true));
+                        }
+                        "$derived.by" => match arg.map(|a| &a.kind) {
+                            Some(EK::ArrowFunctionExpression(f)) if f.expression => {
+                                self.evaluate_node(&f.body, scope, values);
+                            }
+                            _ => add(values, Val::Unknown),
+                        },
+                        _ => add(values, Val::Unknown),
+                    }
+                    return;
+                }
+                if let Some((ty, f)) = global_fn(&keypath) {
+                    if c.arguments.iter().all(|a| !matches!(a.kind, EK::SpreadElement(_))) {
+                        let args: Vec<Evaluation> = c.arguments.iter().map(|a| self.eval_node(a, scope)).collect();
+                        match f {
+                            Some(f) if args.iter().all(|e| e.is_known) => {
+                                let vals: Vec<Val> = args.into_iter().map(|e| e.value.unwrap_or(Val::Undefined)).collect();
+                                add(values, f(&vals).unwrap_or(Val::Unknown));
+                            }
+                            _ => add(values, ty),
+                        }
+                        return;
+                    }
+                }
+                add(values, Val::Unknown);
+            }
+            EK::TemplateLiteral(t) => {
+                let cooked = |i: usize| match &t.quasis[i].kind {
+                    EK::TemplateElement(q) => q.cooked.as_ref().map_or("undefined".to_string(), |c| c.to_string()),
+                    _ => String::new(),
+                };
+                let mut result = cooked(0);
+                for (i, e) in t.expressions.iter().enumerate() {
+                    let ev = self.eval_node(e, scope);
+                    if ev.is_known {
+                        let s = ev.value.as_ref().and_then(Val::to_js_string).unwrap_or_else(|| "undefined".into());
+                        result.push_str(&s);
+                        result.push_str(&cooked(i + 1));
+                    } else {
+                        add(values, Val::String);
+                        break;
+                    }
+                }
+                add(values, Val::Str(result));
+            }
+            EK::MemberExpression(_) => {
+                let keypath = estree_keypath(self.scopes, n, scope);
+                let constant = match keypath.as_deref() {
+                    Some("Math.PI") => Some(std::f64::consts::PI),
+                    Some("Math.E") => Some(std::f64::consts::E),
+                    Some("Math.LN10") => Some(std::f64::consts::LN_10),
+                    Some("Math.LN2") => Some(std::f64::consts::LN_2),
+                    Some("Math.LOG10E") => Some(std::f64::consts::LOG10_E),
+                    Some("Math.LOG2E") => Some(std::f64::consts::LOG2_E),
+                    Some("Math.SQRT2") => Some(std::f64::consts::SQRT_2),
+                    Some("Math.SQRT1_2") => Some(std::f64::consts::FRAC_1_SQRT_2),
+                    _ => None,
+                };
+                add(values, constant.map_or(Val::Unknown, Val::Num));
+            }
+            EK::ArrowFunctionExpression(_) | EK::FunctionExpression(_) => add(values, Val::Function),
+            _ => add(values, Val::Unknown),
+        }
+    }
+
+    /// The `Identifier` case for a binding
+    fn binding_value(&mut self, b: BindingId, name: &str, scope: ScopeId, values: &mut Vec<Val>) {
+        let binding: &scope::Binding<'s> = self.scopes.binding(b);
+        if let Some(initial @ P::Js(AstKind::CallExpression(_))) = binding.initial {
+            if scope::get_rune(self.scopes, Some(initial), scope) == Some("$props.id") {
+                add(values, Val::String);
+                return;
+            }
+        }
+        let is_prop = matches!(binding.kind, Kind::Prop | Kind::RestProp | Kind::BindableProp);
+        if let Some(P::Node(n)) = binding.initial {
+            match &self.ast.nodes[n] {
+                Node::EachBlock { index: Some(index), .. } if index == name => {
+                    add(values, Val::Number);
+                    return;
+                }
+                Node::SnippetBlock { .. } => {
+                    add(values, Val::Unknown);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if !binding.updated() && !is_prop {
+            if let Some(initial) = binding.initial {
+                self.evaluate(initial, binding.scope, values);
+                return;
+            }
+        }
+        add(values, Val::Unknown);
+    }
+}

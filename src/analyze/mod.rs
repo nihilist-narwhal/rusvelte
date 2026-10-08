@@ -244,6 +244,21 @@ pub(crate) struct StateField {
     /// start of the PropertyDefinition / AssignmentExpression
     pub node_start: usize,
     pub is_assignment: bool,
+    /// `type`: the rune (`$state`, `$state.raw`, `$derived`, `$derived.by`)
+    pub rune: &'static str,
+    /// `key`: the name of the private backing field (without `#`)
+    pub key: String,
+    /// `value`: the rune call
+    pub value_key: usize,
+}
+
+/// `scope.tracing`: the label of `$inspect.trace(...)`
+#[derive(Clone, Debug)]
+pub enum Tracing {
+    /// the trace's argument (its key)
+    Expression(usize),
+    /// `label (location)`
+    Label(String),
 }
 
 pub(crate) struct Analyzer<'s> {
@@ -321,6 +336,16 @@ pub(crate) struct Analyzer<'s> {
     pub meta_of: FxHashMap<usize, u32>,
     pub component_slots: Vec<FxHashSet<String>>,
     pub state_fields: Vec<Vec<StateField>>,
+    /// `analysis.classes`: ClassBody key → index into `state_fields`
+    pub classes: FxHashMap<usize, u32>,
+    /// `binding.metadata.exclude_props` of rest props (by `binding.node.key`)
+    pub exclude_props: FxHashMap<usize, Vec<String>>,
+    /// `binding.legacy_indirect_bindings`
+    pub legacy_indirect_bindings: FxHashMap<BindingId, Vec<BindingId>>,
+    /// `scope.tracing`
+    pub scope_tracing: FxHashMap<ScopeId, Tracing>,
+    /// `analysis.tracing`
+    pub tracing: bool,
     pub reactive_statements: Vec<ReactiveStatement>,
     /// the per-slot fragments `visit_component` creates: (fragment, nodes)
     pub slot_fragments: Vec<(FragId, Vec<NodeId>)>,
@@ -608,6 +633,11 @@ pub(crate) fn analyze_component<'s>(
         meta_of: FxHashMap::default(),
         component_slots: Vec::new(),
         state_fields: vec![Vec::new()],
+        classes: FxHashMap::default(),
+        exclude_props: FxHashMap::default(),
+        legacy_indirect_bindings: FxHashMap::default(),
+        scope_tracing: FxHashMap::default(),
+        tracing: false,
         reactive_statements: Vec::new(),
         slot_fragments: Vec::new(),
         emptied_fragment: None,

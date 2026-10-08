@@ -50,7 +50,7 @@ fn main() {
         if options.root_dir.is_none() {
             options.root_dir = Some(oracle_cwd.to_string_lossy().into_owned());
         }
-        if options.generate != Generate::Server {
+        if options.generate == Generate::None {
             skipped += 1;
             continue;
         }
