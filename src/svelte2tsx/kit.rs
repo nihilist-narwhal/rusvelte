@@ -796,8 +796,10 @@ impl<'a> Visit<'a> for ImportCollector<'_, 'a> {
     }
 
     fn visit_statement(&mut self, it: &Statement<'a>) {
-        // blocks are hosts wherever they appear (see `visit_block_statement`)
-        if !matches!(it, Statement::BlockStatement(_)) {
+        // blocks are hosts wherever they appear (see `visit_block_statement`), and an
+        // expression statement starting with `(` gets no JSDoc (its expression does)
+        let paren_statement = matches!(it, Statement::ExpressionStatement(_)) && self.src.text.as_bytes().get(it.span().start as usize) == Some(&b'(');
+        if !matches!(it, Statement::BlockStatement(_)) && !paren_statement {
             self.host(it.span(), false);
         }
         walk::walk_statement(self, it);
