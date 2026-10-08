@@ -457,6 +457,7 @@ impl<'s> Analyzer<'s> {
         if !is_reference(p, first_parent) {
             return Ok(());
         }
+        self.mark_subtree_dynamic();
         i -= 1;
         let mut parent = first_parent;
 
@@ -1763,6 +1764,7 @@ impl<'s> Analyzer<'s> {
                         }
                     }
                 }
+                self.mark_subtree_dynamic();
                 let meta = self.new_meta(p);
                 self.next(p, &State { expression: Some(meta), ..*st })
             }
@@ -1770,6 +1772,7 @@ impl<'s> Analyzer<'s> {
                 if self.runes {
                     self.validate_opening_tag(n, '@')?;
                 }
+                self.mark_subtree_dynamic();
                 let meta = self.new_meta(p);
                 self.next(p, &State { expression: Some(meta), ..*st })
             }
@@ -1788,11 +1791,28 @@ impl<'s> Analyzer<'s> {
                 if self.runes {
                     self.validate_opening_tag(n, if *elseif { ':' } else { '#' })?;
                 }
+                self.mark_subtree_dynamic();
                 let meta = self.new_meta(p);
                 self.visit_child(p, nodes::template_expr(test), &State { expression: Some(meta), ..*st })?;
                 self.visit_child(p, P::Fragment(*consequent), st)?;
                 if let Some(a) = alternate {
                     self.visit_child(p, P::Fragment(*a), st)?;
+                    // fold an else-if chain into one block, unless an else-if awaits or has new blockers
+                    let alt_nodes = &self.ast.fragments[*a].nodes;
+                    if alt_nodes.len() == 1 {
+                        let e = alt_nodes[0];
+                        if let Node::IfBlock { elseif: true, .. } = &self.ast.nodes[e] {
+                            let em = self.meta_of[&P::Node(e).key()];
+                            let mine = self.meta_blockers(meta);
+                            let more = self.meta_blockers(em).iter().any(|b| !mine.contains(b));
+                            if !self.metas[em as usize].has_await && !more {
+                                let rest = self.node_meta_mut(e).flattened.take().unwrap_or_default();
+                                let mut flattened = vec![e];
+                                flattened.extend(rest);
+                                self.node_meta_mut(n).flattened = Some(flattened);
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1812,6 +1832,7 @@ impl<'s> Analyzer<'s> {
                         }
                     }
                 }
+                self.mark_subtree_dynamic();
                 let meta = self.new_meta(p);
                 self.visit_child(p, nodes::template_expr(expression), &State { expression: Some(meta), ..*st })?;
                 for f in [pending, then, catch].into_iter().flatten() {
@@ -1824,6 +1845,7 @@ impl<'s> Analyzer<'s> {
                 if self.runes {
                     self.validate_opening_tag(n, '#')?;
                 }
+                self.mark_subtree_dynamic();
                 let meta = self.new_meta(p);
                 self.visit_child(p, nodes::template_expr(expression), &State { expression: Some(meta), ..*st })?;
                 self.visit_child(p, P::Fragment(*fragment), st)
@@ -1875,6 +1897,7 @@ impl<'s> Analyzer<'s> {
                     if let Some(a) = el.attributes.first() {
                         return Err(e::svelte_head_illegal_attribute(self.loc(P::Attr(a))));
                     }
+                    self.mark_subtree_dynamic();
                     self.next(p, st)
                 }
                 "SvelteBody" | "SvelteDocument" | "SvelteWindow" => {
@@ -1911,6 +1934,7 @@ impl<'s> Analyzer<'s> {
                             }
                         }
                     }
+                    self.mark_subtree_dynamic();
                     self.next(p, st)
                 }
                 "SlotElement" => {
@@ -1939,6 +1963,7 @@ impl<'s> Analyzer<'s> {
                         Some(entry) => entry.1 = n,
                         None => self.slot_names.push((name, n)),
                     }
+                    self.mark_subtree_dynamic();
                     self.next(p, st)
                 }
                 "TitleElement" => {
@@ -2135,6 +2160,9 @@ impl<'s> Analyzer<'s> {
             }
         }
 
+        let dynamic = binding.is_none_or(|b| self.binding(b).kind != Kind::Normal);
+        self.node_meta_mut(n).dynamic = dynamic;
+        self.mark_subtree_dynamic();
         let meta = self.new_meta(p);
         self.visit_child(p, callee, &State { expression: Some(meta), ..*st })?;
         for a in &c.arguments {
@@ -2173,6 +2201,7 @@ impl<'s> Analyzer<'s> {
         if keyed && context.is_none() {
             return Err(e::each_key_without_as(self.loc(nodes::template_expr(key.as_ref().unwrap()))));
         }
+        self.node_meta_mut(n).keyed = keyed;
 
         let meta = self.new_meta(p);
         let parent_scope = self.sc.scope(st.scope).parent.unwrap_or(st.scope);
@@ -2202,14 +2231,16 @@ impl<'s> Analyzer<'s> {
                 }
             }
             if mutated {
-                for b in transitive {
+                for &b in &transitive {
                     let b = self.sc.binding_mut(b);
                     if b.kind == Kind::Normal && matches!(b.declaration_kind, DeclKind::Const | DeclKind::Let | DeclKind::Var) {
                         b.kind = Kind::State;
                     }
                 }
             }
+            self.node_meta_mut(n).transitive_deps = transitive;
         }
+        self.mark_subtree_dynamic();
         Ok(())
     }
 
@@ -2248,7 +2279,9 @@ impl<'s> Analyzer<'s> {
                 return Err(e::declaration_duplicate(self.loc(nodes::template_expr(expression)), name));
             }
             let mut visited = Vec::new();
-            if self.can_hoist_snippet(st.scope, &mut visited) {
+            let can_hoist = self.can_hoist_snippet(st.scope, &mut visited);
+            self.node_meta_mut(n).can_hoist = can_hoist;
+            if can_hoist {
                 if let Some(b) = self.get(st.scope, name) {
                     let module = self.module_scope;
                     let node_name = self.binding(b).node.name;
@@ -2739,6 +2772,7 @@ impl<'s> Analyzer<'s> {
         }
         self.renderer_snippets.insert(n, snippets);
         self.snippet_renderers.push((n, resolved));
+        self.mark_subtree_dynamic();
 
         for a in &el.attributes {
             let ap = P::Attr(a);
@@ -2832,21 +2866,53 @@ impl<'s> Analyzer<'s> {
         let parent = self.path.last().copied();
         let parent_ty = parent.map(|q| self.ty(q));
         match a {
-            Attr::Attribute { value, .. } => {
+            Attr::Attribute { value, name, .. } => {
                 self.next(p, st)?;
-                if !matches!(value, AttrValue::True)
-                    && is_event_attribute(a)
-                    && matches!(parent_ty, Some("RegularElement" | "SvelteElement"))
-                {
-                    self.uses_event_attributes = true;
+                if parent_ty == Some("RegularElement") && *name == "value" {
+                    if let Some(Node::Element(el)) = parent.and_then(|q| q.node()).map(|q| &self.ast.nodes[q]) {
+                        if el.name == "option" {
+                            self.mark_subtree_dynamic();
+                        }
+                    }
+                }
+                if is_event_attribute(a) {
+                    self.mark_subtree_dynamic();
+                }
+                if utils::cannot_be_set_statically(name) {
+                    self.mark_subtree_dynamic();
+                }
+                // class={[...]}, class={{...}} or class={x} need clsx
+                if *name == "class" {
+                    if let AttrValue::Expression(chunk) = value {
+                        if let Chunk::Expression { expression, .. } = chunk.as_ref() {
+                            let simple = matches!(
+                                nodes::template_expr(expression),
+                                P::Js(AstKind::StringLiteral(_) | AstKind::NumericLiteral(_) | AstKind::BooleanLiteral(_) | AstKind::NullLiteral(_) | AstKind::RegExpLiteral(_) | AstKind::BigIntLiteral(_) | AstKind::TemplateLiteral(_) | AstKind::BinaryExpression(_))
+                                    | P::TplExpr(Expr::Literal { .. })
+                            );
+                            if !simple {
+                                self.mark_subtree_dynamic();
+                                self.attr_meta.entry(p.key()).or_default().needs_clsx = true;
+                            }
+                        }
+                    }
+                }
+                if !matches!(value, AttrValue::True) && is_event_attribute(a) {
+                    if matches!(parent_ty, Some("RegularElement" | "SvelteElement")) {
+                        self.uses_event_attributes = true;
+                    }
+                    let delegated = parent_ty == Some("RegularElement") && utils::can_delegate_event(&name[2..]);
+                    self.attr_meta.entry(p.key()).or_default().delegated = delegated;
                 }
                 Ok(())
             }
             Attr::Spread { .. } => {
+                self.mark_subtree_dynamic();
                 let meta = self.new_meta(p);
                 self.next(p, &State { expression: Some(meta), ..*st })
             }
             Attr::Attach { .. } => {
+                self.mark_subtree_dynamic();
                 let meta = self.new_meta(p);
                 self.next(p, &State { expression: Some(meta), ..*st })?;
                 if self.metas[meta as usize].has_await {
@@ -2858,13 +2924,37 @@ impl<'s> Analyzer<'s> {
                 if modifiers.len() > 1 || (modifiers.len() == 1 && modifiers[0] != "important") {
                     return Err(e::style_directive_invalid_modifier(self.loc(p)));
                 }
-                if !matches!(value, AttrValue::True) {
+                self.mark_subtree_dynamic();
+                let meta = self.new_meta(p);
+                if matches!(value, AttrValue::True) {
+                    let name = super::attr_name(a);
+                    if let Some(b) = self.get(st.scope, name) {
+                        let binding = self.binding(b);
+                        let (has_state, blocked) = (binding.kind != Kind::Normal, binding.blocker.is_some());
+                        let m = &mut self.metas[meta as usize];
+                        m.has_state |= has_state;
+                        if blocked && !m.dependencies.contains(&b) {
+                            m.dependencies.push(b);
+                        }
+                    }
+                } else {
                     self.next(p, st)?;
+                    for c in utils::chunks(value) {
+                        if let Chunk::Expression { .. } = c {
+                            if let Some(&cm) = self.meta_of.get(&P::Chunk(c).key()) {
+                                let other = self.metas[cm as usize].clone();
+                                self.metas[meta as usize].merge(&other);
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
             Attr::Directive { kind, name, modifiers, expression, start, end, .. } => match *kind {
                 "AnimateDirective" | "TransitionDirective" | "UseDirective" => {
+                    if *kind != "AnimateDirective" {
+                        self.mark_subtree_dynamic();
+                    }
                     let meta = self.new_meta(p);
                     self.next(p, &State { expression: Some(meta), ..*st })?;
                     if self.metas[meta as usize].has_await {
@@ -2873,6 +2963,7 @@ impl<'s> Analyzer<'s> {
                     Ok(())
                 }
                 "ClassDirective" => {
+                    self.mark_subtree_dynamic();
                     let meta = self.new_meta(p);
                     self.next(p, &State { expression: Some(meta), ..*st })
                 }
@@ -2884,6 +2975,7 @@ impl<'s> Analyzer<'s> {
                         self.event_directive_node = Some((*start, *end, name));
                     }
                     let _ = modifiers;
+                    self.mark_subtree_dynamic();
                     let meta = self.new_meta(p);
                     self.next(p, &State { expression: Some(meta), ..*st })
                 }

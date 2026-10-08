@@ -66,6 +66,8 @@ pub struct CompileOptions {
     pub custom_element: bool,
     /// `experimental.async`
     pub experimental_async: bool,
+    /// `namespace` (`html` when `None`); `<svelte:options namespace>` overrides it
+    pub namespace: Option<String>,
 }
 
 /// The warnings `svelte.compile(source, { dev: true, generate: false, filename })` reports,
@@ -119,6 +121,36 @@ pub fn compile_diagnostics_with(
             end: err.position.map(|p| pos(p.1)),
         }),
     }
+}
+
+/// `node.metadata` of template nodes (the fields code generation reads)
+#[derive(Default, Debug, Clone)]
+pub struct NodeMeta {
+    /// elements: in the SVG / MathML namespace
+    pub svg: bool,
+    pub mathml: bool,
+    pub has_spread: bool,
+    /// `<option>{expr}</option>`: the ExpressionTag used as its value
+    pub synthetic_value_node: Option<NodeId>,
+    /// IfBlock: the else-if blocks folded into this one
+    pub flattened: Option<Vec<NodeId>>,
+    /// EachBlock
+    pub keyed: bool,
+    pub contains_group_binding: bool,
+    pub transitive_deps: Vec<BindingId>,
+    /// SnippetBlock
+    pub can_hoist: bool,
+    /// RenderTag: the callee isn't a plain (normal) binding
+    pub dynamic: bool,
+}
+
+/// `attribute.metadata`
+#[derive(Default, Debug, Clone, Copy)]
+pub struct AttrMeta {
+    /// `class={...}` needs `clsx`
+    pub needs_clsx: bool,
+    /// an event attribute that can be delegated
+    pub delegated: bool,
 }
 
 /// `ExpressionMetadata`
@@ -223,6 +255,8 @@ pub(crate) struct Analyzer<'s> {
     pub maybe_runes: bool,
     pub custom_element: bool,
     pub experimental_async: bool,
+    /// the component's namespace (`options.namespace` or `<svelte:options namespace>`)
+    pub namespace: &'static str,
     pub custom_element_props: bool,
     pub name: String,
     pub module_scope: ScopeId,
@@ -248,6 +282,12 @@ pub(crate) struct Analyzer<'s> {
     pub props_id: Option<Id<'s>>,
     pub has_props_rune: bool,
     pub metas: Vec<ExprMeta>,
+    /// `attribute.metadata` (by attribute address)
+    pub attr_meta: FxHashMap<usize, AttrMeta>,
+    /// `node.metadata` of template nodes
+    pub node_meta: FxHashMap<NodeId, NodeMeta>,
+    /// `fragment.metadata.dynamic` (by fragment id)
+    pub fragment_dynamic: FxHashSet<usize>,
     /// `analysis.instance_body`
     pub instance_body: blockers::InstanceBody<'s>,
     /// `analysis.needs_context`
@@ -332,6 +372,39 @@ impl<'s> Analyzer<'s> {
 
     pub fn binding(&self, b: BindingId) -> &scope::Binding<'s> {
         self.sc.binding(b)
+    }
+
+    /// `node.metadata`, created on first use
+    pub fn node_meta_mut(&mut self, n: NodeId) -> &mut NodeMeta {
+        self.node_meta.entry(n).or_default()
+    }
+
+    /// `mark_subtree_dynamic(context.path)`
+    pub fn mark_subtree_dynamic(&mut self) {
+        for i in (0..self.path.len()).rev() {
+            let key = match self.path[i] {
+                P::Fragment(f) => f,
+                // the slot fragments share the component fragment's `metadata`
+                P::SlotFragment(s) => self.slot_fragments[s as usize].0,
+                _ => continue,
+            };
+            if !self.fragment_dynamic.insert(key) {
+                return;
+            }
+        }
+    }
+
+    /// The blockers of an expression's references (`#get_blockers`), deduplicated by identity
+    pub fn meta_blockers(&self, m: u32) -> Vec<blockers::Blocker> {
+        let mut out: Vec<blockers::Blocker> = Vec::new();
+        for &r in &self.metas[m as usize].references {
+            if let Some(b) = self.binding(r).blocker {
+                if !out.contains(&b) {
+                    out.push(b);
+                }
+            }
+        }
+        out
     }
 
     /// A new `ExpressionMetadata`, as `owner.metadata.expression`
@@ -458,6 +531,11 @@ fn analyze_component<'s>(
         maybe_runes: false,
         custom_element: custom_element_options.is_some() || compile_options.custom_element,
         experimental_async: compile_options.experimental_async,
+        namespace: match root.options.as_ref().and_then(|o| o.values.get("namespace")).and_then(|v| v.as_str()).or(compile_options.namespace.as_deref()) {
+            Some("svg") => "svg",
+            Some("mathml") => "mathml",
+            _ => "html",
+        },
         custom_element_props: custom_element_options.and_then(|c| c.get("props")).is_some_and(|p| !p.is_null()),
         name: String::new(),
         module_scope: module.scope,
@@ -481,6 +559,9 @@ fn analyze_component<'s>(
         metas: Vec::new(),
         needs_context: false,
         instance_body: blockers::InstanceBody::default(),
+        node_meta: FxHashMap::default(),
+        attr_meta: FxHashMap::default(),
+        fragment_dynamic: FxHashSet::default(),
         pickled_awaits: FxHashSet::default(),
         async_deriveds: Vec::new(),
         meta_of: FxHashMap::default(),
