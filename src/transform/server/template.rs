@@ -361,16 +361,24 @@ impl<'a, 's> Server<'a, 's> {
     }
 
     /// The ESTree form of a template expression
-    pub fn convert_expr(&self, e: &Expr<'s>) -> Node {
+    pub fn convert_expr(&self, e: &'s Expr<'s>) -> Node {
         match e {
             Expr::Js(js) => self.conv.expression(js.effective_root()),
-            Expr::Ident { name, .. } => b::id(name.as_str()),
+            Expr::Ident { name, start, end, loc } => {
+                let mut id = b::id(name.as_str());
+                id.span = Some(crate::estree::Span::new(*start as u32, *end as u32));
+                if matches!(loc, crate::ast::IdentLoc::Svelte) {
+                    id.loc = Some(self.conv.location(oxc_span::Span::new(*start as u32, *end as u32)));
+                }
+                id.origin = Some(P::TplExpr(e).key());
+                id
+            }
             Expr::Literal { value, .. } => b::literal(value.as_str()),
         }
     }
 
     /// `context.visit(expression)` for an expression of template node `n`
-    pub fn visit_template_expr(&mut self, n: NodeId, e: &Expr<'s>, st: &State) -> Node {
+    pub fn visit_template_expr(&mut self, n: NodeId, e: &'s Expr<'s>, st: &State) -> Node {
         let node = self.convert_expr(e);
         self.path.push(PathNode::Tpl(P::Node(n)));
         let out = self.visit_js(&node, st);
@@ -553,7 +561,7 @@ impl<'a, 's> Server<'a, 's> {
     }
 
     /// `context.visit(expression)` with the current template node on the path
-    pub fn visit_template_expr_here(&mut self, e: &Expr<'s>, st: &State) -> Node {
+    pub fn visit_template_expr_here(&mut self, e: &'s Expr<'s>, st: &State) -> Node {
         let node = self.convert_expr(e);
         self.visit_js(&node, st)
     }
