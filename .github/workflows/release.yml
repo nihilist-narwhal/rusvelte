@@ -1,0 +1,99 @@
+# Builds the native module for each platform, tests that it loads and compiles a component,
+# and publishes the npm packages (packages/rusvelte/npm/prepare.mjs).
+#
+# - Push a tag `v<version>` matching packages/rusvelte/package.json to publish (needs the
+#   NPM_TOKEN secret).
+# - Run it by hand (Actions → Release → Run workflow) for a dry run: everything but the upload.
+#
+# Linux builds target glibc 2.17 (cargo-zigbuild), so they load on old distributions too.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-14, lib: librusvelte_node.dylib, test: native }
+          - { target: x86_64-apple-darwin, os: macos-14, lib: librusvelte_node.dylib, test: none }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, lib: librusvelte_node.so, zig: x86_64-unknown-linux-gnu.2.17, test: native }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, lib: librusvelte_node.so, zig: aarch64-unknown-linux-gnu.2.17, test: native }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, lib: librusvelte_node.so, zig: x86_64-unknown-linux-musl, test: alpine }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, lib: rusvelte_node.dll, test: native }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build
+        if: ${{ !matrix.zig }}
+        run: cargo build --release -p rusvelte-node --target ${{ matrix.target }}
+      - name: Build (zig)
+        if: ${{ matrix.zig }}
+        env:
+          # a cdylib for musl must link the C runtime dynamically
+          RUSTFLAGS: ${{ contains(matrix.target, 'musl') && '-C target-feature=-crt-static' || '' }}
+        run: |
+          pip install cargo-zigbuild ziglang
+          cargo zigbuild --release -p rusvelte-node --target ${{ matrix.zig }}
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.lib }} dist/rusvelte.${{ matrix.target }}.node
+      - name: Test
+        if: ${{ matrix.test == 'native' }}
+        shell: bash
+        run: node packages/rusvelte/npm/smoke-test.cjs dist/rusvelte.${{ matrix.target }}.node
+      - name: Test (Alpine)
+        if: ${{ matrix.test == 'alpine' }}
+        run: docker run --rm -v "$PWD:/w" -w /w node:24-alpine node packages/rusvelte/npm/smoke-test.cjs dist/rusvelte.${{ matrix.target }}.node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rusvelte.${{ matrix.target }}
+          path: dist/rusvelte.${{ matrix.target }}.node
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Check the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(node -p "require('./packages/rusvelte/package.json').version")
+          test "v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != package version $version"; exit 1; }
+      - name: Prepare packages
+        run: node packages/rusvelte/npm/prepare.mjs artifacts npm-out
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ startsWith(github.ref, 'refs/tags/') && '' || '--dry-run' }}
+        run: |
+          # the platform packages first, so the main package's optional dependencies exist
+          for dir in npm-out/rusvelte-*; do
+            (cd "$dir" && npm publish --access public --provenance $DRY_RUN)
+          done
+          (cd npm-out/rusvelte && npm publish --access public --provenance $DRY_RUN)
