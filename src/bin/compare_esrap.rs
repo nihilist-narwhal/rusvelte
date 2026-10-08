@@ -6,7 +6,8 @@
 //! Each file is parsed with oxc, converted to the owned ESTree and printed with the comments
 //! collected the way Svelte collects them. The code must match exactly; the source map
 //! mappings are compared too (they check every node's `loc`). VERBOSE=1 prints the first
-//! difference of each failure, FILTER=<substring> limits the files.
+//! difference of each failure, FILTER=<substring> limits the files. BENCH=<n> also prints
+//! every corpus n more times, with and without source maps, and reports the time per pass.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -35,6 +36,7 @@ fn first_difference(expected: &str, actual: &str) -> (usize, String, String) {
 fn main() {
     let verbose = std::env::var("VERBOSE").is_ok();
     let filter = std::env::var("FILTER").ok();
+    let bench: usize = std::env::var("BENCH").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
     let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for out in std::env::args().skip(1) {
@@ -46,6 +48,7 @@ fn main() {
         let mut print_time = Duration::ZERO;
         let mut convert_time = Duration::ZERO;
         let mut parse_time = Duration::ZERO;
+        let mut kept: Vec<(estree::Node, Vec<estree::Comment>)> = Vec::new();
 
         for entry in files {
             let rel = entry["path"].as_str().unwrap();
@@ -92,9 +95,10 @@ fn main() {
                     &program,
                     &print::PrintOptions { comments: &comments, source_map: true, ..Default::default() },
                 );
-                (printed, converted, t.elapsed())
+                let elapsed = t.elapsed();
+                (printed, converted, elapsed, (program, comments))
             }));
-            let (printed, converted, printed_in) = match result {
+            let (printed, converted, printed_in, program) = match result {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e
@@ -108,6 +112,9 @@ fn main() {
             };
             convert_time += converted;
             print_time += printed_in;
+            if bench > 0 {
+                kept.push(program);
+            }
 
             if printed.code == expected {
                 ok += 1;
@@ -135,6 +142,24 @@ fn main() {
                     eprintln!("  expected: {e:?}");
                     eprintln!("  actual:   {a:?}");
                 }
+            }
+        }
+
+        if bench > 0 {
+            for source_map in [false, true] {
+                let t = Instant::now();
+                let mut bytes = 0;
+                for _ in 0..bench {
+                    for (program, comments) in &kept {
+                        let options = print::PrintOptions { comments, source_map, ..Default::default() };
+                        bytes += print::print(program, &options).code.len();
+                    }
+                }
+                println!(
+                    "  bench: print {:.1} ms per pass (source maps: {source_map}, {} MB)",
+                    t.elapsed().as_secs_f64() * 1000.0 / bench as f64,
+                    bytes / bench / 1_000_000
+                );
             }
         }
 
