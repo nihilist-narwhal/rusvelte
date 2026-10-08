@@ -68,6 +68,8 @@ impl State {
 }
 
 pub struct Server<'a, 's> {
+    /// A compile error the transform raises (`const_tag_cycle`); the first one wins
+    pub error: std::cell::RefCell<Option<crate::error::CompileError>>,
     pub an: &'a mut Analyzer<'s>,
     pub options: &'a CompileOptions,
     pub conv: Converter<'a>,
@@ -491,6 +493,10 @@ impl<'a, 's> Server<'a, 's> {
     pub fn element_attributes(&self, n: crate::ast::NodeId) -> Vec<&'s crate::ast::Attr<'s>> {
         let crate::ast::Node::Element(el) = &self.ast().nodes[n] else { return vec![] };
         let mut out: Vec<&'s crate::ast::Attr<'s>> = el.attributes.iter().collect();
+        // the `value` the analysis makes out of a `<textarea>`'s dynamic children
+        if self.an.textarea_values.contains(&n) {
+            out.push(super::client::fragment::TEXTAREA_VALUE.with(|a| *a));
+        }
         if self.synthetic_class.contains(&n) {
             out.push(SYNTHETIC.with(|s| s.0));
         }

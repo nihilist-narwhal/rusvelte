@@ -722,7 +722,7 @@ impl<'a, 's> Server<'a, 's> {
                     declarations.push(b::declarator((*d.id).clone(), value));
                     continue;
                 }
-                declarations.extend(self.create_state_declarators(&d.id, st, value));
+                declarations.extend(self.create_state_declarators(&d.id, st, Some(value)));
             }
         } else {
             for declarator in &v.declarations {
@@ -769,12 +769,9 @@ impl<'a, 's> Server<'a, 's> {
                     declarations.push(b::declarator((*d.id).clone(), init));
                     continue;
                 }
-                let value = match d.init.as_deref() {
-                    Some(i) => self.visit_in(node, i, st),
-                    None => b::void0(),
-                };
-                let value_opt = if d.init.is_some() { value } else { b::void0() };
-                declarations.extend(self.create_state_declarators(&d.id, st, value_opt));
+                // `declarator.init && context.visit(declarator.init)`: no initializer stays none
+                let value = d.init.as_deref().map(|i| self.visit_in(node, i, st));
+                declarations.extend(self.create_state_declarators(&d.id, st, value));
             }
         }
         if declarations.is_empty() {
@@ -816,7 +813,7 @@ impl<'a, 's> Server<'a, 's> {
     }
 
     /// `create_state_declarators(declarator, scope, value)`
-    fn create_state_declarators(&mut self, id: &Node, st: &State, value: Node) -> Vec<Node> {
+    fn create_state_declarators(&mut self, id: &Node, st: &State, value: Option<Node>) -> Vec<Node> {
         if matches!(id.kind, NodeKind::Identifier(_)) {
             return vec![b::declarator(id.clone(), value)];
         }

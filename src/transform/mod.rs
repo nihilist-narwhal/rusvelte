@@ -3,6 +3,7 @@
 //! [`compile_css`].
 
 pub mod client;
+pub mod const_tags;
 pub mod css;
 pub mod js;
 pub mod options;
@@ -320,6 +321,7 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
         options::Generate::Server => {
             let conv = crate::estree::convert::Converter::new(&locator, root.ts);
             let mut s = server::Server {
+                error: Default::default(),
                 an: &mut analysis.an,
                 options: &combined,
                 conv,
@@ -336,11 +338,16 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
                 synthetic_class,
                 synthetic_style,
             };
-            server::server_component(&mut s, inject_css)
+            let program = server::server_component(&mut s, inject_css);
+            if let Some(e) = s.error.take() {
+                return Err(e);
+            }
+            program
         }
         options::Generate::Client => {
             let conv = crate::estree::convert::Converter::new(&locator, root.ts);
             let mut c = client::Client {
+                error: Default::default(),
                 an: &mut analysis.an,
                 options: &combined,
                 conv,
@@ -373,7 +380,11 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
             c.needs_props = c.an.needs_props;
             c.immutable = c.an.runes || combined.immutable;
             c.accessors = c.an.custom_element || (!c.an.runes && combined.accessors) || combined.component_api_4;
-            client::client_component(&mut c, inject_css)
+            let program = client::client_component(&mut c, inject_css);
+            if let Some(e) = c.error.take() {
+                return Err(e);
+            }
+            program
         }
         _ => return Err(CompileError { code: "unsupported", message: "generate: false is not supported".into(), position: None }),
     };
@@ -442,6 +453,7 @@ pub fn compile_module(source: &str, options: &options::CompileOptions) -> Result
         options::Generate::Server => {
             let conv = crate::estree::convert::Converter::new(&locator, false);
             let mut s = server::Server {
+                error: Default::default(),
                 an: &mut an,
                 options: &combined,
                 conv,
@@ -463,6 +475,7 @@ pub fn compile_module(source: &str, options: &options::CompileOptions) -> Result
         options::Generate::Client => {
             let conv = crate::estree::convert::Converter::new(&locator, false);
             let mut c = client::Client {
+                error: Default::default(),
                 an: &mut an,
                 options: &combined,
                 conv,

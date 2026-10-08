@@ -98,10 +98,55 @@ impl<'a, 's> Server<'a, 's> {
         }
     }
 
-    /// `clean_nodes(parent, nodes, path, namespace, state, preserve_whitespace, preserve_comments)`
-    pub fn clean_nodes(&self, parent: Parent, nodes: &[NodeId], namespace: &str, preserve_whitespace: bool, preserve_comments: bool) -> Cleaned<'s> {
+    /// `sort_const_tags(nodes, state)`: `{@const}` tags in topological order (legacy mode); a
+    /// cycle is recorded as the `const_tag_cycle` error and the nodes stay as they are
+    fn sort_const_tags(&self, nodes: &[NodeId], scope: crate::analyze::scope::ScopeId) -> Vec<NodeId> {
         let ast = self.ast();
-        // TODO: `sort_const_tags` in legacy mode
+        let sorted = crate::transform::const_tags::sort(nodes, |n| {
+            let TNode::ConstTag { id, init, .. } = &ast.nodes[n] else { return None };
+            let pattern = self.convert_pattern(id);
+            let bindings = js::extract_identifiers(&pattern).into_iter().filter_map(|i| self.get(scope, js::ident(i).unwrap())).collect();
+            let init = self.convert_expr(init);
+            let mut deps = Vec::new();
+            self.collect_deps(&init, None, scope, &mut deps);
+            Some(crate::transform::const_tags::ConstTag { node: n, bindings, deps })
+        });
+        match sorted {
+            Ok(sorted) => sorted,
+            Err((tag, cycle)) => {
+                let mut error = self.error.borrow_mut();
+                if error.is_none() {
+                    if let TNode::ConstTag { start, end, .. } = &ast.nodes[tag] {
+                        let names: Vec<&str> = cycle.iter().map(|&b| self.binding(b).node.name).collect();
+                        *error = Some(crate::errors::const_tag_cycle((*start, *end), &names.join(" → ")));
+                    }
+                }
+                nodes.to_vec()
+            }
+        }
+    }
+
+    /// The references of an expression (`walk` with `set_scope` and an `Identifier` visitor)
+    fn collect_deps(&self, n: &Node, parent: Option<&Node>, scope: crate::analyze::scope::ScopeId, out: &mut Vec<crate::analyze::scope::BindingId>) {
+        let scope = n.origin.and_then(|o| self.scope_of_key(o)).unwrap_or(scope);
+        if let NodeKind::Identifier(i) = &n.kind {
+            if js::is_reference(n, parent) {
+                if let Some(bnd) = self.get(scope, &i.name) {
+                    if !out.contains(&bnd) {
+                        out.push(bnd);
+                    }
+                }
+            }
+            return;
+        }
+        n.for_each_child(&mut |c| self.collect_deps(c, Some(n), scope, out));
+    }
+
+    /// `clean_nodes(parent, nodes, path, namespace, state, preserve_whitespace, preserve_comments)`
+    pub fn clean_nodes(&self, parent: Parent, nodes: &[NodeId], namespace: &str, scope: crate::analyze::scope::ScopeId, preserve_whitespace: bool, preserve_comments: bool) -> Cleaned<'s> {
+        let ast = self.ast();
+        let sorted = if !self.an.runes { self.sort_const_tags(nodes, scope) } else { nodes.to_vec() };
+        let nodes = &sorted[..];
         let mut hoisted = Vec::new();
         let mut regular: Vec<Child<'s>> = Vec::new();
         for &n in nodes {
@@ -414,7 +459,7 @@ impl<'a, 's> Server<'a, 's> {
     pub fn fragment_nodes(&mut self, f: FragId, nodes: &[NodeId], parent: Parent, st: &State) -> Node {
         let nodes = nodes.to_vec();
         let namespace = self.infer_namespace(st.namespace, parent, &nodes);
-        let cleaned = self.clean_nodes(parent, &nodes, namespace, st.preserve_whitespace, self.options.preserve_comments);
+        let cleaned = self.clean_nodes(parent, &nodes, namespace, st.scope, st.preserve_whitespace, self.options.preserve_comments);
         let state = State { init: shared(), template: shared(), namespace, is_standalone: cleaned.is_standalone, async_consts: Default::default(), ..st.clone() };
 
         self.path.push(PathNode::Tpl(P::Fragment(f)));
@@ -960,7 +1005,8 @@ impl<'a, 's> Server<'a, 's> {
             state.template.borrow_mut().push(b::literal(if node_is_void { "/>" } else { ">" }));
         }
 
-        let frag_nodes = ast.fragments[el.fragment].nodes.clone();
+        // a `<textarea>`'s dynamic children were moved into its `value` (`node.fragment.nodes = []`)
+        let frag_nodes = if self.an.textarea_values.contains(&n) { vec![] } else { ast.fragments[el.fragment].nodes.clone() };
         if (name == "script" || name == "style") && frag_nodes.len() == 1 {
             if let TNode::Text { data, .. } = &ast.nodes[frag_nodes[0]] {
                 state.template.borrow_mut().push(b::literal(data.as_ref()));
@@ -973,7 +1019,7 @@ impl<'a, 's> Server<'a, 's> {
             return;
         }
 
-        let cleaned = self.clean_nodes(Parent::Node(n), &frag_nodes, namespace, state.preserve_whitespace, self.options.preserve_comments);
+        let cleaned = self.clean_nodes(Parent::Node(n), &frag_nodes, namespace, state.scope, state.preserve_whitespace, self.options.preserve_comments);
         for &h in &cleaned.hoisted {
             self.visit_node(h, &state);
         }
@@ -991,9 +1037,8 @@ impl<'a, 's> Server<'a, 's> {
             let body_node = if is_option_special {
                 if let Some(svn) = meta.synthetic_value_node {
                     let TNode::ExpressionTag { expression, .. } = &ast.nodes[svn] else { unreachable!() };
-                    self.path.push(PathNode::Tpl(P::Node(svn)));
+                    // `context.visit(node.metadata.synthetic_value_node.expression)` from the element
                     let e = self.visit_template_expr_here(expression, &state);
-                    self.path.pop();
                     let m = self.meta_of_node(svn);
                     optimiser.transform(self, e, m)
                 } else {
@@ -1018,8 +1063,9 @@ impl<'a, 's> Server<'a, 's> {
                 statements.extend(build_template(std::mem::take(&mut *inner.template.borrow_mut())));
                 b::arrow(vec![b::id("$$renderer")], b::block(statements))
             };
-            self.path.pop();
+            // the attributes are visited from the element's visitor too (it's on the path)
             let mut args = self.prepare_element_spread_object(n, st, &mut optimiser);
+            self.path.pop();
             if customizable {
                 args.push(Some(b::r#true()));
             }

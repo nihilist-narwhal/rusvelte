@@ -127,6 +127,55 @@ impl<'a, 's> Server<'a, 's> {
         }
     }
 
+    /// `build_attribute_value(attribute.value, ...)` of the `value` the analysis makes out of a
+    /// `<textarea>`'s dynamic children (the first text lost one leading newline in the analysis,
+    /// and gets one back here if another follows)
+    fn build_textarea_children_value(&mut self, n: crate::ast::NodeId, st: &State, opt: &mut PromiseOptimiser) -> Node {
+        let ast = self.ast();
+        let TNode::Element(el) = &ast.nodes[n] else { return b::r#true() };
+        let nodes = ast.fragments[el.fragment].nodes.clone();
+        let text_of = |i: usize, data: &str| -> String {
+            if i != 0 {
+                return data.to_string();
+            }
+            let stripped = data.strip_prefix("\r\n").or_else(|| data.strip_prefix('\n')).unwrap_or(data);
+            if starts_with_newline(stripped) { format!("\n{stripped}") } else { stripped.to_string() }
+        };
+        if nodes.len() == 1 {
+            return match &ast.nodes[nodes[0]] {
+                TNode::Text { data, .. } => b::literal(escape_html(&text_of(0, data), true).as_str()),
+                TNode::ExpressionTag { expression, .. } => {
+                    let e = self.visit_expr_here(expression, st);
+                    let meta = self.meta_of_node(nodes[0]);
+                    opt.transform(self, e, meta)
+                }
+                _ => b::r#true(),
+            };
+        }
+        let mut quasis: Vec<(String, bool)> = vec![(String::new(), false)];
+        let mut expressions = Vec::new();
+        let len = nodes.len();
+        for (i, &c) in nodes.iter().enumerate() {
+            match &ast.nodes[c] {
+                TNode::Text { data, .. } => quasis.last_mut().unwrap().0.push_str(&text_of(i, data)),
+                TNode::ExpressionTag { expression, .. } => {
+                    let evaluated = self.evaluate_expr(expression, st.scope);
+                    if evaluated.is_known {
+                        quasis.last_mut().unwrap().0.push_str(&evaluated_string(&evaluated.value));
+                    } else {
+                        let e = self.visit_expr_here(expression, st);
+                        let meta = self.meta_of_node(c);
+                        let e = opt.transform(self, e, meta);
+                        expressions.push(if evaluated.is_string && evaluated.is_defined { e } else { b::call("$.stringify", vec![e]) });
+                        quasis.push((String::new(), i + 1 == len));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if expressions.is_empty() { b::literal(quasis[0].0.as_str()) } else { template_from(quasis, expressions) }
+    }
+
     /// `get_attribute_name(element, attribute)`
     fn attribute_name(&self, n: NodeId, name: &str) -> String {
         let m = self.an.node_meta.get(&n).cloned().unwrap_or_default();
@@ -160,7 +209,10 @@ impl<'a, 's> Server<'a, 's> {
             match a {
                 Attr::Attribute { name, value, .. } => {
                     if *name == "value" {
-                        if el.name == "textarea" {
+                        if el.name == "textarea" && self.an.textarea_values.contains(&n) && is_textarea_value(a) {
+                            let v = self.build_textarea_children_value(n, st, opt);
+                            content = Some(b::call("$.escape", vec![v]));
+                        } else if el.name == "textarea" {
                             let newline = matches!(value, AttrValue::Sequence(c) if matches!(c.first(), Some(Chunk::Text { data, .. }) if starts_with_newline(data)));
                             let v = self.build_attribute_value(value, st, opt, false, false, newline);
                             content = Some(b::call("$.escape", vec![v]));
@@ -542,4 +594,9 @@ fn strict_ws_collapse(s: &str) -> String {
         }
     }
     out
+}
+
+/// The synthetic `value` attribute of a `<textarea>` with dynamic children
+fn is_textarea_value(a: &Attr) -> bool {
+    super::super::client::fragment::TEXTAREA_VALUE.with(|v| std::ptr::eq(*v as *const Attr, a as *const Attr))
 }

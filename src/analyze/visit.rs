@@ -3951,39 +3951,40 @@ pub fn order_reactive_statements(an: &mut Analyzer) -> Res {
     Ok(())
 }
 
-fn check_graph_for_cycles<'a>(edges: &[(&'a str, &'a str)]) -> Option<Vec<&'a str>> {
-    let mut graph: indexmap::IndexMap<&str, Vec<&str>> = indexmap::IndexMap::new();
+/// `check_graph_for_cycles(edges)`: the first cycle found (`[...on_stack, w]`), or none
+pub(crate) fn check_graph_for_cycles<T: Copy + Eq + std::hash::Hash>(edges: &[(T, T)]) -> Option<Vec<T>> {
+    let mut graph: indexmap::IndexMap<T, Vec<T>> = indexmap::IndexMap::new();
     for &(u, v) in edges {
         graph.entry(u).or_default();
         graph.entry(v).or_default();
-        graph.get_mut(u).unwrap().push(v);
+        graph.get_mut(&u).unwrap().push(v);
     }
-    let mut visited: Vec<&str> = Vec::new();
-    let mut on_stack: indexmap::IndexSet<&str> = indexmap::IndexSet::new();
-    let mut cycles: Vec<Vec<&str>> = Vec::new();
-    fn visit<'a>(
-        v: &'a str,
-        graph: &indexmap::IndexMap<&'a str, Vec<&'a str>>,
-        visited: &mut Vec<&'a str>,
-        on_stack: &mut indexmap::IndexSet<&'a str>,
-        cycles: &mut Vec<Vec<&'a str>>,
+    let mut visited: rustc_hash::FxHashSet<T> = Default::default();
+    let mut on_stack: indexmap::IndexSet<T> = indexmap::IndexSet::new();
+    let mut cycles: Vec<Vec<T>> = Vec::new();
+    fn visit<T: Copy + Eq + std::hash::Hash>(
+        v: T,
+        graph: &indexmap::IndexMap<T, Vec<T>>,
+        visited: &mut rustc_hash::FxHashSet<T>,
+        on_stack: &mut indexmap::IndexSet<T>,
+        cycles: &mut Vec<Vec<T>>,
     ) {
-        visited.push(v);
+        visited.insert(v);
         on_stack.insert(v);
-        if let Some(ws) = graph.get(v) {
+        if let Some(ws) = graph.get(&v) {
             for &w in ws {
                 if !visited.contains(&w) {
                     visit(w, graph, visited, on_stack, cycles);
-                } else if on_stack.contains(w) {
-                    let mut c: Vec<&str> = on_stack.iter().copied().collect();
+                } else if on_stack.contains(&w) {
+                    let mut c: Vec<T> = on_stack.iter().copied().collect();
                     c.push(w);
                     cycles.push(c);
                 }
             }
         }
-        on_stack.shift_remove(v);
+        on_stack.shift_remove(&v);
     }
-    let keys: Vec<&str> = graph.keys().copied().collect();
+    let keys: Vec<T> = graph.keys().copied().collect();
     for v in keys {
         if !visited.contains(&v) {
             visit(v, &graph, &mut visited, &mut on_stack, &mut cycles);

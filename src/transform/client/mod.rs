@@ -14,7 +14,7 @@ mod blocks;
 mod component;
 mod directives;
 mod element;
-mod fragment;
+pub(crate) mod fragment;
 mod js_visitors;
 mod template;
 mod utils;
@@ -136,6 +136,8 @@ impl State {
 }
 
 pub struct Client<'a, 's> {
+    /// A compile error the transform raises (`const_tag_cycle`); the first one wins
+    pub error: std::cell::RefCell<Option<crate::error::CompileError>>,
     pub(crate) an: &'a mut Analyzer<'s>,
     pub options: &'a CompileOptions,
     pub conv: Converter<'a>,

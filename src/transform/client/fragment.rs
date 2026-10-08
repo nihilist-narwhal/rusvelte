@@ -175,55 +175,39 @@ impl<'a, 's> Client<'a, 's> {
         }
     }
 
-    /// `sort_const_tags(nodes, state)`: `{@const}` tags in topological order (legacy mode)
+    /// `sort_const_tags(nodes, state)`: `{@const}` tags in topological order (legacy mode); a
+    /// cycle is recorded as the `const_tag_cycle` error and the nodes stay as they are
     fn sort_const_tags(&self, nodes: &[NodeId], scope: crate::analyze::scope::ScopeId) -> Vec<NodeId> {
         let ast = self.ast();
-        let mut other = Vec::new();
-        // (binding, tag node, deps)
-        let mut tags: Vec<(crate::analyze::scope::BindingId, NodeId, Vec<crate::analyze::scope::BindingId>)> = Vec::new();
-        for &n in nodes {
-            if let TNode::ConstTag { id, init, .. } = &ast.nodes[n] {
-                let pattern = self.convert_const_pattern(id);
-                let bindings: Vec<_> = super::super::js::extract_identifiers(&pattern)
-                    .into_iter()
-                    .filter_map(|i| self.get(scope, super::super::js::ident(i).unwrap()))
-                    .collect();
-                let init = self.convert_expr(init);
-                let mut deps = Vec::new();
-                self.collect_deps(&init, None, scope, &mut deps);
-                for bnd in bindings {
-                    match tags.iter_mut().find(|t| t.0 == bnd) {
-                        Some(t) => {
-                            t.1 = n;
-                            t.2 = deps.clone();
-                        }
-                        None => tags.push((bnd, n, deps.clone())),
-                    }
-                }
-            } else {
-                other.push(n);
+        let sorted = crate::transform::const_tags::sort(nodes, |n| {
+            let TNode::ConstTag { id, init, .. } = &ast.nodes[n] else { return None };
+            let pattern = self.convert_const_pattern(id);
+            let bindings = super::super::js::extract_identifiers(&pattern)
+                .into_iter()
+                .filter_map(|i| self.get(scope, super::super::js::ident(i).unwrap()))
+                .collect();
+            let init = self.convert_expr(init);
+            let mut deps = Vec::new();
+            self.collect_deps(&init, None, scope, &mut deps);
+            Some(crate::transform::const_tags::ConstTag { node: n, bindings, deps })
+        });
+        match sorted {
+            Ok(sorted) => sorted,
+            Err((tag, cycle)) => {
+                self.record_const_tag_cycle(tag, &cycle);
+                nodes.to_vec()
             }
         }
-        if tags.is_empty() {
-            return nodes.to_vec();
+    }
+
+    /// `e.const_tag_cycle(tag.node, ...)`: the first one is the compile error
+    fn record_const_tag_cycle(&self, tag: NodeId, cycle: &[crate::analyze::scope::BindingId]) {
+        let mut error = self.error.borrow_mut();
+        if error.is_none() {
+            let TNode::ConstTag { start, end, .. } = &self.ast().nodes[tag] else { return };
+            let names: Vec<&str> = cycle.iter().map(|&b| self.binding(b).node.name).collect();
+            *error = Some(crate::errors::const_tag_cycle((*start, *end), &names.join(" → ")));
         }
-        let mut sorted: Vec<NodeId> = Vec::new();
-        fn add(tag: usize, tags: &[(u32, NodeId, Vec<u32>)], sorted: &mut Vec<NodeId>, depth: usize) {
-            if sorted.contains(&tags[tag].1) || depth > 1000 {
-                return;
-            }
-            for dep in &tags[tag].2 {
-                if let Some(i) = tags.iter().position(|t| t.0 == *dep) {
-                    add(i, tags, sorted, depth + 1);
-                }
-            }
-            sorted.push(tags[tag].1);
-        }
-        for i in 0..tags.len() {
-            add(i, &tags, &mut sorted, 0);
-        }
-        sorted.extend(other);
-        sorted
     }
 
     /// The references of an expression (`walk` with `set_scope` and an `Identifier` visitor)
