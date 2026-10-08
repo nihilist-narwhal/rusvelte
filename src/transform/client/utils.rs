@@ -188,10 +188,13 @@ impl<'a, 's> Client<'a, 's> {
     pub fn convert_expr(&self, e: &Expr<'s>) -> Node {
         match e {
             Expr::Js(js) => self.conv.expression(js.effective_root()),
-            Expr::Ident { name, start, end, .. } => {
+            Expr::Ident { name, start, end, loc } => {
                 let mut id = b::id(name.as_str());
                 id.span = Some(crate::estree::Span::new(*start as u32, *end as u32));
-                id.loc = Some(self.conv.location(oxc_span::Span::new(*start as u32, *end as u32)));
+                // the identifiers Svelte's parser makes for `bind:x` / `class:x` have no `loc`
+                if matches!(loc, crate::ast::IdentLoc::Svelte) {
+                    id.loc = Some(self.conv.location(oxc_span::Span::new(*start as u32, *end as u32)));
+                }
                 id.origin = Some(P::TplExpr(e).key());
                 id
             }
@@ -200,8 +203,8 @@ impl<'a, 's> Client<'a, 's> {
                     value: LiteralValue::String(value.as_str().into()),
                     raw: Some(raw.as_str().into()),
                 }));
+                // no `loc` (`<svelte:element this="div">`)
                 l.span = Some(crate::estree::Span::new(*start as u32, *end as u32));
-                l.loc = Some(self.conv.location(oxc_span::Span::new(*start as u32, *end as u32)));
                 l.origin = Some(P::TplExpr(e).key());
                 l
             }
