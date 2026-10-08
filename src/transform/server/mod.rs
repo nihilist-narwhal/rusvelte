@@ -53,7 +53,9 @@ pub struct State {
     pub is_standalone: bool,
     pub init: Shared<Node>,
     pub template: Shared<Node>,
-    pub async_consts: Option<Rc<RefCell<AsyncConsts>>>,
+    /// `state.async_consts`: set (`??=`) on the state object of the fragment or element that
+    /// owns the `{@const}` tags, so it's a cell shared by the copies made after it
+    pub async_consts: Rc<RefCell<Option<AsyncConsts>>>,
     /// index into `Analyzer::state_fields` for the class body being transformed
     pub state_fields: Option<u32>,
 }
@@ -182,7 +184,7 @@ pub fn server_component(s: &mut Server) -> Node {
         is_standalone: false,
         init: shared(),
         template: shared(),
-        async_consts: None,
+        async_consts: Default::default(),
         state_fields: None,
     };
 

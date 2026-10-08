@@ -4,7 +4,8 @@
 use crate::analyze::nodes::P;
 use crate::ast::{Expr, FragId, Node as TNode, NodeId};
 use crate::estree::builders as b;
-use crate::estree::Node;
+use crate::estree::{Node, NodeKind};
+use crate::transform::js;
 
 use super::super::js::PathNode;
 use super::utils::{build_template, create_child_block, prepend_block_marker, PromiseOptimiser, BLOCK_CLOSE, BLOCK_OPEN, BLOCK_OPEN_ELSE, EMPTY_COMMENT};
@@ -352,7 +353,7 @@ impl<'a, 's> Server<'a, 's> {
 
     /// `metadata.blockers()`
     pub fn meta_blockers_array(&self, meta: u32) -> Node {
-        b::array(self.an.meta_blockers(meta).into_iter().map(super::utils::blocker_expression).collect::<Vec<_>>())
+        b::array(self.an.meta_blockers(meta).into_iter().map(|bl| super::utils::blocker_expression(self, bl)).collect::<Vec<_>>())
     }
 
     /// `scope.evaluate(expression)`
@@ -414,7 +415,7 @@ impl<'a, 's> Server<'a, 's> {
         let nodes = nodes.to_vec();
         let namespace = self.infer_namespace(st.namespace, parent, &nodes);
         let cleaned = self.clean_nodes(parent, &nodes, namespace, st.preserve_whitespace, self.options.preserve_comments);
-        let state = State { init: shared(), template: shared(), namespace, is_standalone: cleaned.is_standalone, async_consts: None, ..st.clone() };
+        let state = State { init: shared(), template: shared(), namespace, is_standalone: cleaned.is_standalone, async_consts: Default::default(), ..st.clone() };
 
         self.path.push(PathNode::Tpl(P::Fragment(f)));
         for &h in &cleaned.hoisted {
@@ -426,12 +427,7 @@ impl<'a, 's> Server<'a, 's> {
         self.process_children(&cleaned.trimmed, &state);
         self.path.pop();
 
-        if let Some(ac) = &state.async_consts {
-            let ac = ac.borrow();
-            if !ac.thunks.is_empty() {
-                state.init.borrow_mut().push(b::var(b::id(ac.id.as_str()), b::call("$$renderer.run", vec![b::array(ac.thunks.clone())])));
-            }
-        }
+        self.push_async_consts(&state);
         let mut body = std::mem::take(&mut *state.init.borrow_mut());
         body.extend(build_template(std::mem::take(&mut *state.template.borrow_mut())));
         b::block(body)
@@ -509,13 +505,107 @@ impl<'a, 's> Server<'a, 's> {
                 let id = self.visit_js(&id, st);
                 let init = self.convert_expr(init);
                 let init = self.visit_js(&init, st);
-                // TODO: async `{@const}` (`metadata.promises_id`)
-                st.init.borrow_mut().push(b::r#const(id, init));
+                if self.an.promises_id.contains_key(&n) {
+                    let ids = js::extract_identifiers(&id).into_iter().cloned().collect();
+                    let assignment = b::stmt(b::assignment("=", id, init));
+                    self.add_async_declaration(n, st, ids, vec![assignment], "let");
+                } else {
+                    st.init.borrow_mut().push(b::r#const(id, init));
+                }
+            }
+            TNode::DeclarationTag { declaration, .. } => {
+                if let crate::ast::Declaration::Js(stmt) = declaration {
+                    let node = self.conv.statement(&stmt.stmt);
+                    let declaration = self.visit_js(&node, st);
+                    match (&declaration.kind, self.an.promises_id.contains_key(&n) && node.is("VariableDeclaration")) {
+                        (NodeKind::VariableDeclaration(v), true) => {
+                            // `build_async_declaration_parts(declaration)`
+                            let mut ids: Vec<Node> = Vec::new();
+                            for d in &v.declarations {
+                                let NodeKind::VariableDeclarator(d) = &d.kind else { continue };
+                                for id in js::extract_identifiers(&d.id) {
+                                    let name = js::ident(id).unwrap_or("");
+                                    match ids.iter_mut().find(|x| js::ident(x) == Some(name)) {
+                                        Some(x) => *x = id.clone(),
+                                        None => ids.push(id.clone()),
+                                    }
+                                }
+                            }
+                            let assignments = v
+                                .declarations
+                                .iter()
+                                .filter_map(|d| match &d.kind {
+                                    NodeKind::VariableDeclarator(d) => d.init.as_ref().map(|i| b::stmt(b::assignment("=", (*d.id).clone(), (**i).clone()))),
+                                    _ => None,
+                                })
+                                .collect();
+                            let kind = v.kind.as_str().to_string();
+                            self.add_async_declaration(n, st, ids, assignments, &kind);
+                        }
+                        _ => st.init.borrow_mut().push(declaration),
+                    }
+                }
             }
             TNode::DebugTag { identifiers, .. } => self.debug_tag(identifiers, st),
             _ => {}
         }
         self.path.pop();
+    }
+
+    /// `var promises = $$renderer.run([...thunks])` of a fragment's async `{@const}` tags
+    fn push_async_consts(&mut self, state: &State) {
+        if let Some(ac) = state.async_consts.borrow().as_ref() {
+            if !ac.thunks.is_empty() {
+                state.init.borrow_mut().push(b::var(b::id(ac.id.as_str()), b::call("$$renderer.run", vec![b::array(ac.thunks.clone())])));
+            }
+        }
+    }
+
+    /// `add_async_declaration(context, metadata, ids, assignments, kind)`
+    fn add_async_declaration(&mut self, n: NodeId, st: &State, ids: Vec<Node>, assignments: Vec<Node>, kind: &str) {
+        let promises = self.an.promises_id[&n];
+        if st.async_consts.borrow().is_none() {
+            *st.async_consts.borrow_mut() = Some(super::AsyncConsts { id: self.an.promise_ids[promises as usize].clone(), thunks: Vec::new() });
+        }
+        for id in &ids {
+            let name = js::ident(id).unwrap_or("");
+            st.init.borrow_mut().push(if kind == "var" { b::var(b::id(name), None) } else { b::r#let(b::id(name), None) });
+        }
+        let current = st.async_consts.borrow().as_ref().map(|a| a.id.clone());
+        let meta = self.meta_of_node(n);
+        let blockers: Vec<Node> = self.an.metas[meta as usize]
+            .references
+            .iter()
+            .filter_map(|&r| self.binding(r).blocker)
+            .filter(|bl| {
+                let obj = match bl.object {
+                    Some(o) => self.an.promise_ids[o as usize].as_str(),
+                    None => "$$promises",
+                };
+                current.as_deref() != Some(obj)
+            })
+            .map(|bl| super::utils::blocker_expression(self, bl))
+            .collect();
+        let mut thunks = Vec::new();
+        if blockers.len() == 1 {
+            thunks.push(b::thunk(blockers.into_iter().next().unwrap()));
+        } else if !blockers.is_empty() {
+            thunks.push(b::thunk(b::call("Promise.all", vec![b::array(blockers)])));
+        }
+        // keep the number of thunks pushed in sync with analysis phase
+        let has_await = self.an.metas[meta as usize].has_await || assignments.iter().any(b::has_await_expression);
+        let body = if assignments.len() == 1 {
+            match assignments.into_iter().next().unwrap().kind {
+                NodeKind::ExpressionStatement(e) => *e.expression,
+                kind => Node { kind, ..b::empty() },
+            }
+        } else {
+            b::block(assignments)
+        };
+        thunks.push(b::thunk_with(body, has_await));
+        if let Some(ac) = st.async_consts.borrow_mut().as_mut() {
+            ac.thunks.extend(thunks);
+        }
     }
 
     /// A template pattern (`{#each}` context, `{:then}` value, `{@const}` id) as ESTree
@@ -775,7 +865,7 @@ impl<'a, 's> Server<'a, 's> {
         for id in &ids {
             if let Some(name) = super::super::js::ident(id) {
                 if let Some(bl) = self.get(st.scope, name).and_then(|b| self.binding(b).blocker) {
-                    blockers.push(super::utils::blocker_expression(bl));
+                    blockers.push(super::utils::blocker_expression(self, bl));
                 }
             }
         }
@@ -841,7 +931,7 @@ impl<'a, 's> Server<'a, 's> {
             preserve_whitespace: st.preserve_whitespace || el.name == "pre" || el.name == "textarea",
             init: shared(),
             template: shared(),
-            async_consts: None,
+            async_consts: Default::default(),
             ..st.clone()
         };
         let attribute_state = State { scope: st.scope, ..state.clone() };
@@ -968,6 +1058,9 @@ impl<'a, 's> Server<'a, 's> {
         }
         self.path.pop();
 
+        if has_child_declarations {
+            self.push_async_consts(&state);
+        }
         let init = std::mem::take(&mut *state.init.borrow_mut());
         let template = std::mem::take(&mut *state.template.borrow_mut());
         if has_child_declarations {

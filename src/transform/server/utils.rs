@@ -190,8 +190,8 @@ pub fn create_child_block(statements: Vec<Node>, blockers: Node, has_await: bool
 pub struct PromiseOptimiser {
     pub expressions: Vec<Node>,
     pub has_await: bool,
-    /// blocker objects, deduplicated by identity
-    blockers: Vec<crate::analyze::blockers::Blocker>,
+    /// blocker objects (and their expressions), deduplicated by identity
+    blockers: Vec<(crate::analyze::blockers::Blocker, Node)>,
     /// `(expression) => expression` in place of `optimiser.transform`
     pub identity: bool,
 }
@@ -219,8 +219,8 @@ impl PromiseOptimiser {
     pub fn check_blockers(&mut self, s: &Server, meta: u32) {
         for &r in &s.an.metas[meta as usize].references {
             if let Some(bl) = s.binding(r).blocker {
-                if !self.blockers.contains(&bl) {
-                    self.blockers.push(bl);
+                if !self.blockers.iter().any(|(b, _)| *b == bl) {
+                    self.blockers.push((bl, blocker_expression(s, bl)));
                 }
             }
         }
@@ -249,7 +249,7 @@ impl PromiseOptimiser {
     }
 
     pub fn blockers(&self) -> Node {
-        b::array(self.blockers.iter().map(|bl| blocker_expression(*bl)).collect::<Vec<_>>())
+        b::array(self.blockers.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>())
     }
 
     pub fn is_async(&self) -> bool {
@@ -281,9 +281,13 @@ impl PromiseOptimiser {
     }
 }
 
-/// `$$promises[i]`
-pub fn blocker_expression(bl: crate::analyze::blockers::Blocker) -> Node {
-    b::member_with(b::id("$$promises"), b::literal(bl.index as f64), true, false)
+/// `$$promises[i]`, or `promises[i]` of an async `{@const}`
+pub fn blocker_expression(s: &Server, bl: crate::analyze::blockers::Blocker) -> Node {
+    let object = match bl.object {
+        Some(o) => s.an.promise_ids[o as usize].as_str(),
+        None => "$$promises",
+    };
+    b::member_with(b::id(object), b::literal(bl.index as f64), true, false)
 }
 
 /// `prepend_block_marker(block, marker)`
