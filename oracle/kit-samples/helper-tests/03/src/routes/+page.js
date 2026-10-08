@@ -1,0 +1,1 @@
+/** @param {import('./$types.js').PageLoadEvent} e */ export function load(e) { return e; }
