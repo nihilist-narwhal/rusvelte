@@ -25,7 +25,7 @@ original by diffing outputs over large corpora.
 | svelte-check-rs, compiler warnings | identical to svelte-check on the private app and Windmill (89 warnings) |
 | svelte-check-rs, CSS diagnostics (`css`/`scss`/`less`) | identical to svelte-check on Windmill (96 warnings in all); the CSS linter matches svelte-check's on 4,567/4,567 Svelte tests, Windmill, the private app and 47,072 synthetic files |
 | CSS output (`css.code`, `css.hasGlobal`, injected styles) | byte-identical on every component of the code generation oracle (Svelte test suites 6,929 compilations, the private app 342, Windmill 3,964), plus `dev`/`css: 'injected'` variants and the CSS linter's 31,418 synthetic files (1 differs: oxc rejects a mangled TypeScript expression acorn accepts) |
-| JS printer (esrap 2.4.0 `ts({ comments })`) | byte-identical code and source map mappings on 20,190 JS files: Svelte's snapshot expectations 74/74, Svelte's sources 368/368, `node_modules` 4,747/4,747 (oracle and a Windmill sample, minified files included), and the compiler's output for every component of the code generation oracle re-parsed (Svelte test suites 6,975, the private app 342, Windmill 3,964) |
+| JS printer (esrap 2.4.0 `ts({ comments })`) | byte-identical code and source map mappings on 16,470 JS files: Svelte's snapshot expectations 74/74, Svelte's sources 368/368, `node_modules` 4,747/4,747 (oracle and a Windmill sample, minified files included), and the compiler's output for every component of the code generation oracle re-parsed (Svelte test suites 6,975, the private app 342, Windmill 3,964) |
 
 The remaining svelte2tsx mismatches are 2 scripts that oxc can't parse but TypeScript
 recovers from, and 2 samples where npm 0.7.61 throws but the current language-tools source
