@@ -709,8 +709,16 @@ where
     use AstKind as K;
     match k {
         K::Program(p) => {
+            let ts = p.source_type.is_typescript();
             for s in &p.body {
-                go!(cx, f, statement(s));
+                // `remove_typescript_nodes` removes an export whose specifiers (once the type
+                // ones are filtered out) are none, even `export {}`
+                let empty_export = match s {
+                    Statement::ExportNamedDeclaration(x) => x.specifiers.is_empty(),
+                    Statement::ExportFromDeclaration(x) => x.specifiers.is_empty(),
+                    _ => false,
+                };
+                go!(cx, f, if ts && empty_export { P::Empty } else { statement(s) });
             }
         }
         K::BlockStatement(b) => {

@@ -795,7 +795,8 @@ impl<'s> Analyzer<'s> {
 
         match rune {
             None => {
-                if !self.is_safe_identifier(nodes::expr(&c.callee), st.scope) {
+                let parenthesized = matches!(c.callee, Expression::ParenthesizedExpression(_)) && self.in_snippet_parameters();
+                if parenthesized || !self.is_safe_identifier(nodes::expr(&c.callee), st.scope) {
                     self.needs_context = true;
                 }
             }
@@ -1028,12 +1029,26 @@ impl<'s> Analyzer<'s> {
 
     /// `is_safe_identifier`
     pub(crate) fn is_safe_identifier(&self, expression: P<'s>, scope: super::ScopeId) -> bool {
+        // a snippet's parameters keep their `ParenthesizedExpression`s (no `remove_parens`),
+        // which stop the walk
+        let parens = self.in_snippet_parameters();
         let mut node = expression;
         while is_member(node) {
+            if parens && member_object_is_parenthesized(node) {
+                return false;
+            }
             node = scope::member_object(node).unwrap();
         }
         let Some(id) = ident(node) else { return false };
         self.is_safe_name(id.name, scope)
+    }
+
+    /// Whether the node being visited is in a snippet's parameters
+    pub(crate) fn in_snippet_parameters(&self) -> bool {
+        match self.path.iter().rev().find(|q| !matches!(q, P::Js(_) | P::ParamDefault(_) | P::AtpiDefault(_))) {
+            Some(P::Node(n)) => matches!(self.ast.nodes[*n], Node::SnippetBlock { .. }),
+            _ => false,
+        }
     }
 
     fn is_safe_name(&self, name: &str, scope: super::ScopeId) -> bool {
@@ -1847,6 +1862,16 @@ fn extract_paths<'s>(p: P<'s>) -> smallvec::SmallVec<[(P<'s>, bool); 4]> {
     let _ = K::Program;
     go(p, &mut out);
     out
+}
+
+fn member_object_is_parenthesized(p: P) -> bool {
+    let object = match p {
+        P::Js(AstKind::StaticMemberExpression(m)) => &m.object,
+        P::Js(AstKind::ComputedMemberExpression(m)) => &m.object,
+        P::Js(AstKind::PrivateFieldExpression(m)) => &m.object,
+        _ => return false,
+    };
+    matches!(object, Expression::ParenthesizedExpression(_))
 }
 
 fn dummy_id<'s>() -> Id<'s> {
@@ -3726,28 +3751,31 @@ pub fn legacy_exports(an: &mut Analyzer) {
                     }
                 }
             }
-            P::Js(AstKind::ExportNamedDeclaration(d)) => {
+            P::Js(AstKind::ExportNamedDeclaration(ExportNamedDeclaration { specifiers, .. }))
+            | P::Js(AstKind::ExportFromDeclaration(ExportFromDeclaration { specifiers, .. })) => {
                 an.needs_props = true;
-                for s in &d.specifiers {
+                // (a re-export's local names are looked up in the instance scope too)
+                for s in specifiers {
                     if s.export_kind.is_type() {
                         continue;
                     }
-                    let (ModuleExportName::IdentifierReference(local), ModuleExportName::IdentifierName(exported)) =
-                        (&s.local, &s.exported)
-                    else {
-                        continue;
+                    let local = match &s.local {
+                        ModuleExportName::IdentifierReference(x) => x.name.as_str(),
+                        ModuleExportName::IdentifierName(x) => x.name.as_str(),
+                        ModuleExportName::StringLiteral(_) => continue,
                     };
-                    if let Some(b) = an.get(an.instance_scope, local.name.as_str()) {
+                    let ModuleExportName::IdentifierName(exported) = &s.exported else { continue };
+                    if let Some(b) = an.get(an.instance_scope, local) {
                         let binding = an.sc.binding_mut(b);
                         if matches!(binding.declaration_kind, DeclKind::Var | DeclKind::Let) {
                             binding.kind = Kind::BindableProp;
-                            if exported.name != local.name {
+                            if exported.name != local {
                                 binding.prop_alias = Some(exported.name.as_str());
                             }
                             continue;
                         }
                     }
-                    an.exports.push((local.name.to_string(), Some(exported.name.to_string())));
+                    an.exports.push((local.to_string(), Some(exported.name.to_string())));
                 }
             }
             _ => {}
