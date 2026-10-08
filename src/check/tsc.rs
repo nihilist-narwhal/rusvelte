@@ -41,6 +41,10 @@ fn resolve_package(name: &str, dir: &Path) -> Option<PathBuf> {
 /// The TypeScript 7 executable for a project: `@typescript/native` (an alias of `typescript@7`)
 /// or `@typescript/native-preview`, and the platform package that ships the binary
 pub fn find_tsgo(tsconfig_dir: &Path) -> Result<PathBuf, String> {
+    // a specific compiler binary (e.g. another TypeScript 7 build)
+    if let Some(exe) = std::env::var_os("SVELTE_CHECK_TSGO") {
+        return Ok(PathBuf::from(exe));
+    }
     for name in ["@typescript/native", "@typescript/native-preview"] {
         let Some(pkg_json) = resolve_package(name, tsconfig_dir) else { continue };
         let Ok(text) = std::fs::read_to_string(&pkg_json) else { continue };
@@ -78,6 +82,10 @@ pub fn find_tsgo(tsconfig_dir: &Path) -> Result<PathBuf, String> {
 pub fn start(exe: &Path, tsconfig: &Path, cwd: &Path, build_info: Option<&Path>) -> Result<std::process::Child, String> {
     let mut cmd = Command::new(exe);
     cmd.arg("-p").arg(tsconfig).args(["--pretty", "true", "--noErrorTruncation"]);
+    // extra compiler flags, e.g. `--singleThreaded` to compare compilers deterministically
+    if let Some(extra) = std::env::var_os("SVELTE_CHECK_TSGO_ARGS") {
+        cmd.args(extra.to_string_lossy().split_whitespace());
+    }
     if let Some(b) = build_info {
         cmd.arg("--incremental").arg("--tsBuildInfoFile").arg(b);
     }

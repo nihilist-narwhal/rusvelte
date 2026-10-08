@@ -79,6 +79,10 @@ Options follow svelte-check:
 
 `--timings` prints where the time went.
 
+`SVELTE_CHECK_TSGO=/path/to/tsgo` uses another TypeScript 7 binary, such as
+[tsc-rs](https://github.com/pingdotgg/ts-rust), and `SVELTE_CHECK_TSGO_ARGS` passes it extra
+flags (`--singleThreaded` makes results independent of how files are split between checkers).
+
 ## Analysis
 
 `svelte_rs::analyze::compile_diagnostics(source, filename)` reproduces the `warnings` of
