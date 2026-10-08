@@ -125,7 +125,8 @@ for (const rel of files) {
 		if (r.css) with_css++;
 	} catch (e) {
 		errors++;
-		result.error = e.code ?? String(e.message).split('\n')[0];
+		if (e.code) result.error = e.code;
+		else result.crash = String(e.message).split('\n')[0]; // e.g. a stack overflow
 	}
 	const id = rel.replaceAll('/', '__');
 	fs.writeFileSync(path.join(out, id + '.json'), JSON.stringify(result));

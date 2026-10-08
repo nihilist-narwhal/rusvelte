@@ -91,6 +91,10 @@ fn main() {
             continue;
         }
         let mut expected: Value = serde_json::from_str(&std::fs::read_to_string(out.join(format!("{id}.json"))).unwrap()).unwrap();
+        // the JS compiler crashed (a stack overflow on very deep nesting): not comparable
+        if expected.get("crash").is_some() {
+            continue;
+        }
         if codegen {
             if expected["module"].as_bool() == Some(true) {
                 continue;
