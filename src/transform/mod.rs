@@ -227,6 +227,7 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
         custom_element: options.custom_element,
         experimental_async: options.experimental_async,
         namespace: Some(combined.namespace.clone()),
+        name: options.name.clone(),
     };
     let mut analysis = analyze::analyze_component(&alloc, &component, source, &options.filename, &analyze_options, &mut warnings)?;
 

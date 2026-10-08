@@ -68,6 +68,8 @@ pub struct CompileOptions {
     pub experimental_async: bool,
     /// `namespace` (`html` when `None`); `<svelte:options namespace>` overrides it
     pub namespace: Option<String>,
+    /// `name`: the component's name (otherwise derived from the filename)
+    pub name: Option<String>,
 }
 
 /// The warnings `svelte.compile(source, { dev: true, generate: false, filename })` reports,
@@ -765,7 +767,7 @@ pub(crate) fn analyze_component<'s>(
         }
     }
 
-    an.name = an.sc.generate(module.scope, &component_name);
+    an.name = an.sc.generate(module.scope, compile_options.name.as_deref().unwrap_or(&component_name));
 
     an.maybe_runes = !runes && runes_option != Some(false) && {
         let refs = &an.sc.scope(module.scope).references;

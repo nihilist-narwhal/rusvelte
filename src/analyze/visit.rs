@@ -445,6 +445,17 @@ impl<'s> Analyzer<'s> {
     }
 
     fn visit_function(&mut self, p: P<'s>, st: &State<'s>) -> Res {
+        // the references of the function from outside it
+        if let Some(m) = st.expression {
+            let names: Vec<&'s str> = self.sc.scope(st.scope).ref_names.iter().copied().collect();
+            for name in names {
+                if let Some(b) = self.get(st.scope, name) {
+                    if self.binding(b).scope != st.scope && !self.metas[m as usize].references.contains(&b) {
+                        self.metas[m as usize].references.push(b);
+                    }
+                }
+            }
+        }
         let depth = self.sc.scope(st.scope).function_depth.max(st.function_depth) + 1;
         self.next(p, &State { function_depth: depth, expression: None, ..*st })
     }

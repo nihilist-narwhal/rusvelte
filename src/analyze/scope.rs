@@ -119,7 +119,7 @@ pub struct Scope<'s> {
     pub track_refs: bool,
     /// every name referenced in this scope (`references.has(name)`), whether or not
     /// `references` is kept
-    pub ref_names: FxHashSet<&'s str>,
+    pub ref_names: indexmap::IndexSet<&'s str, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
     /// names `generate` handed out here (they become references too)
     pub generated: FxHashSet<String>,
     /// The parent to continue a lookup with: `parent`, skipping scopes that can never
@@ -252,7 +252,7 @@ impl<'s> Scopes<'s> {
             declarations: DeclMap::default(),
             references: FxIndexMap::default(),
             track_refs: parent.is_none(),
-            ref_names: FxHashSet::default(),
+            ref_names: Default::default(),
             generated: FxHashSet::default(),
             lookup_parent: parent,
         });

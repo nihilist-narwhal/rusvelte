@@ -899,7 +899,7 @@ impl<'a, 's> Client<'a, 's> {
             }
         }
         if !body.declarations.is_empty() {
-            statements.push(b::declaration("var", body.declarations.iter().map(|id| b::declarator(b::id(id.name), None)).collect()));
+            statements.push(b::declaration("var", body.declarations.iter().map(|id| b::declarator(self.id_node(*id), None)).collect()));
         }
         if !body.r#async.is_empty() {
             let mut thunks = Vec::new();
@@ -1421,9 +1421,4 @@ impl<'a, 's> Client<'a, 's> {
 /// `is_non_coercive_operator(operator)`
 fn is_non_coercive_operator(operator: &str) -> bool {
     matches!(operator, "=" | "||=" | "&&=" | "??=")
-}
-
-#[allow(dead_code)]
-fn unused(_: Node) -> Node {
-    get_value(copy_transform(&Default::default()).borrow().len().to_string().into())
 }

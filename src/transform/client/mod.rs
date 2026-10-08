@@ -568,7 +568,11 @@ pub fn client_component(c: &mut Client, inject_css: Option<(String, String)>) ->
             let program = unsafe { &*p };
             c.visit_js(program, &state)
         }
-        None => program_node(vec![]),
+        None => {
+            // the JS walks an empty program (the visitor still runs)
+            let empty = program_node(vec![]);
+            c.visit_js(&empty, &state)
+        }
     };
 
     let instance_state = State {
@@ -942,14 +946,20 @@ pub fn client_component(c: &mut Client, inject_css: Option<(String, String)>) ->
 
 /// The identifier of a binding's declaration (`binding.node`)
 fn binding_id_node(c: &Client, b: BindingId) -> Node {
-    let binding = c.binding(b);
-    let mut id = b::id(binding.node.name);
-    if let Some((start, end)) = binding.node.span {
-        id.span = Some(crate::estree::Span::new(start, end));
-        id.loc = Some(c.conv.location(oxc_span::Span::new(start, end)));
+    c.id_node(c.binding(b).node)
+}
+
+impl<'a, 's> Client<'a, 's> {
+    /// An analysis identifier as an ESTree node (with its position and identity)
+    pub fn id_node(&self, id: crate::analyze::scope::Id) -> Node {
+        let mut n = b::id(id.name);
+        if let Some((start, end)) = id.span {
+            n.span = Some(crate::estree::Span::new(start, end));
+            n.loc = Some(self.conv.location(oxc_span::Span::new(start, end)));
+        }
+        n.origin = Some(id.key);
+        n
     }
-    id.origin = Some(binding.node.key);
-    id
 }
 
 /// `$.create_custom_element(...)`
