@@ -40,6 +40,8 @@ pub struct CheckOptions {
     pub threads: usize,
     /// print timings to stderr
     pub timings: bool,
+    /// keep generated files, tsgo's build info and compiler warnings between runs
+    pub incremental: bool,
 }
 
 const SHIMS: [(&str, &str); 2] = [
@@ -51,6 +53,7 @@ const SHIMS: [(&str, &str); 2] = [
 struct Entry {
     source_path: PathBuf,
     out_path: PathBuf,
+    dts_path: PathBuf,
     is_ts_file: bool,
     source: String,
     code: String,
@@ -173,9 +176,20 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
         files
     });
     // start on the compiler warnings right away (they don't depend on the emit)
-    let svelte_warnings = if use_svelte { Some(svelte_warnings_start(&workspace, &cache, &files, (opts.threads / 2).max(1))?) } else { None };
+    let mut warnings_cache = if use_svelte && opts.incremental { WarningsCache::load(&workspace, &cache) } else { WarningsCache::default() };
+    let svelte_warnings = if use_svelte {
+        let todo: Vec<PathBuf> = files.iter().filter(|f| !warnings_cache.is_fresh(f)).cloned().collect();
+        if todo.is_empty() { None } else { Some(svelte_warnings_start(&workspace, &cache, &todo, (opts.threads / 2).max(1))?) }
+    } else {
+        None
+    };
 
-    let _ = std::fs::remove_dir_all(&emit_dir);
+    let previous_outputs: Vec<PathBuf> = if opts.incremental {
+        std::fs::read_to_string(cache.join("emitted.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    } else {
+        let _ = std::fs::remove_dir_all(&emit_dir);
+        Vec::new()
+    };
     std::fs::create_dir_all(&emit_dir).map_err(|e| e.to_string())?;
     let entries: Vec<Option<Entry>> = timed(opts.timings, "svelte2tsx + write", || {
         let next = AtomicUsize::new(0);
@@ -203,18 +217,28 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
                     let Ok(r) = svelte2tsx_full(&source, &o, false) else { continue };
                     let _ = std::fs::create_dir_all(out_path.parent().unwrap());
                     let import = format!("./{}", out_path.file_name().unwrap().to_string_lossy());
-                    if std::fs::write(&out_path, &r.code).is_err()
-                        || std::fs::write(&dts_path, format!("export {{ default }} from \"{import}\";\nexport * from \"{import}\";\n")).is_err()
-                    {
+                    let dts = format!("export {{ default }} from \"{import}\";\nexport * from \"{import}\";\n");
+                    if write_if_changed(&out_path, &r.code).is_err() || write_if_changed(&dts_path, &dts).is_err() {
                         continue;
                     }
-                    *results[i].lock().unwrap() = Some(Entry { source_path: path.clone(), out_path, is_ts_file: is_ts, source, code: r.code });
+                    *results[i].lock().unwrap() = Some(Entry { source_path: path.clone(), out_path, dts_path, is_ts_file: is_ts, source, code: r.code });
                 });
             }
         });
         results.into_iter().map(|m| m.into_inner().unwrap()).collect()
     });
     let entries: Vec<Entry> = entries.into_iter().flatten().collect();
+    if opts.incremental {
+        // remove what earlier runs generated for files that are gone or failed now
+        let current: std::collections::HashSet<&Path> = entries.iter().flat_map(|e| [e.out_path.as_path(), e.dts_path.as_path()]).collect();
+        for p in &previous_outputs {
+            if !current.contains(p.as_path()) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        let list: Vec<&Path> = current.into_iter().collect();
+        let _ = std::fs::write(cache.join("emitted.json"), serde_json::to_string(&list).unwrap());
+    }
 
     let mut by_file: Vec<FileDiagnostics> = Vec::new();
     let mut index: HashMap<PathBuf, usize> = HashMap::new();
@@ -225,16 +249,29 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
 
     // type-check while the compiler warnings finish
     let tsgo = if use_ts {
-        timed(opts.timings, "overlay tsconfig", || write_overlay(&tsconfig_path, &tsconfig_dir, &workspace, &cache, &overlay_path, &entries))?;
+        timed(opts.timings, "overlay tsconfig", || write_overlay(&tsconfig_path, &tsconfig_dir, &workspace, &cache, &overlay_path, &entries, opts.incremental))?;
         let exe = tsc::find_tsgo(&tsconfig_dir)?;
-        Some((std::time::Instant::now(), tsc::start(&exe, &overlay_path, &workspace)?))
+        let build_info = opts.incremental.then(|| cache.join("tsbuildinfo.json"));
+        Some((std::time::Instant::now(), tsc::start(&exe, &overlay_path, &workspace, build_info.as_deref())?))
     } else {
         None
     };
 
     // compiler warnings come first in each file
-    if let Some(handle) = svelte_warnings {
-        let (results, has_preprocess) = timed(opts.timings, "svelte compiler warnings (wait)", || svelte_warnings_finish(handle))?;
+    if use_svelte {
+        let fresh = match svelte_warnings {
+            Some(handle) => timed(opts.timings, "svelte compiler warnings (wait)", || svelte_warnings_finish(handle))?,
+            None => (Vec::new(), warnings_cache.has_preprocess),
+        };
+        let has_preprocess = if fresh.0.is_empty() { warnings_cache.has_preprocess } else { fresh.1 };
+        warnings_cache.has_preprocess = has_preprocess;
+        for (path, raw) in fresh.0 {
+            warnings_cache.insert(&path, raw);
+        }
+        if opts.incremental {
+            warnings_cache.save(&cache);
+        }
+        let results: Vec<(PathBuf, CompilerResult)> = files.iter().filter_map(|f| warnings_cache.get(f).map(|raw| (f.clone(), to_compiler_result(raw)))).collect();
         for (path, diags) in results {
             let mapped = map_compiler_diagnostics(&path, diags, &opts.compiler_warnings, has_preprocess);
             match index.get(&path) {
@@ -272,7 +309,7 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
 }
 
 /// `writeOverlayTsconfig`
-fn write_overlay(tsconfig_path: &Path, tsconfig_dir: &Path, workspace: &Path, cache: &Path, overlay_path: &Path, entries: &[Entry]) -> Result<(), String> {
+fn write_overlay(tsconfig_path: &Path, tsconfig_dir: &Path, workspace: &Path, cache: &Path, overlay_path: &Path, entries: &[Entry], incremental: bool) -> Result<(), String> {
     let overlay_dir = cache;
     let parsed = tsconfig::parse_config(tsconfig_path)?;
     let raw = &parsed.raw;
@@ -340,7 +377,7 @@ fn write_overlay(tsconfig_path: &Path, tsconfig_dir: &Path, workspace: &Path, ca
     compiler_options.insert("rootDirs".into(), json!(root_dirs));
     compiler_options.insert("allowArbitraryExtensions".into(), json!(true));
     compiler_options.insert("noEmit".into(), json!(true));
-    compiler_options.insert("incremental".into(), json!(false));
+    compiler_options.insert("incremental".into(), json!(incremental));
     compiler_options.insert("tsBuildInfoFile".into(), json!(relative_posix(overlay_dir, &cache.join("tsbuildinfo.json"))));
     let mut paths = rebase_paths(&parsed, tsconfig_dir, overlay_dir);
     add_subpath_import_paths(&mut paths, workspace, overlay_dir, &cache.join("svelte"));
@@ -372,7 +409,7 @@ fn write_overlay(tsconfig_path: &Path, tsconfig_dir: &Path, workspace: &Path, ca
         overlay.insert("references".into(), Value::Array(refs));
     }
     let text = serde_json::to_string_pretty(&Value::Object(overlay)).unwrap();
-    std::fs::write(overlay_path, text).map_err(|e| e.to_string())
+    write_if_changed(overlay_path, &text).map_err(|e| e.to_string())
 }
 
 /// `rebasePathsConfig` (tsgo mode: no `baseUrl`)
@@ -653,7 +690,7 @@ fn svelte_warnings_start(workspace: &Path, cache: &Path, files: &[PathBuf], proc
 /// Per file: `Ok(warnings)` or `Err(error)`, as JSON
 type CompilerResult = Result<Vec<Value>, Value>;
 
-fn svelte_warnings_finish(h: WarningsHandle) -> Result<(Vec<(PathBuf, CompilerResult)>, bool), String> {
+fn svelte_warnings_finish(h: WarningsHandle) -> Result<(Vec<(PathBuf, Value)>, bool), String> {
     let mut results = Vec::new();
     let mut has_preprocess = false;
     for child in h.0 {
@@ -661,18 +698,95 @@ fn svelte_warnings_finish(h: WarningsHandle) -> Result<(Vec<(PathBuf, CompilerRe
         let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("compiler warnings: {e}"))?;
         let Value::Object(mut m) = v else { continue };
         has_preprocess |= m.remove("\0config").is_some_and(|c| c["preprocess"] == Value::Bool(true));
-        for (k, v) in m {
-            let r = if let Some(e) = v.get("error") {
-                Err(e.clone())
-            } else if let Some(e) = v.get("preprocessError") {
-                Err(json!({ "message": e, "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } } }))
-            } else {
-                Ok(v.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default())
-            };
-            results.push((PathBuf::from(k), r));
-        }
+        results.extend(m.into_iter().map(|(k, v)| (PathBuf::from(k), v)));
     }
     Ok((results, has_preprocess))
+}
+
+fn to_compiler_result(v: &Value) -> CompilerResult {
+    if let Some(e) = v.get("error") {
+        Err(e.clone())
+    } else if let Some(e) = v.get("preprocessError") {
+        Err(json!({ "message": e, "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } } }))
+    } else {
+        Ok(v.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+}
+
+fn write_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
+    if std::fs::read(path).is_ok_and(|old| old == content.as_bytes()) {
+        return Ok(());
+    }
+    std::fs::write(path, content)
+}
+
+fn hash_bytes(b: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    b.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Compiler results by file content, valid as long as the Svelte config and compiler are the same
+#[derive(Default)]
+struct WarningsCache {
+    key: String,
+    entries: Map<String, Value>,
+    has_preprocess: bool,
+    hashes: HashMap<PathBuf, String>,
+}
+
+impl WarningsCache {
+    fn config_key(workspace: &Path) -> String {
+        let mut parts = Vec::new();
+        for name in ["svelte.config.js", "svelte.config.mjs", "svelte.config.cjs", "package.json", "node_modules/svelte/package.json"] {
+            parts.extend(std::fs::read(workspace.join(name)).unwrap_or_default());
+            parts.push(0);
+        }
+        hash_bytes(&parts)
+    }
+
+    fn load(workspace: &Path, cache: &Path) -> Self {
+        let key = Self::config_key(workspace);
+        let mut c = WarningsCache { key: key.clone(), ..Default::default() };
+        if let Some(Value::Object(m)) = std::fs::read_to_string(cache.join("compiler-warnings.json")).ok().and_then(|t| serde_json::from_str(&t).ok()) {
+            if m.get("key").and_then(Value::as_str) == Some(&key) {
+                c.has_preprocess = m.get("preprocess") == Some(&Value::Bool(true));
+                if let Some(Value::Object(e)) = m.get("entries") {
+                    c.entries = e.clone();
+                }
+            }
+        }
+        c
+    }
+
+    fn hash(&mut self, path: &Path) -> String {
+        if let Some(h) = self.hashes.get(path) {
+            return h.clone();
+        }
+        let h = hash_bytes(&std::fs::read(path).unwrap_or_default());
+        self.hashes.insert(path.to_path_buf(), h.clone());
+        h
+    }
+
+    fn is_fresh(&mut self, path: &Path) -> bool {
+        let h = self.hash(path);
+        self.entries.get(&*path.to_string_lossy()).is_some_and(|e| e["hash"].as_str() == Some(&h))
+    }
+
+    fn insert(&mut self, path: &Path, raw: Value) {
+        let h = self.hash(path);
+        self.entries.insert(path.to_string_lossy().to_string(), json!({ "hash": h, "result": raw }));
+    }
+
+    fn get(&self, path: &Path) -> Option<&Value> {
+        self.entries.get(&*path.to_string_lossy()).map(|e| &e["result"])
+    }
+
+    fn save(&self, cache: &Path) {
+        let v = json!({ "key": self.key, "preprocess": self.has_preprocess, "entries": self.entries });
+        let _ = std::fs::write(cache.join("compiler-warnings.json"), v.to_string());
+    }
 }
 
 /// The Svelte plugin's `getDiagnostics` for compiler output (no preprocessors)

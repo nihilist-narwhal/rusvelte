@@ -75,11 +75,13 @@ pub fn find_tsgo(tsconfig_dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// Start the compiler; `finish` collects its diagnostics
-pub fn start(exe: &Path, tsconfig: &Path, cwd: &Path) -> Result<std::process::Child, String> {
-    Command::new(exe)
-        .arg("-p")
-        .arg(tsconfig)
-        .args(["--pretty", "true", "--noErrorTruncation"])
+pub fn start(exe: &Path, tsconfig: &Path, cwd: &Path, build_info: Option<&Path>) -> Result<std::process::Child, String> {
+    let mut cmd = Command::new(exe);
+    cmd.arg("-p").arg(tsconfig).args(["--pretty", "true", "--noErrorTruncation"]);
+    if let Some(b) = build_info {
+        cmd.arg("--incremental").arg("--tsBuildInfoFile").arg(b);
+    }
+    cmd
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

@@ -21,6 +21,7 @@ fn main() {
     let mut sources = vec!["js".to_string(), "svelte".to_string()];
     let mut compiler_warnings = HashMap::new();
     let mut timings = false;
+    let mut incremental = false;
     let mut colors = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     while let Some(a) = args.next() {
         let (flag, inline) = match a.split_once('=') {
@@ -60,6 +61,7 @@ fn main() {
             "--color" => colors = true,
             "--no-color" => colors = false,
             "--timings" => timings = true,
+            "--incremental" => incremental = true,
             "--tsgo" => {}
             other => fail(&format!("unknown option {other}")),
         }
@@ -80,6 +82,7 @@ fn main() {
         colors,
         threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
         timings,
+        incremental,
     };
     let start = std::time::Instant::now();
     let stdout = std::io::stdout();
