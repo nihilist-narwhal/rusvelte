@@ -2,7 +2,8 @@
 //! program `compile(..., { generate: 'client' })` prints.
 //!
 //! Visitors follow zimmerframe like the server transform does (see `server/mod.rs`): each
-//! visitor gets the original node, with `self.path` holding its ancestors, and returns its
+//! visitor gets the original node, with its ancestors (`context.path`: the `js::Ancestors`
+//! parameter of the JS visitors, after the template nodes in `tpl_path`), and returns its
 //! replacement. The JS `state` is [`State`], copied where the JS spreads it; the objects the
 //! JS shares between state copies (the statement arrays, the template, the memoizer, the
 //! `transform` record) are reference-counted here and copied where the JS copies them.
@@ -31,7 +32,6 @@ use crate::estree::builders as b;
 use crate::estree::convert::Converter;
 use crate::estree::{Node, NodeKind};
 
-use super::js::PathNode;
 use super::options::CompileOptions;
 
 pub use template::Template;
@@ -145,7 +145,8 @@ pub struct Client<'a, 's> {
     /// `analysis.css.hash` (empty without `<style>`) and the elements the CSS scopes
     pub css_hash: String,
     pub scoped: FxHashSet<crate::ast::NodeId>,
-    pub path: Vec<PathNode<'s>>,
+    /// The template nodes of `context.path` (the JS nodes are the visitors' `js::Ancestors`)
+    pub tpl_path: Vec<P<'s>>,
     /// `state.hoisted`
     pub hoisted: Vec<Node>,
     /// `state.templates`: deduplicated templates
@@ -163,9 +164,10 @@ pub struct Client<'a, 's> {
     /// Elements the analysis gives an empty `class`/`style` attribute
     pub synthetic_class: FxHashSet<crate::ast::NodeId>,
     pub synthetic_style: FxHashSet<crate::ast::NodeId>,
-    /// The converted scripts' nodes, by origin (the programs are kept in `programs`)
-    pub js_nodes: FxHashMap<usize, *const Node>,
-    pub programs: Vec<Box<Node>>,
+    /// The scripts, converted before the transform
+    pub scripts: &'a Scripts,
+    /// The converted scripts' nodes, by origin
+    pub js_nodes: FxHashMap<usize, &'a Node>,
     /// `node.metadata.is_controlled` (set during the transform)
     pub is_controlled: FxHashSet<crate::ast::NodeId>,
     /// `analysis.needs_mutation_validation`
@@ -349,8 +351,12 @@ impl<'a, 's> Client<'a, 's> {
 
     /// The converted script node of an analysis node (`binding.initial` and the like)
     pub fn js_node(&self, p: P<'s>) -> Option<Node> {
-        // SAFETY: the programs the pointers point into are kept alive (and unmodified) in `programs`
-        self.js_nodes.get(&p.key()).map(|&n| unsafe { (*n).clone() })
+        self.js_node_by_key(p.key())
+    }
+
+    /// The converted node of a script node by its key
+    pub fn js_node_by_key(&self, key: usize) -> Option<Node> {
+        self.js_nodes.get(&key).map(|&n| n.clone())
     }
 
     /// The memoizer placeholder id `#`, renamed when the memoizer is applied
@@ -437,30 +443,41 @@ impl<'a, 's> Client<'a, 's> {
         self.an.meta_of.get(&key).copied().unwrap_or(0)
     }
 
-    pub fn convert_program(&self, p: P<'s>) -> Node {
-        match p {
+}
+
+/// The `<script module>` and instance `<script>` programs, converted once before the
+/// transform, which borrows them (and indexes their nodes in `Client::js_nodes`)
+pub struct Scripts {
+    pub module: Option<Node>,
+    pub instance: Option<Node>,
+}
+
+impl Scripts {
+    pub(crate) fn convert(an: &Analyzer, conv: &Converter) -> Scripts {
+        let convert = |p: P| match p {
             P::Js(oxc_ast::AstKind::Program(program)) => {
-                let mut node = self.conv.program(program);
-                node.loc = crate::transform::script_program_loc(&self.conv, self.an.root, program).or(node.loc);
+                let mut node = conv.program(program);
+                node.loc = crate::transform::script_program_loc(conv, an.root, program).or(node.loc);
                 node
             }
             _ => program_node(vec![]),
-        }
+        };
+        Scripts { module: an.module_program.map(convert), instance: an.instance_program.map(convert) }
     }
 
-    /// Keep a converted program alive and index its nodes by origin
-    fn register_program(&mut self, program: Node) -> *const Node {
-        let boxed = Box::new(program);
-        let ptr: *const Node = &*boxed;
-        fn index(n: &Node, out: &mut FxHashMap<usize, *const Node>) {
+    /// The programs' nodes by origin (the first one with a given origin)
+    pub fn index(&self) -> FxHashMap<usize, &Node> {
+        fn index<'p>(n: &'p Node, out: &mut FxHashMap<usize, &'p Node>) {
             if let Some(o) = n.origin {
-                out.entry(o).or_insert(n as *const Node);
+                out.entry(o).or_insert(n);
             }
             n.for_each_child(&mut |c| index(c, out));
         }
-        index(&boxed, &mut self.js_nodes);
-        self.programs.push(boxed);
-        ptr
+        let mut out = FxHashMap::default();
+        for program in [&self.module, &self.instance].into_iter().flatten() {
+            index(program, &mut out);
+        }
+        out
     }
 }
 
@@ -563,12 +580,6 @@ pub struct CustomElementOptions {
 
 /// `client_component(analysis, options)`
 pub fn client_component(c: &mut Client, inject_css: Option<(String, String)>) -> Node {
-    // the scripts, converted once
-    let module_program = c.an.module_program.map(|p| c.convert_program(p));
-    let instance_program = c.an.instance_program.map(|p| c.convert_program(p));
-    let module_ptr = module_program.map(|p| c.register_program(p));
-    let instance_ptr = instance_program.map(|p| c.register_program(p));
-
     let mut hoisted = vec![b::import_all("$", "svelte/internal/client")];
     for h in c.an.instance_body.hoisted.clone() {
         if let Some(n) = c.js_node(h) {
@@ -579,12 +590,9 @@ pub fn client_component(c: &mut Client, inject_css: Option<(String, String)>) ->
 
     let state = root_state(c);
 
-    // SAFETY: the programs are kept alive in `c.programs` and not modified
-    let module = match module_ptr {
-        Some(p) => {
-            let program = unsafe { &*p };
-            c.visit_js(program, &state)
-        }
+    let scripts = c.scripts;
+    let module = match &scripts.module {
+        Some(program) => c.visit_js(program, &state),
         None => {
             // the JS walks an empty program (the visitor still runs)
             let empty = program_node(vec![]);
@@ -598,11 +606,8 @@ pub fn client_component(c: &mut Client, inject_css: Option<(String, String)>) ->
         is_instance: true,
         ..state.clone()
     };
-    let instance = match instance_ptr {
-        Some(p) => {
-            let program = unsafe { &*p };
-            c.visit_js(program, &instance_state)
-        }
+    let instance = match &scripts.instance {
+        Some(program) => c.visit_js(program, &instance_state),
         None => {
             // the JS walks an empty program (the visitor still runs)
             let empty = program_node(vec![]);
@@ -963,14 +968,11 @@ pub fn client_component(c: &mut Client, inject_css: Option<(String, String)>) ->
 
 /// `client_module(analysis, options)`: a `.svelte.js` module
 pub fn client_module(c: &mut Client) -> Node {
-    let program = match c.an.module_program {
-        Some(p) => c.convert_program(p),
-        None => program_node(vec![]),
-    };
-    let ptr = c.register_program(program);
     let state = root_state(c);
-    // SAFETY: the program is kept alive in `c.programs` and not modified
-    let module = c.visit_js(unsafe { &*ptr }, &state);
+    let module = match &c.scripts.module {
+        Some(program) => c.visit_js(program, &state),
+        None => c.visit_js(&program_node(vec![]), &state),
+    };
 
     let mut body = vec![b::import_all("$", "svelte/internal/client")];
     // (the analysis only sets `tracing` in dev)

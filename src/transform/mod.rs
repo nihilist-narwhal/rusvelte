@@ -372,7 +372,7 @@ fn compile_component(source: &str, options: &options::CompileOptions) -> Result<
                 locator: &locator,
                 css_hash,
                 scoped,
-                path: Vec::new(),
+                tpl_path: Vec::new(),
                 hoisted: Vec::new(),
                 legacy_reactive_statements: Vec::new(),
                 filename: state_filename,
@@ -390,6 +390,8 @@ fn compile_component(source: &str, options: &options::CompileOptions) -> Result<
         }
         options::Generate::Client => {
             let conv = crate::estree::convert::Converter::new(&locator, root.ts);
+            // the scripts, converted once
+            let scripts = client::Scripts::convert(&analysis.an, &conv);
             let mut c = client::Client {
                 error: Default::default(),
                 an: &mut analysis.an,
@@ -398,7 +400,7 @@ fn compile_component(source: &str, options: &options::CompileOptions) -> Result<
                 locator: &locator,
                 css_hash,
                 scoped,
-                path: Vec::new(),
+                tpl_path: Vec::new(),
                 hoisted: Vec::new(),
                 templates: Default::default(),
                 legacy_reactive_imports: Vec::new(),
@@ -410,8 +412,8 @@ fn compile_component(source: &str, options: &options::CompileOptions) -> Result<
                 dev: options.dev,
                 synthetic_class,
                 synthetic_style,
-                js_nodes: Default::default(),
-                programs: Vec::new(),
+                js_nodes: scripts.index(),
+                scripts: &scripts,
                 is_controlled: Default::default(),
                 needs_mutation_validation: false,
                 needs_props: false,
@@ -513,7 +515,7 @@ fn compile_module_inner(source: &str, options: &options::CompileOptions) -> Resu
                 locator: &locator,
                 css_hash: String::new(),
                 scoped: Default::default(),
-                path: Vec::new(),
+                tpl_path: Vec::new(),
                 hoisted: Vec::new(),
                 legacy_reactive_statements: Vec::new(),
                 filename: state_filename,
@@ -527,6 +529,7 @@ fn compile_module_inner(source: &str, options: &options::CompileOptions) -> Resu
         }
         options::Generate::Client => {
             let conv = crate::estree::convert::Converter::new(&locator, false);
+            let scripts = client::Scripts::convert(&an, &conv);
             let mut c = client::Client {
                 error: Default::default(),
                 an: &mut an,
@@ -535,7 +538,7 @@ fn compile_module_inner(source: &str, options: &options::CompileOptions) -> Resu
                 locator: &locator,
                 css_hash: String::new(),
                 scoped: Default::default(),
-                path: Vec::new(),
+                tpl_path: Vec::new(),
                 hoisted: Vec::new(),
                 templates: Default::default(),
                 legacy_reactive_imports: Vec::new(),
@@ -547,8 +550,8 @@ fn compile_module_inner(source: &str, options: &options::CompileOptions) -> Resu
                 dev: options.dev,
                 synthetic_class: Default::default(),
                 synthetic_style: Default::default(),
-                js_nodes: Default::default(),
-                programs: Vec::new(),
+                js_nodes: scripts.index(),
+                scripts: &scripts,
                 is_controlled: Default::default(),
                 needs_mutation_validation: false,
                 needs_props: false,

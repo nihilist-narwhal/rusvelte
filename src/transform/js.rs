@@ -6,20 +6,60 @@ use crate::analyze::nodes::P;
 use crate::analyze::scope::{ScopeId, Scopes};
 use crate::estree::{LiteralValue, Node, NodeKind};
 
-/// An entry of `context.path`: a JS node of the tree being transformed (the original, which
-/// outlives the visit), or a template node
+/// The JS part of `context.path` in a walk of a JS tree: the ancestors of the node being
+/// visited, innermost first, up to the node the walk started from (the template nodes
+/// around the walk, the outer part of `context.path`, are the transform's `tpl_path`).
+///
+/// It is a list on the stack: the visitors get it as a parameter, and `next`/`visit_in`
+/// visit a node's children with the node pushed in front of it. The entries are the visited
+/// nodes themselves, so they can be compared by identity with their children
+/// (`is_reference`).
 #[derive(Clone, Copy)]
-pub enum PathNode<'s> {
-    Js(*const Node),
+pub struct Ancestors<'n>(Option<(&'n Node, &'n Ancestors<'n>)>);
+
+impl Ancestors<'static> {
+    /// The ancestors of the node a walk starts from
+    pub const ROOT: Ancestors<'static> = Ancestors(None);
+}
+
+impl<'n> Ancestors<'n> {
+    /// The ancestors of `node`'s children
+    pub fn push(&'n self, node: &'n Node) -> Ancestors<'n> {
+        Ancestors(Some((node, self)))
+    }
+
+    /// The parent, if it is a JS node
+    pub fn parent(&self) -> Option<&'n Node> {
+        self.0.map(|(node, _)| node)
+    }
+
+    /// The nodes, innermost first
+    pub fn iter(&self) -> impl Iterator<Item = &'n Node> + use<'n> {
+        let mut rest = *self;
+        std::iter::from_fn(move || {
+            let (node, parent) = rest.0?;
+            rest = *parent;
+            Some(node)
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+}
+
+/// An entry of `context.path`: a JS node or a template node
+#[derive(Clone, Copy)]
+pub enum PathNode<'s, 'n> {
+    Js(&'n Node),
     Tpl(P<'s>),
 }
 
-impl<'s> PathNode<'s> {
+impl<'s, 'n> PathNode<'s, 'n> {
     /// The JS node, if it is one
-    pub fn js(&self) -> Option<&Node> {
-        match self {
-            // SAFETY: path entries point at nodes that are being visited, which outlive the visit
-            PathNode::Js(n) => Some(unsafe { &**n }),
+    pub fn js(&self) -> Option<&'n Node> {
+        match *self {
+            PathNode::Js(n) => Some(n),
             PathNode::Tpl(_) => None,
         }
     }
@@ -27,14 +67,27 @@ impl<'s> PathNode<'s> {
     /// The node's `type`
     pub fn ty(&self, ast: &crate::ast::Ast) -> &'static str {
         match self {
-            PathNode::Js(_) => self.js().unwrap().type_name(),
+            PathNode::Js(n) => n.type_name(),
             PathNode::Tpl(p) => p.ty(ast),
         }
     }
+}
 
-    pub fn is(&self, node: &Node) -> bool {
-        matches!(self, PathNode::Js(n) if std::ptr::eq(*n, node))
-    }
+/// `context.path` of a JS node, innermost first: its JS ancestors, then the template nodes
+/// around the walk
+pub fn context_path<'s, 'n>(tpl_path: &'n [P<'s>], ancestors: &Ancestors<'n>) -> impl Iterator<Item = PathNode<'s, 'n>> + use<'s, 'n> {
+    ancestors.iter().map(PathNode::Js).chain(tpl_path.iter().rev().map(|&p| PathNode::Tpl(p)))
+}
+
+/// `context.path.at(-i)` (`i >= 1`)
+pub fn path_at<'s, 'n>(tpl_path: &'n [P<'s>], ancestors: &Ancestors<'n>, i: usize) -> Option<PathNode<'s, 'n>> {
+    context_path(tpl_path, ancestors).nth(i - 1)
+}
+
+/// `context.path[i]`
+pub fn path_from_root<'s, 'n>(tpl_path: &'n [P<'s>], ancestors: &Ancestors<'n>, i: usize) -> Option<PathNode<'s, 'n>> {
+    let len = tpl_path.len() + ancestors.len();
+    if i >= len { None } else { path_at(tpl_path, ancestors, len - i) }
 }
 
 /// `is_reference(node, parent)` from `is-reference`

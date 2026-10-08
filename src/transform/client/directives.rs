@@ -9,7 +9,7 @@ use crate::ast::{Attr, AttrValue, Node as TNode};
 use crate::estree::builders as b;
 use crate::estree::{Node, NodeKind};
 
-use super::super::js::{self, PathNode};
+use super::super::js;
 use super::fragment::is_text_attribute;
 use super::utils::{parse_directive_name, Memoize};
 use super::{Client, State, Transform, TRANSITION_GLOBAL, TRANSITION_IN, TRANSITION_OUT};
@@ -33,7 +33,7 @@ impl<'a, 's> Client<'a, 's> {
     /// `context.visit(attribute, state)`: the visitor's result (`OnDirective` and
     /// `SpreadAttribute` return expressions)
     pub fn visit_attr(&mut self, a: &'s Attr<'s>, st: &State) -> Option<Node> {
-        self.path.push(PathNode::Tpl(P::Attr(a)));
+        self.tpl_path.push(P::Attr(a));
         let out = match a {
             Attr::Attribute { .. } => {
                 if crate::analyze::utils::is_event_attribute(a) {
@@ -70,7 +70,7 @@ impl<'a, 's> Client<'a, 's> {
             }
             _ => None,
         };
-        self.path.pop();
+        self.tpl_path.pop();
         out
     }
 
@@ -221,10 +221,10 @@ impl<'a, 's> Client<'a, 's> {
         let raw = self.convert_expr(binding_expr);
         let expression = self.visit_js(&raw, st);
         let (event, bidirectional) = binding_event(name);
-        let len = self.path.len();
-        let parent = if len >= 2 { self.path[len - 2] } else { self.path[0] };
+        let len = self.tpl_path.len();
+        let parent = if len >= 2 { self.tpl_path[len - 2] } else { self.tpl_path[0] };
         let parent_node = match parent {
-            PathNode::Tpl(P::Node(p)) => Some(p),
+            P::Node(p) => Some(p),
             _ => None,
         };
         let parent_el = parent_node.and_then(|p| match &self.ast().nodes[p] {
@@ -241,7 +241,7 @@ impl<'a, 's> Client<'a, 's> {
                 && self.an.runes
                 && expression.is("MemberExpression")
                 && (*name != "this"
-                    || self.path.iter().any(|p| matches!(p.ty(self.an.ast), "IfBlock" | "EachBlock" | "AwaitBlock" | "KeyBlock")))
+                    || self.tpl_path.iter().any(|p| matches!(p.ty(self.an.ast), "IfBlock" | "EachBlock" | "AwaitBlock" | "KeyBlock")))
                 && !self.is_ignored_key(P::Attr(a).key(), "binding_property_non_reactive")
             {
                 self.validate_binding(st, a, binding_expr, &expression);

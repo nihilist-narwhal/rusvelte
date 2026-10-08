@@ -5,7 +5,6 @@ use crate::ast::{Attr, Node as TNode, NodeId};
 use crate::estree::builders as b;
 use crate::estree::{Node, NodeKind};
 
-use super::super::js::PathNode;
 use super::template::Parent;
 use super::utils::{PromiseOptimiser, BLOCK_CLOSE, BLOCK_OPEN, BLOCK_OPEN_ELSE, EMPTY_COMMENT};
 use super::{shared, Server, State};
@@ -53,9 +52,9 @@ impl<'a, 's> Server<'a, 's> {
                     }
                 }
                 Attr::Spread { expression, .. } => {
-                    self.path.push(PathNode::Tpl(P::Attr(a)));
+                    self.tpl_path.push(P::Attr(a));
                     let e = self.visit_expr_here(expression, st);
-                    self.path.pop();
+                    self.tpl_path.pop();
                     let meta = self.an.meta_of.get(&P::Attr(a).key()).copied().unwrap_or(0);
                     props_and_spreads.push(PropOrSpread::Spread(opt.transform(self, e, meta)));
                 }
@@ -153,9 +152,9 @@ impl<'a, 's> Server<'a, 's> {
             } else {
                 State { scope: scope_for(slot_name).unwrap_or(st.scope), ..st.clone() }
             };
-            self.path.push(PathNode::Tpl(P::Node(n)));
+            self.tpl_path.push(P::Node(n));
             let block = self.fragment_nodes(el.fragment, nodes, Parent::Node(n), &slot_state);
-            self.path.pop();
+            self.tpl_path.pop();
             let NodeKind::BlockStatement(body) = block.kind else { continue };
             if body.body.is_empty() {
                 continue;

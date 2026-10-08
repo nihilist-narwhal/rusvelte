@@ -7,7 +7,6 @@ use crate::estree::builders as b;
 use crate::estree::{Node, NodeKind};
 use crate::transform::js;
 
-use super::super::js::PathNode;
 use super::utils::{build_template, create_child_block, prepend_block_marker, PromiseOptimiser, BLOCK_CLOSE, BLOCK_OPEN, BLOCK_OPEN_ELSE, EMPTY_COMMENT};
 use super::{shared, Server, State};
 
@@ -211,7 +210,7 @@ impl<'a, 's> Server<'a, 's> {
             }
 
             let parent_name = self.parent_element_name(parent);
-            let in_text = self.path.iter().any(|p| matches!(p, PathNode::Tpl(P::Node(n)) if matches!(&ast.nodes[*n], TNode::Element(el) if el.kind == "RegularElement" && el.name == "text")));
+            let in_text = self.tpl_path.iter().any(|p| matches!(p, P::Node(n) if matches!(&ast.nodes[*n], TNode::Element(el) if el.kind == "RegularElement" && el.name == "text")));
             let can_remove_entirely = (namespace == "svg" && parent_name != Some("text") && !in_text)
                 || matches!(parent_name, Some("select" | "tr" | "table" | "tbody" | "thead" | "tfoot" | "colgroup" | "datalist"));
 
@@ -426,9 +425,9 @@ impl<'a, 's> Server<'a, 's> {
     /// `context.visit(expression)` for an expression of template node `n`
     pub fn visit_template_expr(&mut self, n: NodeId, e: &'s Expr<'s>, st: &State) -> Node {
         let node = self.convert_expr(e);
-        self.path.push(PathNode::Tpl(P::Node(n)));
+        self.tpl_path.push(P::Node(n));
         let out = self.visit_js(&node, st);
-        self.path.pop();
+        self.tpl_path.pop();
         out
     }
 
@@ -462,7 +461,7 @@ impl<'a, 's> Server<'a, 's> {
         let cleaned = self.clean_nodes(parent, &nodes, namespace, st.scope, st.preserve_whitespace, self.options.preserve_comments);
         let state = State { init: shared(), template: shared(), namespace, is_standalone: cleaned.is_standalone, async_consts: Default::default(), ..st.clone() };
 
-        self.path.push(PathNode::Tpl(P::Fragment(f)));
+        self.tpl_path.push(P::Fragment(f));
         for &h in &cleaned.hoisted {
             self.visit_node(h, &state);
         }
@@ -470,7 +469,7 @@ impl<'a, 's> Server<'a, 's> {
             state.template.borrow_mut().push(b::literal(EMPTY_COMMENT));
         }
         self.process_children(&cleaned.trimmed, &state);
-        self.path.pop();
+        self.tpl_path.pop();
 
         self.push_async_consts(&state);
         let mut body = std::mem::take(&mut *state.init.borrow_mut());
@@ -496,11 +495,11 @@ impl<'a, 's> Server<'a, 's> {
             _ => st,
         };
         let ast = self.ast();
-        self.path.push(PathNode::Tpl(P::Node(n)));
+        self.tpl_path.push(P::Node(n));
         match &ast.nodes[n] {
             TNode::Element(el) => match el.kind {
                 "RegularElement" => {
-                    self.path.pop();
+                    self.tpl_path.pop();
                     self.regular_element(n, st);
                     return;
                 }
@@ -594,7 +593,7 @@ impl<'a, 's> Server<'a, 's> {
             TNode::DebugTag { identifiers, .. } => self.debug_tag(identifiers, st),
             _ => {}
         }
-        self.path.pop();
+        self.tpl_path.pop();
     }
 
     /// `var promises = $$renderer.run([...thunks])` of a fragment's async `{@const}` tags
@@ -683,12 +682,12 @@ impl<'a, 's> Server<'a, 's> {
         let flattened = self.an.node_meta.get(&n).and_then(|m| m.flattened.clone()).unwrap_or_default();
         for elseif in flattened {
             let TNode::IfBlock { test, consequent, alternate, .. } = &ast.nodes[elseif] else { continue };
-            self.path.push(PathNode::Tpl(P::Node(elseif)));
+            self.tpl_path.push(P::Node(elseif));
             let mut branch = self.fragment(*consequent, Parent::Node(elseif), st);
             prepend_block_marker(&mut branch, &format!("<!--[{index}-->"));
             index += 1;
             let t = self.visit_template_expr_here(test, st);
-            self.path.pop();
+            self.tpl_path.pop();
             branches.push((t, branch));
             alt = *alternate;
         }
@@ -985,7 +984,7 @@ impl<'a, 's> Server<'a, 's> {
         let node_is_void = crate::analyze::utils::is_void(&name);
         let mut optimiser = PromiseOptimiser::default();
 
-        self.path.push(PathNode::Tpl(P::Node(n)));
+        self.tpl_path.push(P::Node(n));
 
         // <select value> and <option> have their attributes handled by the runtime
         let is_select_special = name == "select"
@@ -1015,7 +1014,7 @@ impl<'a, 's> Server<'a, 's> {
             let mut statements = std::mem::take(&mut *state.init.borrow_mut());
             statements.extend(build_template(std::mem::take(&mut *state.template.borrow_mut())));
             st.template.borrow_mut().extend(optimiser.render(statements));
-            self.path.pop();
+            self.tpl_path.pop();
             return;
         }
 
@@ -1065,7 +1064,7 @@ impl<'a, 's> Server<'a, 's> {
             };
             // the attributes are visited from the element's visitor too (it's on the path)
             let mut args = self.prepare_element_spread_object(n, st, &mut optimiser);
-            self.path.pop();
+            self.tpl_path.pop();
             if customizable {
                 args.push(Some(b::r#true()));
             }
@@ -1104,7 +1103,7 @@ impl<'a, 's> Server<'a, 's> {
         if self.dev {
             state.template.borrow_mut().push(b::stmt(b::call("$.pop_element", ())));
         }
-        self.path.pop();
+        self.tpl_path.pop();
 
         if has_child_declarations {
             self.push_async_consts(&state);
@@ -1216,9 +1215,9 @@ impl<'a, 's> Server<'a, 's> {
                 pending_attribute_block(self, a).1
             } else {
                 let TNode::SnippetBlock { body, .. } = &ast.nodes[pending_snippet.unwrap()] else { unreachable!() };
-                self.path.push(PathNode::Tpl(P::Node(pending_snippet.unwrap())));
+                self.tpl_path.push(P::Node(pending_snippet.unwrap()));
                 let block = self.fragment(*body, Parent::Node(pending_snippet.unwrap()), st);
-                self.path.pop();
+                self.tpl_path.pop();
                 b::block(build_template(vec![b::literal(BLOCK_OPEN_ELSE), block, b::literal(BLOCK_CLOSE)]))
             }
         } else {
@@ -1263,9 +1262,9 @@ impl<'a, 's> Server<'a, 's> {
         for a in &el.attributes {
             match a {
                 Attr::Spread { expression, .. } => {
-                    self.path.push(PathNode::Tpl(P::Attr(a)));
+                    self.tpl_path.push(P::Attr(a));
                     let e = self.visit_template_expr_here(expression, st);
-                    self.path.pop();
+                    self.tpl_path.pop();
                     let meta = self.an.meta_of.get(&P::Attr(a).key()).copied().unwrap_or(0);
                     spreads.push(opt.transform(self, e, meta));
                 }

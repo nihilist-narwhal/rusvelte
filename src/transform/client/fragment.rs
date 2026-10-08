@@ -10,7 +10,6 @@ use crate::ast::{Attr, AttrValue, Chunk, FragId, Node as TNode, NodeId};
 use crate::estree::builders as b;
 use crate::estree::Node;
 
-use super::super::js::PathNode;
 use super::template::TextPart;
 use super::utils::{ChunkRef, Memoize};
 use super::{shared, Client, Memoizer, State, Template, TEMPLATE_FRAGMENT, TEMPLATE_USE_IMPORT_NODE};
@@ -290,8 +289,8 @@ impl<'a, 's> Client<'a, 's> {
             }
 
             let parent_name = self.parent_element_name(parent);
-            let in_text = self.path.iter().any(|p| {
-                matches!(p, PathNode::Tpl(P::Node(n)) if matches!(&ast.nodes[*n], TNode::Element(el) if el.kind == "RegularElement" && el.name == "text"))
+            let in_text = self.tpl_path.iter().any(|p| {
+                matches!(p, P::Node(n) if matches!(&ast.nodes[*n], TNode::Element(el) if el.kind == "RegularElement" && el.name == "text"))
             });
             let can_remove_entirely = (namespace == "svg" && parent_name != Some("text") && !in_text)
                 || matches!(parent_name, Some("select" | "tr" | "table" | "tbody" | "thead" | "tfoot" | "colgroup" | "datalist"));
@@ -508,23 +507,23 @@ impl<'a, 's> Client<'a, 's> {
     }
 
     /// The parent of the node being visited (the node on the path before it)
-    pub fn tpl_parent(&self) -> Option<PathNode<'s>> {
-        let len = self.path.len();
-        if len >= 2 { Some(self.path[len - 2]) } else { None }
+    pub fn tpl_parent(&self) -> Option<P<'s>> {
+        let len = self.tpl_path.len();
+        if len >= 2 { Some(self.tpl_path[len - 2]) } else { None }
     }
 
     /// The `Fragment` visitor
     fn fragment(&mut self, f: FragId, nodes: &[NodeId], st: &State) -> Node {
-        self.path.push(PathNode::Tpl(P::Fragment(f)));
+        self.tpl_path.push(P::Fragment(f));
         let parent = match self.tpl_parent() {
-            Some(PathNode::Tpl(P::Node(n))) => Parent::Node(n),
+            Some(P::Node(n)) => Parent::Node(n),
             _ => Parent::Root,
         };
         let namespace = self.infer_namespace(st.namespace, parent, nodes);
         let cleaned = self.clean_nodes(parent, nodes, namespace, st.scope, st.preserve_whitespace, self.options.preserve_comments);
 
         if cleaned.hoisted.is_empty() && cleaned.trimmed.is_empty() {
-            self.path.pop();
+            self.tpl_path.pop();
             return b::block(vec![]);
         }
 
@@ -607,7 +606,7 @@ impl<'a, 's> Client<'a, 's> {
                 close = Some(b::stmt(b::call("$.append", vec![b::id("$$anchor"), id])));
             }
         }
-        self.path.pop();
+        self.tpl_path.pop();
 
         body.extend(state.snippets.borrow().iter().cloned());
         body.extend(state.let_directives.borrow().iter().cloned());

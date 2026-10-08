@@ -6,13 +6,19 @@ use crate::analyze::scope::{DeclKind, Kind};
 use crate::estree::builders as b;
 use crate::estree::{Node, NodeKind};
 
-use super::super::js::{self, PathNode};
+use super::super::js::{self, Ancestors, PathNode};
 use super::{call_fn, get_value_fn, Client, State, Transform};
 
 impl<'a, 's> Client<'a, 's> {
+    /// `context.visit(node, state)` on a JS node from a template visitor, or on a tree of
+    /// its own: a walk with no JS ancestors
+    pub fn visit_js(&mut self, node: &Node, st: &State) -> Node {
+        self.visit(node, &Ancestors::ROOT, st)
+    }
+
     /// `context.visit(node, state)` on a JS node: the universal `set_scope` visitor, then the
     /// node's visitor
-    pub fn visit_js(&mut self, node: &Node, st: &State) -> Node {
+    pub fn visit(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let scoped;
         let st = match node.origin.and_then(|o| self.scope_of_key(o)) {
             Some(scope) if scope != st.scope => {
@@ -22,63 +28,55 @@ impl<'a, 's> Client<'a, 's> {
             _ => st,
         };
         match &node.kind {
-            NodeKind::Identifier(_) => self.identifier(node, st),
-            NodeKind::MemberExpression(_) => self.member_expression(node, st),
-            NodeKind::UpdateExpression(_) => self.update_expression(node, st),
-            NodeKind::AssignmentExpression(_) => self.assignment_expression(node, st),
-            NodeKind::CallExpression(_) => self.call_expression(node, st),
-            NodeKind::ClassBody(_) => self.class_body(node, st),
-            NodeKind::LabeledStatement(_) => self.labeled_statement(node, st),
-            NodeKind::VariableDeclaration(_) => self.variable_declaration(node, st),
-            NodeKind::Program(_) => self.program(node, st),
-            NodeKind::ExpressionStatement(_) => self.expression_statement(node, st),
-            NodeKind::ExportNamedDeclaration(_) => self.export_named_declaration(node, st),
-            NodeKind::BlockStatement(_) => self.block_statement(node, st),
-            NodeKind::BreakStatement(_) => self.break_statement(node, st),
-            NodeKind::AwaitExpression(_) => self.await_expression(node, st),
-            NodeKind::BinaryExpression(_) => self.binary_expression(node, st),
-            NodeKind::ArrowFunctionExpression(_) | NodeKind::FunctionExpression(_) => self.visit_function(node, st),
+            NodeKind::Identifier(_) => self.identifier(node, ancestors, st),
+            NodeKind::MemberExpression(_) => self.member_expression(node, ancestors, st),
+            NodeKind::UpdateExpression(_) => self.update_expression(node, ancestors, st),
+            NodeKind::AssignmentExpression(_) => self.assignment_expression(node, ancestors, st),
+            NodeKind::CallExpression(_) => self.call_expression(node, ancestors, st),
+            NodeKind::ClassBody(_) => self.class_body(node, ancestors, st),
+            NodeKind::LabeledStatement(_) => self.labeled_statement(node, ancestors, st),
+            NodeKind::VariableDeclaration(_) => self.variable_declaration(node, ancestors, st),
+            NodeKind::Program(_) => self.program(node, ancestors, st),
+            NodeKind::ExpressionStatement(_) => self.expression_statement(node, ancestors, st),
+            NodeKind::ExportNamedDeclaration(_) => self.export_named_declaration(node, ancestors, st),
+            NodeKind::BlockStatement(_) => self.block_statement(node, ancestors, st),
+            NodeKind::BreakStatement(_) => self.break_statement(node, ancestors, st),
+            NodeKind::AwaitExpression(_) => self.await_expression(node, ancestors, st),
+            NodeKind::BinaryExpression(_) => self.binary_expression(node, ancestors, st),
+            NodeKind::ArrowFunctionExpression(_) | NodeKind::FunctionExpression(_) => self.visit_function(node, ancestors, st),
             NodeKind::FunctionDeclaration(_) => {
                 let state = State { in_constructor: false, in_derived: false, ..st.clone() };
-                self.next(node, &state)
+                self.next(node, ancestors, &state)
             }
-            NodeKind::ForOfStatement(_) => self.for_of_statement(node, st),
-            _ => self.next(node, st),
+            NodeKind::ForOfStatement(_) => self.for_of_statement(node, ancestors, st),
+            _ => self.next(node, ancestors, st),
         }
     }
 
     /// `context.next(state)`: the node with its children visited
-    pub fn next(&mut self, node: &Node, st: &State) -> Node {
-        self.path.push(PathNode::Js(node));
-        let out = node.map_children(&mut |c| self.visit_js(c, st));
-        self.path.pop();
-        out
+    pub fn next(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
+        let ancestors = ancestors.push(node);
+        node.map_children(&mut |c| self.visit(c, &ancestors, st))
     }
 
     /// `context.visit(child)` from the visitor of `node`
-    pub fn visit_in(&mut self, node: &Node, child: &Node, st: &State) -> Node {
-        self.path.push(PathNode::Js(node));
-        let out = self.visit_js(child, st);
-        self.path.pop();
-        out
+    pub fn visit_in(&mut self, node: &Node, child: &Node, ancestors: &Ancestors, st: &State) -> Node {
+        self.visit(child, &ancestors.push(node), st)
     }
 
-    fn parent_js(&self) -> Option<&Node> {
-        self.path.last().and_then(|p| p.js())
+    /// `context.path.at(-i)`
+    fn path_at<'n>(&'n self, ancestors: &Ancestors<'n>, i: usize) -> Option<PathNode<'s, 'n>> {
+        js::path_at(&self.tpl_path, ancestors, i)
     }
 
     /// The `type` of `context.path.at(-i)`
-    pub fn path_type(&self, i: usize) -> Option<&'static str> {
-        let len = self.path.len();
-        if i > len {
-            return None;
-        }
-        Some(self.path[len - i].ty(self.an.ast))
+    pub fn path_type(&self, ancestors: &Ancestors, i: usize) -> Option<&'static str> {
+        self.path_at(ancestors, i).map(|p| p.ty(self.an.ast))
     }
 
-    fn identifier(&mut self, node: &Node, st: &State) -> Node {
-        let parent = self.parent_js();
-        let is_ref = match self.path.last() {
+    fn identifier(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
+        let parent = ancestors.parent();
+        let is_ref = match self.path_at(ancestors, 1) {
             Some(PathNode::Js(_)) | None => js::is_reference(node, parent),
             Some(PathNode::Tpl(_)) => true,
         };
@@ -95,7 +93,7 @@ impl<'a, 's> Client<'a, 's> {
             if let Some(bid) = binding {
                 let bnd = self.binding(bid);
                 if node.origin.is_none_or(|o| o != bnd.node.key) && bnd.kind == Kind::RestProp {
-                    let grand_parent = self.path_type(2);
+                    let grand_parent = self.path_type(ancestors, 2);
                     if let Some(NodeKind::MemberExpression(m)) = parent.map(|p| &p.kind) {
                         if !m.computed && grand_parent != Some("AssignmentExpression") && grand_parent != Some("UpdateExpression") {
                             let key = js::ident(&m.property).unwrap_or("").to_string();
@@ -115,7 +113,7 @@ impl<'a, 's> Client<'a, 's> {
         self.an.state_fields[st.state_fields as usize].iter().position(|f| f.name == name)
     }
 
-    fn member_expression(&mut self, node: &Node, st: &State) -> Node {
+    fn member_expression(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::MemberExpression(m) = &node.kind else { unreachable!() };
         if let NodeKind::PrivateIdentifier(p) = &m.property.kind {
             let name = format!("#{}", p.name);
@@ -128,10 +126,10 @@ impl<'a, 's> Client<'a, 's> {
                 };
             }
         }
-        self.next(node, st)
+        self.next(node, ancestors, st)
     }
 
-    fn update_expression(&mut self, node: &Node, st: &State) -> Node {
+    fn update_expression(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::UpdateExpression(u) = &node.kind else { unreachable!() };
         let argument = &*u.argument;
         if let NodeKind::MemberExpression(m) = &argument.kind {
@@ -154,26 +152,26 @@ impl<'a, 's> Client<'a, 's> {
                 return update(self, node);
             }
         }
-        let mut update = self.next(node, st);
+        let mut update = self.next(node, ancestors, st);
         if let (Some(left), Some(mutate)) = (&left, transformers.as_ref().and_then(|t| t.mutate.clone())) {
             update = mutate(self, left, update);
         }
         self.validate_mutation(node, st, update)
     }
 
-    fn assignment_expression(&mut self, node: &Node, st: &State) -> Node {
-        let expression = match self.visit_assignment_expression(node, st) {
+    fn assignment_expression(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
+        let expression = match self.visit_assignment_expression(node, ancestors, st) {
             Some(e) => e,
-            None => self.next(node, st),
+            None => self.next(node, ancestors, st),
         };
         self.validate_mutation(node, st, expression)
     }
 
     /// `visit_assignment_expression(node, context, build_assignment)`
-    fn visit_assignment_expression(&mut self, node: &Node, st: &State) -> Option<Node> {
+    fn visit_assignment_expression(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Option<Node> {
         let NodeKind::AssignmentExpression(a) = &node.kind else { unreachable!() };
         if matches!(a.left.kind, NodeKind::ArrayPattern(_) | NodeKind::ObjectPattern(_) | NodeKind::RestElement(_)) {
-            let value = self.visit_in(node, &a.right, st);
+            let value = self.visit_in(node, &a.right, ancestors, st);
             let should_cache = !matches!(value.kind, NodeKind::Identifier(_));
             let rhs = if should_cache { b::id("$$value") } else { value.clone() };
             let (inserts, paths) = js::extract_paths(&a.left, rhs.clone());
@@ -183,15 +181,15 @@ impl<'a, 's> Client<'a, 's> {
             for path in paths {
                 let mut value = path.expression;
                 js::rename_placeholders(&mut value, &names);
-                let assignment = self.build_assignment("=", &path.node, &value, node, false, st);
+                let assignment = self.build_assignment("=", &path.node, &value, node, false, ancestors, st);
                 if assignment.is_some() {
                     changed = true;
                 }
                 assignments.push(match assignment {
                     Some(a) => a,
                     None => {
-                        let left = self.visit_in(node, &path.node, st);
-                        let right = self.visit_in(node, &value, st);
+                        let left = self.visit_in(node, &path.node, ancestors, st);
+                        let right = self.visit_in(node, &value, ancestors, st);
                         b::assignment("=", left, right)
                     }
                 });
@@ -199,7 +197,7 @@ impl<'a, 's> Client<'a, 's> {
             if !changed {
                 return None;
             }
-            let is_standalone = self.path_type(1).is_some_and(|t| t.ends_with("Statement"));
+            let is_standalone = self.path_type(ancestors, 1).is_some_and(|t| t.ends_with("Statement"));
             if !inserts.is_empty() || should_cache {
                 let mut statements: Vec<Node> = inserts
                     .into_iter()
@@ -225,12 +223,12 @@ impl<'a, 's> Client<'a, 's> {
             return Some(b::sequence(expressions));
         }
         let operator = a.operator.as_str();
-        self.build_assignment(operator, &a.left, &a.right, node, true, st)
+        self.build_assignment(operator, &a.left, &a.right, node, true, ancestors, st)
     }
 
     /// The client's `build_assignment(operator, left, right, context)`. `direct` is set when
     /// `left` is `node.left` (not a destructured part).
-    fn build_assignment(&mut self, operator: &str, left: &Node, right: &Node, node: &Node, direct: bool, st: &State) -> Option<Node> {
+    fn build_assignment(&mut self, operator: &str, left: &Node, right: &Node, node: &Node, direct: bool, ancestors: &Ancestors, st: &State) -> Option<Node> {
         if self.an.runes {
             if let NodeKind::MemberExpression(m) = &left.kind {
                 let name = js::get_name(&m.property);
@@ -245,9 +243,9 @@ impl<'a, 's> Client<'a, 's> {
                         let rune = js::get_rune(Some(right), &self.an.sc, st.scope);
                         if let Some(rune) = rune {
                             let child_state = State { in_constructor: rune != "$derived" && rune != "$derived.by", ..st.clone() };
-                            let mut value = self.visit_in(node, right, &child_state);
+                            let mut value = self.visit_in(node, right, ancestors, &child_state);
                             if self.dev {
-                                let class_name = self.enclosing_class_name();
+                                let class_name = self.enclosing_class_name(ancestors);
                                 value = b::call("$.tag", vec![value, b::literal(format!("{}.{}", class_name, name))]);
                             }
                             // a private field's key is the original `left.property`
@@ -259,13 +257,13 @@ impl<'a, 's> Client<'a, 's> {
                     if let NodeKind::PrivateIdentifier(_) = &m.property.kind {
                         let logical = matches!(operator, "||=" | "&&=" | "??=");
                         let to_visit = if logical { right.clone() } else { js::build_assignment_value(operator, left.clone(), right.clone()) };
-                        let value = self.visit_in(node, &to_visit, st);
+                        let value = self.visit_in(node, &to_visit, ancestors, st);
                         let needs_proxy = rune_ty == "$state" && is_non_coercive_operator(operator) && self.should_proxy(&value, st.scope);
                         let assignment = b::call("$.set", vec![Some(left.clone()), Some(value), if needs_proxy { Some(b::r#true()) } else { None }]);
                         return Some(if !logical {
                             assignment
                         } else {
-                            let l = self.visit_in(node, left, st);
+                            let l = self.visit_in(node, left, ancestors, st);
                             b::logical(&operator[..operator.len() - 1], l, assignment)
                         });
                     }
@@ -284,9 +282,9 @@ impl<'a, 's> Client<'a, 's> {
         // reassignment
         if std::ptr::eq(object, left) {
             if let Some(assign) = transform.as_ref().and_then(|t| t.assign.clone()) {
-                let is_primitive = self.path_type(1) == Some("BindDirective") && self.path_type(2) == Some("RegularElement");
+                let is_primitive = self.path_type(ancestors, 1) == Some("BindDirective") && self.path_type(ancestors, 2) == Some("RegularElement");
                 let value_node = js::build_assignment_value(operator, left.clone(), right.clone());
-                let value = self.visit_in(node, &value_node, st);
+                let value = self.visit_in(node, &value_node, ancestors, st);
                 let kind = self.binding(bid).kind;
                 let proxy = !is_primitive
                     && !matches!(kind, Kind::Prop | Kind::BindableProp | Kind::RawState | Kind::Derived | Kind::StoreSub)
@@ -299,8 +297,8 @@ impl<'a, 's> Client<'a, 's> {
 
         // mutation
         if let Some(mutate) = transform.as_ref().and_then(|t| t.mutate.clone()) {
-            let l = self.visit_in(node, left, st);
-            let r = self.visit_in(node, right, st);
+            let l = self.visit_in(node, left, ancestors, st);
+            let r = self.visit_in(node, right, ancestors, st);
             let mut mutation = mutate(self, object, b::assignment(operator, l, r));
             let indirect = self.an.legacy_indirect_bindings.get(&bid).cloned().unwrap_or_default();
             if !indirect.is_empty() {
@@ -316,14 +314,13 @@ impl<'a, 's> Client<'a, 's> {
 
         // `(object.items ??= []).push(value)` and the like: `$.assign(...)` in dev
         let mut should_transform = self.dev
-            && self.path_type(1) != Some("ExpressionStatement")
+            && self.path_type(ancestors, 1) != Some("ExpressionStatement")
             && is_non_coercive_operator(operator)
             && !self.evaluate(right, st.scope).is_primitive;
 
         // `onclick={() => (...)}`
-        if self.path_type(1) == Some("ArrowFunctionExpression") && matches!(self.path_type(2), Some("RegularElement" | "SvelteElement")) {
-            let len = self.path.len();
-            if let (PathNode::Tpl(crate::analyze::nodes::P::Node(el)), Some(arrow)) = (self.path[len - 2], self.path[len - 1].js()) {
+        if self.path_type(ancestors, 1) == Some("ArrowFunctionExpression") && matches!(self.path_type(ancestors, 2), Some("RegularElement" | "SvelteElement")) {
+            if let (Some(PathNode::Tpl(crate::analyze::nodes::P::Node(el))), Some(arrow)) = (self.path_at(ancestors, 2), ancestors.parent()) {
                 if let crate::ast::Node::Element(e) = &self.ast().nodes[el] {
                     // `get_attribute_expression(attribute) === context.path.at(-1)`
                     let found = e.attributes.iter().any(|a| match a {
@@ -340,9 +337,9 @@ impl<'a, 's> Client<'a, 's> {
             }
         }
 
-        let p1 = self.path_type(1);
-        let p2 = self.path_type(2);
-        let p3 = self.path_type(3);
+        let p1 = self.path_type(ancestors, 1);
+        let p2 = self.path_type(ancestors, 2);
+        let p3 = self.path_type(ancestors, 3);
         if matches!(p1, Some("BindDirective" | "Component" | "SvelteComponent"))
             || (p1 == Some("ArrowFunctionExpression")
                 && (p2 == Some("BindDirective")
@@ -371,22 +368,20 @@ impl<'a, 's> Client<'a, 's> {
                 if needs_async {
                     e = b::r#await(e);
                 }
-                return Some(self.visit_in(node, &e, st));
+                return Some(self.visit_in(node, &e, ancestors, st));
             }
         }
         None
     }
 
     /// The name of the class around the current node (`[class]` if anonymous)
-    fn enclosing_class_name(&self) -> String {
-        for p in self.path.iter().rev() {
-            if let Some(n) = p.js() {
-                match &n.kind {
-                    NodeKind::ClassDeclaration(c) | NodeKind::ClassExpression(c) => {
-                        return c.id.as_deref().and_then(js::ident).unwrap_or("[class]").to_string();
-                    }
-                    _ => {}
+    fn enclosing_class_name(&self, ancestors: &Ancestors) -> String {
+        for n in ancestors.iter() {
+            match &n.kind {
+                NodeKind::ClassDeclaration(c) | NodeKind::ClassExpression(c) => {
+                    return c.id.as_deref().and_then(js::ident).unwrap_or("[class]").to_string();
                 }
+                _ => {}
             }
         }
         "[class]".into()
@@ -448,7 +443,7 @@ impl<'a, 's> Client<'a, 's> {
         )
     }
 
-    fn call_expression(&mut self, node: &Node, st: &State) -> Node {
+    fn call_expression(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::CallExpression(c) = &node.kind else { unreachable!() };
         let rune = js::get_rune(Some(node), &self.an.sc, st.scope);
         let first = || c.arguments.first();
@@ -458,7 +453,7 @@ impl<'a, 's> Client<'a, 's> {
             Some(r @ ("$state" | "$state.raw")) => {
                 let mut value = None;
                 if let Some(arg) = first() {
-                    let mut v = self.visit_in(node, arg, st);
+                    let mut v = self.visit_in(node, arg, ancestors, st);
                     if r == "$state" && self.should_proxy(arg, st.scope) {
                         v = b::call("$.proxy", vec![v]);
                     }
@@ -470,24 +465,24 @@ impl<'a, 's> Client<'a, 's> {
             }
             Some(r @ ("$derived" | "$derived.by")) => {
                 let arg = first().cloned().unwrap_or_else(b::void0);
-                let f = self.visit_in(node, &arg, st);
+                let f = self.visit_in(node, &arg, ancestors, st);
                 return b::call("$.derived", vec![if r == "$derived" { b::thunk(f) } else { f }]);
             }
             Some("$state.eager") => {
                 let arg = first().cloned().unwrap_or_else(b::void0);
-                let v = self.visit_in(node, &arg, st);
+                let v = self.visit_in(node, &arg, ancestors, st);
                 return b::call("$.eager", vec![b::thunk(v)]);
             }
             Some("$state.snapshot") => {
                 let arg = first().cloned().unwrap_or_else(b::void0);
-                let v = self.visit_in(node, &arg, st);
+                let v = self.visit_in(node, &arg, ancestors, st);
                 let ignored = self.is_ignored(node, "state_snapshot_uncloneable");
                 return b::call("$.snapshot", vec![Some(v), if ignored { Some(b::r#true()) } else { None }]);
             }
             Some(r @ ("$effect" | "$effect.pre")) => {
                 let callee = if r == "$effect" { "$.user_effect" } else { "$.user_pre_effect" };
                 let arg = first().cloned().unwrap_or_else(b::void0);
-                let func = self.visit_in(node, &arg, st);
+                let func = self.visit_in(node, &arg, ancestors, st);
                 let mut expr = b::call(callee, vec![func]);
                 if let NodeKind::CallExpression(ce) = &mut expr.kind {
                     ce.callee.loc = c.callee.loc;
@@ -495,11 +490,11 @@ impl<'a, 's> Client<'a, 's> {
                 return expr;
             }
             Some("$effect.root") => {
-                let args: Vec<Node> = c.arguments.iter().map(|a| self.visit_in(node, a, st)).collect();
+                let args: Vec<Node> = c.arguments.iter().map(|a| self.visit_in(node, a, ancestors, st)).collect();
                 return b::call("$.effect_root", args);
             }
             Some("$effect.pending") => return b::call("$.eager", vec![b::thunk(b::call("$.pending", ()))]),
-            Some(r @ ("$inspect" | "$inspect().with")) => return self.transform_inspect_rune(r, node, st),
+            Some(r @ ("$inspect" | "$inspect().with")) => return self.transform_inspect_rune(r, node, ancestors, st),
             _ => {}
         }
 
@@ -512,16 +507,16 @@ impl<'a, 's> Client<'a, 's> {
                 {
                     let mut args = vec![b::literal(js::ident(&m.property).unwrap())];
                     for a in &c.arguments {
-                        args.push(self.visit_in(node, a, st));
+                        args.push(self.visit_in(node, a, ancestors, st));
                     }
                     return b::call((*c.callee).clone(), vec![b::spread(b::call("$.log_if_contains_state", args))]);
                 }
             }
         }
-        self.next(node, st)
+        self.next(node, ancestors, st)
     }
 
-    fn transform_inspect_rune(&mut self, rune: &str, node: &Node, st: &State) -> Node {
+    fn transform_inspect_rune(&mut self, rune: &str, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         if !self.dev {
             return b::empty();
         }
@@ -535,17 +530,17 @@ impl<'a, 's> Client<'a, 's> {
             }
         };
         let NodeKind::CallExpression(inner) = &call.kind else { unreachable!() };
-        let args: Vec<Node> = inner.arguments.iter().map(|a| self.visit_in(node, a, st)).collect();
-        let inspector = if rune == "$inspect" { b::id("console.log") } else { self.visit_in(node, &c.arguments[0], st) };
+        let args: Vec<Node> = inner.arguments.iter().map(|a| self.visit_in(node, a, ancestors, st)).collect();
+        let inspector = if rune == "$inspect" { b::id("console.log") } else { self.visit_in(node, &c.arguments[0], ancestors, st) };
         let id = b::id("$$args");
         let f = b::arrow(vec![b::rest(id.clone())], b::call(inspector, vec![b::spread(id)]));
         b::call("$.inspect", vec![Some(b::thunk(b::array(args))), Some(f), if rune == "$inspect" { Some(b::r#true()) } else { None }])
     }
 
-    fn class_body(&mut self, node: &Node, st: &State) -> Node {
+    fn class_body(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::ClassBody(body) = &node.kind else { unreachable!() };
         let Some(&fields_idx) = node.origin.and_then(|o| self.an.classes.get(&o)) else {
-            return self.next(node, st);
+            return self.next(node, ancestors, st);
         };
         let fields: Vec<_> = self.an.state_fields[fields_idx as usize].iter().map(|f| (f.name.clone(), f.is_assignment, f.rune, f.key.clone(), f.node_key, f.value_key)).collect();
         let child_state = State { state_fields: fields_idx, ..st.clone() };
@@ -571,41 +566,34 @@ impl<'a, 's> Client<'a, 's> {
             }
         }
 
-        let class_name = match self.parent_js().map(|p| &p.kind) {
+        let class_name = match ancestors.parent().map(|p| &p.kind) {
             Some(NodeKind::ClassDeclaration(c) | NodeKind::ClassExpression(c)) => c.id.as_deref().and_then(js::ident).unwrap_or("[class]").to_string(),
             _ => "[class]".to_string(),
         };
 
-        self.path.push(PathNode::Js(node));
+        let ancestors = ancestors.push(node);
         for definition in &body.body {
             let NodeKind::PropertyDefinition(d) = &definition.kind else {
-                let v = self.visit_js(definition, &child_state);
+                let v = self.visit(definition, &ancestors, &child_state);
                 out.push(v);
                 continue;
             };
             let name = js::get_name(&d.key);
             let field = name.as_ref().and_then(|n| fields.iter().find(|f| &f.0 == n));
             let Some((name, _, rune, key, node_key, value_key)) = field.cloned() else {
-                let v = self.visit_js(definition, &child_state);
+                let v = self.visit(definition, &ancestors, &child_state);
                 out.push(v);
                 continue;
             };
             if name.starts_with('#') {
-                let mut value = d.value.as_deref().map(|v| {
-                    self.path.push(PathNode::Js(definition));
-                    let r = self.visit_js(v, &child_state);
-                    self.path.pop();
-                    r
-                });
+                let mut value = d.value.as_deref().map(|v| self.visit(v, &ancestors.push(definition), &child_state));
                 if self.dev && definition.origin == Some(node_key) {
                     value = Some(b::call("$.tag", vec![value.unwrap_or_else(b::void0), b::literal(format!("{}.{}", class_name, name))]));
                 }
                 out.push(b::prop_def((*d.key).clone(), value));
             } else if definition.origin == Some(node_key) {
                 let value = self.js_node_by_key(value_key).unwrap_or_else(b::void0);
-                self.path.push(PathNode::Js(definition));
-                let mut call = self.visit_js(&value, &child_state);
-                self.path.pop();
+                let mut call = self.visit(&value, &ancestors.push(definition), &child_state);
                 if self.dev {
                     call = b::call("$.tag", vec![call, b::literal(format!("{}.{}", class_name, name))]);
                 }
@@ -621,7 +609,6 @@ impl<'a, 's> Client<'a, 's> {
                 ));
             }
         }
-        self.path.pop();
         let mut result = node.clone();
         if let NodeKind::ClassBody(b) = &mut result.kind {
             b.body = out;
@@ -629,22 +616,16 @@ impl<'a, 's> Client<'a, 's> {
         result
     }
 
-    /// The converted node of a script node by its key
-    pub fn js_node_by_key(&self, key: usize) -> Option<Node> {
-        // SAFETY: see `js_node`
-        self.js_nodes.get(&key).map(|&n| unsafe { (*n).clone() })
-    }
-
-    fn labeled_statement(&mut self, node: &Node, st: &State) -> Node {
+    fn labeled_statement(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::LabeledStatement(l) = &node.kind else { unreachable!() };
-        if self.an.runes || self.path.len() > 1 || js::ident(&l.label) != Some("$") {
-            return self.next(node, st);
+        if self.an.runes || self.tpl_path.len() + ancestors.len() > 1 || js::ident(&l.label) != Some("$") {
+            return self.next(node, ancestors, st);
         }
         let start = node.span.map_or(0, |s| s.start) as usize;
         let Some(rs) = self.an.reactive_statements.iter().position(|r| r.node_start == start) else {
             return node.clone();
         };
-        let mut serialized_body = self.visit_in(node, &l.body, st);
+        let mut serialized_body = self.visit_in(node, &l.body, ancestors, st);
         if !serialized_body.is("BlockStatement") {
             serialized_body = b::block(vec![serialized_body]);
         }
@@ -670,7 +651,7 @@ impl<'a, 's> Client<'a, 's> {
         b::empty()
     }
 
-    fn program(&mut self, node: &Node, st: &State) -> Node {
+    fn program(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         if !self.an.runes {
             st.transform.borrow_mut().insert(
                 "$$props".into(),
@@ -816,16 +797,14 @@ impl<'a, 's> Client<'a, 's> {
         self.add_state_transformers(st);
 
         if st.is_instance {
-            self.path.push(PathNode::Js(node));
-            let body = self.instance_body(st);
-            self.path.pop();
+            let body = self.instance_body(&ancestors.push(node), st);
             let mut out = node.map_children(&mut |c| c.clone());
             if let NodeKind::Program(p) = &mut out.kind {
                 p.body = body;
             }
             return out;
         }
-        self.next(node, st)
+        self.next(node, ancestors, st)
     }
 
     /// `add_state_transformers(context)`
@@ -869,9 +848,9 @@ impl<'a, 's> Client<'a, 's> {
         }
     }
 
-    /// `transform_body(analysis.instance_body, b.id('$.run'), visit)`, with `self.path`
-    /// already holding the Program
-    fn instance_body(&mut self, st: &State) -> Vec<Node> {
+    /// `transform_body(analysis.instance_body, b.id('$.run'), visit)`, with `ancestors`
+    /// holding the Program
+    fn instance_body(&mut self, ancestors: &Ancestors, st: &State) -> Vec<Node> {
         use crate::analyze::blockers::SyncItem;
         let body = self.an.instance_body.clone();
         let mut statements = Vec::new();
@@ -890,7 +869,7 @@ impl<'a, 's> Client<'a, 's> {
                 }
             };
             if let Some(node) = node {
-                statements.push(self.visit_js(&node, st));
+                statements.push(self.visit(&node, ancestors, st));
             }
         }
         if !body.declarations.is_empty() {
@@ -902,7 +881,7 @@ impl<'a, 's> Client<'a, 's> {
                 let mut entry_statements = Vec::new();
                 for p in &entry.nodes {
                     let Some(node) = self.js_node(*p) else { continue };
-                    entry_statements.extend(self.transform_async_node(&node, st));
+                    entry_statements.extend(self.transform_async_node(&node, ancestors, st));
                 }
                 let thunk = if entry_statements.is_empty() {
                     b::thunk_with(b::void0(), false)
@@ -919,11 +898,11 @@ impl<'a, 's> Client<'a, 's> {
         statements
     }
 
-    fn transform_async_node(&mut self, node: &Node, st: &State) -> Vec<Node> {
+    fn transform_async_node(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Vec<Node> {
         match &node.kind {
             NodeKind::VariableDeclarator(d) => {
                 let var = b::var((*d.id).clone(), d.init.as_deref().cloned());
-                let visited = self.visit_js(&var, st);
+                let visited = self.visit(&var, ancestors, st);
                 match visited.kind {
                     NodeKind::VariableDeclaration(v) => v
                         .declarations
@@ -950,7 +929,7 @@ impl<'a, 's> Client<'a, 's> {
                 vec![b::stmt(b::assignment("=", id, expr))]
             }
             NodeKind::ExpressionStatement(e) => {
-                let expression = self.visit_js(&e.expression, st);
+                let expression = self.visit(&e.expression, ancestors, st);
                 match &expression.kind {
                     NodeKind::EmptyStatement => vec![],
                     NodeKind::AwaitExpression(_) => vec![b::stmt(expression)],
@@ -958,7 +937,7 @@ impl<'a, 's> Client<'a, 's> {
                 }
             }
             _ => {
-                let statement = self.visit_js(node, st);
+                let statement = self.visit(node, ancestors, st);
                 if statement.is("EmptyStatement") {
                     vec![]
                 } else {
@@ -968,31 +947,31 @@ impl<'a, 's> Client<'a, 's> {
         }
     }
 
-    fn expression_statement(&mut self, node: &Node, st: &State) -> Node {
+    fn expression_statement(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::ExpressionStatement(e) = &node.kind else { unreachable!() };
         if e.expression.is("CallExpression") && js::get_rune(Some(&e.expression), &self.an.sc, st.scope) == Some("$inspect.trace") {
             return b::empty();
         }
-        self.next(node, st)
+        self.next(node, ancestors, st)
     }
 
-    fn export_named_declaration(&mut self, node: &Node, st: &State) -> Node {
+    fn export_named_declaration(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::ExportNamedDeclaration(e) = &node.kind else { unreachable!() };
         if st.is_instance {
             if let Some(d) = &e.declaration {
-                return self.visit_in(node, d, st);
+                return self.visit_in(node, d, ancestors, st);
             }
             return b::empty();
         }
-        self.next(node, st)
+        self.next(node, ancestors, st)
     }
 
-    fn block_statement(&mut self, node: &Node, st: &State) -> Node {
+    fn block_statement(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         self.add_state_transformers(st);
         let tracing = if self.dev { self.an.scope_tracing.get(&st.scope).cloned() } else { None };
         if let Some(tracing) = tracing {
             let NodeKind::BlockStatement(bl) = &node.kind else { unreachable!() };
-            let is_async = match self.parent_js().map(|p| &p.kind) {
+            let is_async = match ancestors.parent().map(|p| &p.kind) {
                 Some(NodeKind::ArrowFunctionExpression(a)) => a.is_async,
                 Some(NodeKind::FunctionExpression(f) | NodeKind::FunctionDeclaration(f)) => f.is_async,
                 _ => false,
@@ -1004,21 +983,19 @@ impl<'a, 's> Client<'a, 's> {
                     b::thunk(b::literal(format!("{label} ({loc})")))
                 }
             };
-            let body: Vec<Node> = bl.body.iter().map(|n| self.visit_in(node, n, st)).collect();
+            let body: Vec<Node> = bl.body.iter().map(|n| self.visit_in(node, n, ancestors, st)).collect();
             let call = b::call("$.trace", vec![tracing, b::thunk_with(b::block(body), is_async)]);
             return b::block(vec![b::r#return(if is_async { b::r#await(call) } else { call })]);
         }
-        self.next(node, st)
+        self.next(node, ancestors, st)
     }
 
-    fn break_statement(&mut self, node: &Node, _st: &State) -> Node {
+    fn break_statement(&mut self, node: &Node, ancestors: &Ancestors, _st: &State) -> Node {
         let NodeKind::BreakStatement(j) = &node.kind else { unreachable!() };
         if self.an.runes || j.label.as_deref().and_then(js::ident) != Some("$") {
             return node.clone();
         }
-        let in_reactive_statement = self
-            .path
-            .get(1)
+        let in_reactive_statement = js::path_from_root(&self.tpl_path, ancestors, 1)
             .and_then(|p| p.js())
             .is_some_and(|p| matches!(&p.kind, NodeKind::LabeledStatement(l) if js::ident(&l.label) == Some("$")));
         if in_reactive_statement {
@@ -1027,9 +1004,9 @@ impl<'a, 's> Client<'a, 's> {
         node.clone()
     }
 
-    fn await_expression(&mut self, node: &Node, st: &State) -> Node {
+    fn await_expression(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::AwaitExpression(a) = &node.kind else { unreachable!() };
-        let argument = self.visit_in(node, &a.argument, st);
+        let argument = self.visit_in(node, &a.argument, ancestors, st);
         if node.origin.is_some_and(|o| self.an.pickled_awaits.contains(&o)) {
             return js::save(argument);
         }
@@ -1047,45 +1024,45 @@ impl<'a, 's> Client<'a, 's> {
         out
     }
 
-    fn binary_expression(&mut self, node: &Node, st: &State) -> Node {
+    fn binary_expression(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::BinaryExpression(e) = &node.kind else { unreachable!() };
         if self.dev {
             let op = e.operator.as_str();
             if op == "===" || op == "!==" {
-                let l = self.visit_in(node, &e.left, st);
-                let r = self.visit_in(node, &e.right, st);
+                let l = self.visit_in(node, &e.left, ancestors, st);
+                let r = self.visit_in(node, &e.right, ancestors, st);
                 return b::call("$.strict_equals", vec![Some(l), Some(r), if op == "!==" { Some(b::r#false()) } else { None }]);
             }
             if op == "==" || op == "!=" {
-                let l = self.visit_in(node, &e.left, st);
-                let r = self.visit_in(node, &e.right, st);
+                let l = self.visit_in(node, &e.left, ancestors, st);
+                let r = self.visit_in(node, &e.right, ancestors, st);
                 return b::call("$.equals", vec![Some(l), Some(r), if op == "!=" { Some(b::r#false()) } else { None }]);
             }
         }
-        self.next(node, st)
+        self.next(node, ancestors, st)
     }
 
-    fn visit_function(&mut self, node: &Node, st: &State) -> Node {
+    fn visit_function(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let mut state = State { in_constructor: false, in_derived: false, ..st.clone() };
         if node.is("FunctionExpression") {
-            state.in_constructor = matches!(self.parent_js().map(|p| &p.kind), Some(NodeKind::MethodDefinition(m)) if m.kind == crate::estree::MethodKind::Constructor);
+            state.in_constructor = matches!(ancestors.parent().map(|p| &p.kind), Some(NodeKind::MethodDefinition(m)) if m.kind == crate::estree::MethodKind::Constructor);
         }
-        self.next(node, &state)
+        self.next(node, ancestors, &state)
     }
 
-    fn for_of_statement(&mut self, node: &Node, st: &State) -> Node {
+    fn for_of_statement(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::ForOfStatement(f) = &node.kind else { unreachable!() };
         if f.is_await && self.dev && !self.is_ignored(node, "await_reactivity_loss") && self.options.experimental_async {
-            let left = self.visit_in(node, &f.left, st);
-            let argument = self.visit_in(node, &f.right, st);
-            let body = self.visit_in(node, &f.body, st);
+            let left = self.visit_in(node, &f.left, ancestors, st);
+            let argument = self.visit_in(node, &f.right, ancestors, st);
+            let body = self.visit_in(node, &f.body, ancestors, st);
             let right = b::call("$.for_await_track_reactivity_loss", vec![argument]);
             return b::for_of_with(left, right, body, true);
         }
-        self.next(node, st)
+        self.next(node, ancestors, st)
     }
 
-    fn variable_declaration(&mut self, node: &Node, st: &State) -> Node {
+    fn variable_declaration(&mut self, node: &Node, ancestors: &Ancestors, st: &State) -> Node {
         let NodeKind::VariableDeclaration(v) = &node.kind else { unreachable!() };
         let mut declarations: Vec<Node> = Vec::new();
         if self.an.runes {
@@ -1096,7 +1073,7 @@ impl<'a, 's> Client<'a, 's> {
                 if rune.is_none()
                     || matches!(rune, Some("$effect.tracking" | "$effect.root" | "$inspect" | "$inspect.trace" | "$state.snapshot" | "$state.eager" | "$host"))
                 {
-                    declarations.push(self.visit_in(node, declarator, st));
+                    declarations.push(self.visit_in(node, declarator, ancestors, st));
                     continue;
                 }
                 let rune = rune.unwrap();
@@ -1136,7 +1113,7 @@ impl<'a, 's> Client<'a, 's> {
                                 };
                                 let Some(bid) = js::ident(&id).and_then(|n| self.get(st.scope, n)) else { continue };
                                 let mut initial = match self.binding(bid).initial {
-                                    Some(i) => self.js_node(i).map(|n| self.visit_in(node, &n, st)),
+                                    Some(i) => self.js_node(i).map(|n| self.visit_in(node, &n, ancestors, st)),
                                     None => None,
                                 };
                                 if let Some(i) = &initial {
@@ -1196,13 +1173,13 @@ impl<'a, 's> Client<'a, 's> {
                         value
                     };
                     if let NodeKind::Identifier(i) = &d.id.kind {
-                        let expression = self.visit_in(node, &value, st);
+                        let expression = self.visit_in(node, &value, ancestors, st);
                         let v = create_state_declarator(self, i.name.as_str(), expression);
                         declarations.push(b::declarator((*d.id).clone(), v));
                     } else {
                         let tmp = b::id(self.generate(st.scope, "tmp"));
                         let (inserts, paths) = js::extract_paths(&d.id, tmp.clone());
-                        let v = self.visit_in(node, &value, st);
+                        let v = self.visit_in(node, &value, ancestors, st);
                         declarations.push(b::declarator(tmp, v));
                         let mut names = Vec::new();
                         let is_array = d.id.is("ArrayPattern");
@@ -1212,7 +1189,7 @@ impl<'a, 's> Client<'a, 's> {
                             st.transform.borrow_mut().insert(name.clone(), Transform::read(get_value_fn()));
                             let mut value = value;
                             js::rename_placeholders(&mut value, &names);
-                            let expression = self.visit_in(node, &b::thunk(value), st);
+                            let expression = self.visit_in(node, &b::thunk(value), ancestors, st);
                             let mut c = b::call("$.derived", vec![expression]);
                             if self.dev {
                                 c = b::call("$.tag", vec![c, b::literal(format!("[$state {}]", if is_array { "iterable" } else { "object" }))]);
@@ -1222,7 +1199,7 @@ impl<'a, 's> Client<'a, 's> {
                         for path in paths {
                             let mut e = path.expression;
                             js::rename_placeholders(&mut e, &names);
-                            let value = self.visit_in(node, &e, st);
+                            let value = self.visit_in(node, &e, ancestors, st);
                             let pname = js::ident(&path.node).unwrap_or("").to_string();
                             let bid = self.get(st.scope, &pname);
                             let is_state = bid.is_some_and(|b| matches!(self.binding(b).kind, Kind::State | Kind::RawState));
@@ -1237,7 +1214,7 @@ impl<'a, 's> Client<'a, 's> {
                     let meta = init.origin.and_then(|o| self.an.async_deriveds.iter().find(|(k, _)| *k == o).map(|(_, m)| *m));
                     let is_async = meta.is_some();
                     if let NodeKind::Identifier(i) = &d.id.kind {
-                        let mut expression = self.visit_in(node, &value, st);
+                        let mut expression = self.visit_in(node, &value, ancestors, st);
                         if is_async {
                             let location = if self.dev && !self.is_ignored(init, "await_waterfall") {
                                 Some(self.locate_node(init.start().unwrap_or(0) as usize))
@@ -1264,7 +1241,7 @@ impl<'a, 's> Client<'a, 's> {
                             declarations.push(b::declarator((*d.id).clone(), call));
                         }
                     } else {
-                        let expression = self.visit_in(node, &value, st);
+                        let expression = self.visit_in(node, &value, ancestors, st);
                         let mut rhs = value.clone();
                         let is_array = d.id.is("ArrayPattern");
                         if rune != "$derived" || !call.arguments.first().is_some_and(|a| a.is("Identifier")) {
@@ -1297,7 +1274,7 @@ impl<'a, 's> Client<'a, 's> {
                             st.transform.borrow_mut().insert(name.clone(), Transform::read(get_value_fn()));
                             let mut value = value;
                             js::rename_placeholders(&mut value, &names);
-                            let expression = self.visit_in(node, &b::thunk(value), st);
+                            let expression = self.visit_in(node, &b::thunk(value), ancestors, st);
                             let mut c = b::call("$.derived", vec![expression]);
                             if self.dev {
                                 c = b::call("$.tag", vec![c, b::literal(format!("[$derived {}]", if is_array { "iterable" } else { "object" }))]);
@@ -1307,7 +1284,7 @@ impl<'a, 's> Client<'a, 's> {
                         for path in paths {
                             let mut e = path.expression;
                             js::rename_placeholders(&mut e, &names);
-                            let expression = self.visit_in(node, &e, st);
+                            let expression = self.visit_in(node, &e, ancestors, st);
                             let call = b::call("$.derived", vec![b::thunk(expression)]);
                             let name = js::ident(&path.node).unwrap_or("").to_string();
                             declarations.push(b::declarator(path.node, if self.dev { b::call("$.tag", vec![call, b::literal(name.as_str())]) } else { call }));
@@ -1323,7 +1300,7 @@ impl<'a, 's> Client<'a, 's> {
                 let has_state = bindings.iter().any(|&b| self.binding(b).kind == Kind::State);
                 let has_props = bindings.iter().any(|&b| self.binding(b).kind == Kind::BindableProp);
                 if !has_state && !has_props {
-                    declarations.push(self.visit_in(node, declarator, st));
+                    declarations.push(self.visit_in(node, declarator, ancestors, st));
                     continue;
                 }
                 if has_props {
@@ -1331,7 +1308,7 @@ impl<'a, 's> Client<'a, 's> {
                         let tmp = b::id(self.generate(st.scope, "tmp"));
                         let (inserts, paths) = js::extract_paths(&d.id, tmp.clone());
                         let init = d.init.as_deref().cloned().unwrap_or_else(b::void0);
-                        let init = self.visit_in(node, &init, st);
+                        let init = self.visit_in(node, &init, ancestors, st);
                         declarations.push(b::declarator(tmp, init));
                         let mut names = Vec::new();
                         for (_, value) in inserts {
@@ -1340,7 +1317,7 @@ impl<'a, 's> Client<'a, 's> {
                             st.transform.borrow_mut().insert(name.clone(), Transform::read(get_value_fn()));
                             let mut value = value;
                             js::rename_placeholders(&mut value, &names);
-                            let expression = self.visit_in(node, &b::thunk(value), st);
+                            let expression = self.visit_in(node, &b::thunk(value), ancestors, st);
                             declarations.push(b::declarator(b::id(name.as_str()), b::call("$.derived", vec![expression])));
                         }
                         for path in paths {
@@ -1348,7 +1325,7 @@ impl<'a, 's> Client<'a, 's> {
                             let bid = self.get(st.scope, &name);
                             let mut e = path.expression;
                             js::rename_placeholders(&mut e, &names);
-                            let value = self.visit_in(node, &e, st);
+                            let value = self.visit_in(node, &e, ancestors, st);
                             let v = match bid {
                                 Some(bid) if self.binding(bid).kind == Kind::BindableProp => {
                                     let key = self.binding(bid).prop_alias.map(str::to_string).unwrap_or_else(|| name.clone());
@@ -1363,13 +1340,13 @@ impl<'a, 's> Client<'a, 's> {
                     let name = js::ident(&d.id).unwrap().to_string();
                     let bid = self.get(st.scope, &name).unwrap();
                     let key = self.binding(bid).prop_alias.map(str::to_string).unwrap_or_else(|| name.clone());
-                    let init = d.init.as_deref().map(|i| self.visit_in(node, i, st));
+                    let init = d.init.as_deref().map(|i| self.visit_in(node, i, ancestors, st));
                     let source = self.get_prop_source(bid, &key, init);
                     declarations.push(b::declarator((*d.id).clone(), source));
                     continue;
                 }
-                let value = d.init.as_deref().map(|i| self.visit_in(node, i, st));
-                let decls = self.create_state_declarators(node, &d.id, st, value);
+                let value = d.init.as_deref().map(|i| self.visit_in(node, i, ancestors, st));
+                let decls = self.create_state_declarators(node, &d.id, ancestors, st, value);
                 declarations.extend(decls);
             }
         }
@@ -1384,7 +1361,7 @@ impl<'a, 's> Client<'a, 's> {
     }
 
     /// `create_state_declarators(declarator, context, value)` (legacy mode)
-    fn create_state_declarators(&mut self, node: &Node, id: &Node, st: &State, value: Option<Node>) -> Vec<Node> {
+    fn create_state_declarators(&mut self, node: &Node, id: &Node, ancestors: &Ancestors, st: &State, value: Option<Node>) -> Vec<Node> {
         let immutable = self.immutable;
         let dev = self.dev;
         let mutable_source = move |value: Option<Node>, name: &str| -> Node {
@@ -1404,13 +1381,13 @@ impl<'a, 's> Client<'a, 's> {
             st.transform.borrow_mut().insert(name.clone(), Transform::read(get_value_fn()));
             let mut value = value;
             js::rename_placeholders(&mut value, &names);
-            let expression = self.visit_in(node, &b::thunk(value), st);
+            let expression = self.visit_in(node, &b::thunk(value), ancestors, st);
             out.push(b::declarator(b::id(name.as_str()), b::call("$.derived", vec![expression])));
         }
         for path in paths {
             let mut e = path.expression;
             js::rename_placeholders(&mut e, &names);
-            let value = self.visit_in(node, &e, st);
+            let value = self.visit_in(node, &e, ancestors, st);
             let name = js::ident(&path.node).unwrap_or("").to_string();
             let is_state = self.get(st.scope, &name).is_some_and(|b| self.binding(b).kind == Kind::State);
             out.push(b::declarator(path.node, if is_state { mutable_source(Some(value), &name) } else { value }));
