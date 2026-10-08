@@ -103,7 +103,7 @@ pub struct Scope<'s> {
     pub parent: Option<ScopeId>,
     pub porous: bool,
     pub function_depth: u32,
-    pub declarations: FxIndexMap<&'s str, BindingId>,
+    pub declarations: DeclMap<'s>,
     /// Only kept for the scopes whose references the analysis looks at (the module scope,
     /// `$:` statements and snippets), see `track_references`
     pub references: FxIndexMap<&'s str, Vec<RefId>>,
@@ -114,14 +114,70 @@ pub struct Scope<'s> {
 }
 
 impl Scope<'_> {
-    /// `declarations.get(name)`; small maps are scanned instead of hashed
     #[inline]
     pub fn declared(&self, name: &str) -> Option<BindingId> {
-        if self.declarations.len() <= 8 {
-            self.declarations.iter().find(|(k, _)| **k == name).map(|(_, b)| *b)
-        } else {
-            self.declarations.get(name).copied()
+        self.declarations.get(name).copied()
+    }
+}
+
+/// An insertion-ordered map of declarations (a `Map` in the JS). Most scopes declare few
+/// names, so this is a small vector, indexed once it grows.
+#[derive(Debug, Default)]
+pub struct DeclMap<'s> {
+    entries: smallvec::SmallVec<[(&'s str, BindingId); 2]>,
+    index: Option<Box<FxHashMap<&'s str, usize>>>,
+}
+
+impl<'s> DeclMap<'s> {
+    pub fn get(&self, name: &str) -> Option<&BindingId> {
+        match &self.index {
+            Some(index) => index.get(name).map(|&i| &self.entries[i].1),
+            None => self.entries.iter().find(|(k, _)| *k == name).map(|(_, b)| b),
         }
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// `map.set(name, binding)`: a new name goes last, an existing one keeps its position
+    pub fn insert(&mut self, name: &'s str, b: BindingId) {
+        let existing = match &self.index {
+            Some(index) => index.get(name).copied(),
+            None => self.entries.iter().position(|(k, _)| *k == name),
+        };
+        match existing {
+            Some(i) => self.entries[i].1 = b,
+            None => {
+                self.entries.push((name, b));
+                let i = self.entries.len() - 1;
+                match &mut self.index {
+                    Some(index) => {
+                        index.insert(name, i);
+                    }
+                    None if self.entries.len() > 8 => {
+                        self.index = Some(Box::new(self.entries.iter().enumerate().map(|(i, (k, _))| (*k, i)).collect()));
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&&'s str, &BindingId)> {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &BindingId> {
+        self.entries.iter().map(|(_, v)| v)
     }
 }
 
@@ -150,7 +206,7 @@ impl<'s> Scopes<'s> {
             parent,
             porous,
             function_depth,
-            declarations: FxIndexMap::default(),
+            declarations: DeclMap::default(),
             references: FxIndexMap::default(),
             track_refs: parent.is_none(),
             lookup_parent: parent,
