@@ -4,7 +4,7 @@
 use super::Dialect;
 
 /// `TokenType` (complete, like the JS enum)
-#[allow(dead_code)]
+#[allow(dead_code, clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TT {
     Ident,

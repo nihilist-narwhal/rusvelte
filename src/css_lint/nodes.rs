@@ -369,9 +369,11 @@ impl Iterator for Children<'_> {
     }
 }
 
+type Arena = (Vec<NodeData>, Vec<(NodeId, Issue)>);
+
 thread_local! {
     /// the arena of the previous parse on this thread, reused to avoid reallocating
-    static CACHE: std::cell::RefCell<(Vec<NodeData>, Vec<(NodeId, Issue)>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    static CACHE: std::cell::RefCell<Arena> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
 impl Ast {

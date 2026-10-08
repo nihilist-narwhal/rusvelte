@@ -74,8 +74,7 @@ impl<'a> Parser<'a> {
             return None;
         }
         let node = self.create(Class::VariableDeclaration);
-        let v = self.scss_parse_variable();
-        let Some(v) = v else { return None };
+        let v = self.scss_parse_variable()?;
         self.ast.adopt_child(node, v, -1);
         self.ast.set_field(node, Field::Variable, v);
         if !self.accept(TT::Colon) {

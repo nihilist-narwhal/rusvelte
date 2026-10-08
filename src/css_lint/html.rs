@@ -19,6 +19,7 @@ enum State {
     BeforeAttributeValue,
 }
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tok {
     StartCommentTag,
@@ -541,6 +542,9 @@ pub fn js_substring(src: &[u16], a: usize, b: usize) -> &[u16] {
     if a <= b { &src[a..b] } else { &src[b..a] }
 }
 
+/// (raw name, value)
+pub type Attribute = (Vec<u16>, Option<Vec<u16>>);
+
 pub struct HtmlNode {
     pub start: usize,
     pub end: usize,
@@ -548,7 +552,7 @@ pub struct HtmlNode {
     pub start_tag_end: Option<usize>,
     pub end_tag_start: Option<usize>,
     /// `attributes` (raw names; `None` for a valueless attribute)
-    pub attributes: Option<Vec<(Vec<u16>, Option<Vec<u16>>)>>,
+    pub attributes: Option<Vec<Attribute>>,
     pub children: Vec<usize>,
     pub parent: Option<usize>,
 }
