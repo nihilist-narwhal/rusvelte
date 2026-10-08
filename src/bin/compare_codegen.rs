@@ -116,12 +116,18 @@ fn main() {
                 } else if out.css.as_ref().map(|c| c.code.as_str()) != record["css"].as_str() {
                     ("css differs".to_string(), String::new())
                 } else if check_maps && record.get("js_map").is_some() && Some(out.js_mappings.as_str()) != record["js_map"]["mappings"].as_str() {
-                    first_diff_mappings("js map", record["js_map"]["mappings"].as_str().unwrap_or(""), &out.js_mappings)
+                    first_diff_mappings("js map", record["js_map"]["mappings"].as_str().unwrap_or(""), &out.js_mappings, &out.js, &source)
                 } else if check_maps
                     && record.get("css_map").is_some()
                     && out.css.as_ref().map(|c| c.mappings.as_str()) != record["css_map"]["mappings"].as_str()
                 {
-                    first_diff_mappings("css map", record["css_map"]["mappings"].as_str().unwrap_or(""), out.css.as_ref().map_or("", |c| c.mappings.as_str()))
+                    first_diff_mappings(
+                        "css map",
+                        record["css_map"]["mappings"].as_str().unwrap_or(""),
+                        out.css.as_ref().map_or("", |c| c.mappings.as_str()),
+                        out.css.as_ref().map_or("", |c| c.code.as_str()),
+                        &source,
+                    )
                 } else if check_warnings && record.get("warnings").is_some() && warnings_json(&out.warnings) != record["warnings"] {
                     let expected: Vec<String> = record["warnings"].as_array().unwrap().iter().map(|w| w["code"].as_str().unwrap_or("").to_string()).collect();
                     let actual: Vec<&str> = out.warnings.iter().map(|w| w.code).collect();
@@ -198,16 +204,93 @@ fn warnings_json(warnings: &[rusvelte::analyze::Warning]) -> Value {
     )
 }
 
-/// The first generated line whose mappings differ
-fn first_diff_mappings(what: &str, expected: &str, actual: &str) -> (String, String) {
+
+/// Decodes one generated line's segments: (generated column, source position) with the source
+/// position accumulated in `state` (source, line, column, name)
+fn decode_line(line: &str, state: &mut [i64; 4]) -> Vec<(i64, Option<(i64, i64)>)> {
+    const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut col = 0i64;
+    for seg in line.split(',').filter(|s| !s.is_empty()) {
+        let mut fields = Vec::new();
+        let (mut value, mut shift) = (0i64, 0);
+        for c in seg.bytes() {
+            let d = B64.iter().position(|&x| x == c).unwrap_or(0) as i64;
+            value += (d & 31) << shift;
+            if d & 32 != 0 {
+                shift += 5;
+            } else {
+                fields.push(if value & 1 != 0 { -(value >> 1) } else { value >> 1 });
+                value = 0;
+                shift = 0;
+            }
+        }
+        col += fields[0];
+        if fields.len() >= 4 {
+            for k in 0..3 {
+                state[k] += fields[k + 1];
+            }
+            if fields.len() == 5 {
+                state[3] += fields[4];
+            }
+            out.push((col, Some((state[1], state[2]))));
+        } else {
+            out.push((col, None));
+        }
+    }
+    out
+}
+
+/// The first generated segment whose mapping differs, keyed by the kind of difference and the
+/// generated code there (`MAPKEY=line`: by the generated line number)
+fn first_diff_mappings(what: &str, expected: &str, actual: &str, code: &str, source: &str) -> (String, String) {
     let e: Vec<&str> = expected.split(';').collect();
     let a: Vec<&str> = actual.split(';').collect();
-    for i in 0..e.len().max(a.len()) {
-        let el = e.get(i).copied().unwrap_or("<eof>");
-        let al = a.get(i).copied().unwrap_or("<eof>");
-        if el != al {
-            return (format!("{what} differs (line {})", i + 1), format!("expected: {el}\nactual:   {al}"));
+    let code_lines: Vec<&str> = code.split('\n').collect();
+    let src_lines: Vec<&str> = source.split('\n').collect();
+    let (mut es, mut as_) = ([0i64; 4], [0i64; 4]);
+    let show = |p: Option<(i64, i64)>| -> String {
+        match p {
+            None => "-".into(),
+            Some((l, c)) => {
+                let text: String = src_lines.get(l as usize).map_or("", |s| s).chars().skip(c as usize).take(24).collect();
+                format!("{}:{} `{}`", l + 1, c, text)
+            }
         }
+    };
+    for i in 0..e.len().max(a.len()) {
+        let el = decode_line(e.get(i).copied().unwrap_or(""), &mut es);
+        let al = decode_line(a.get(i).copied().unwrap_or(""), &mut as_);
+        if el == al {
+            continue;
+        }
+        let line = code_lines.get(i).copied().unwrap_or("");
+        let mut k = 0;
+        while k < el.len() && k < al.len() && el[k] == al[k] {
+            k += 1;
+        }
+        let (ex, ac) = (el.get(k).copied(), al.get(k).copied());
+        let (col, kind) = match (ex, ac) {
+            (Some(x), Some(y)) if x.0 < y.0 => (x.0, "missing"),
+            (Some(x), Some(y)) if x.0 > y.0 => (y.0, "extra"),
+            (Some(x), Some(_)) => (x.0, "source differs"),
+            (Some(x), None) => (x.0, "missing"),
+            (None, Some(y)) => (y.0, "extra"),
+            (None, None) => (0, "?"),
+        };
+        let snippet: String = line.chars().skip(col as usize).take(30).collect();
+        let key = if std::env::var("MAPKEY").as_deref() == Ok("line") {
+            format!("{what} differs (line {})", i + 1)
+        } else {
+            format!("{what} {kind} at `{}`", snippet.trim_end())
+        };
+        let fmt = |segs: &[(i64, Option<(i64, i64)>)]| -> String {
+            segs.iter()
+                .map(|(c, p)| format!("    {c} `{}`: {}", line.chars().skip(*c as usize).take(16).collect::<String>(), show(*p)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        return (key, format!("line {}: {line}\nexpected:\n{}\nactual:\n{}", i + 1, fmt(&el), fmt(&al)));
     }
     (format!("{what} differs"), String::new())
 }

@@ -595,9 +595,10 @@ impl<'a, 's> Server<'a, 's> {
         // keep the number of thunks pushed in sync with analysis phase
         let has_await = self.an.metas[meta as usize].has_await || assignments.iter().any(b::has_await_expression);
         let body = if assignments.len() == 1 {
-            match assignments.into_iter().next().unwrap().kind {
+            let assignment = assignments.into_iter().next().unwrap();
+            match assignment.kind {
                 NodeKind::ExpressionStatement(e) => *e.expression,
-                kind => Node { kind, ..b::empty() },
+                _ => assignment,
             }
         } else {
             b::block(assignments)
@@ -614,6 +615,7 @@ impl<'a, 's> Server<'a, 's> {
             crate::ast::Pattern::Ident { name, start, end, .. } => {
                 let mut id = b::id(name.as_str());
                 id.span = Some(crate::estree::Span::new(*start as u32, *end as u32));
+                id.loc = Some(self.conv.location(oxc_span::Span::new(*start as u32, *end as u32)));
                 id.origin = Some(P::PatIdent(p).key());
                 id
             }

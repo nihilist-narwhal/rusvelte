@@ -250,7 +250,9 @@ impl<'a, 's> Client<'a, 's> {
                                 let class_name = self.enclosing_class_name();
                                 value = b::call("$.tag", vec![value, b::literal(format!("{}.{}", class_name, name))]);
                             }
-                            return Some(b::assignment(operator, b::member(b::this(), b::private_id(key.as_str())), value));
+                            // a private field's key is the original `left.property`
+                            let key = if name.starts_with('#') { (*m.property).clone() } else { b::private_id(key.as_str()) };
+                            return Some(b::assignment(operator, b::member(b::this(), key), value));
                         }
                     }
                     // assignment to a private state field
@@ -304,7 +306,7 @@ impl<'a, 's> Client<'a, 's> {
             if !indirect.is_empty() {
                 let mut stmts = Vec::new();
                 for ib in indirect {
-                    let id = b::id(self.binding(ib).node.name);
+                    let id = self.id_copy(self.binding(ib).node);
                     stmts.push(b::stmt(self.build_getter(&id, st)));
                 }
                 mutation = b::sequence(vec![mutation, b::call("$.invalidate_inner_signals", vec![b::arrow(vec![], b::block(stmts))])]);

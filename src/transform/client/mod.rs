@@ -437,7 +437,11 @@ impl<'a, 's> Client<'a, 's> {
 
     pub fn convert_program(&self, p: P<'s>) -> Node {
         match p {
-            P::Js(oxc_ast::AstKind::Program(program)) => self.conv.program(program),
+            P::Js(oxc_ast::AstKind::Program(program)) => {
+                let mut node = self.conv.program(program);
+                node.loc = crate::transform::script_program_loc(&self.conv, self.an.root, program).or(node.loc);
+                node
+            }
             _ => program_node(vec![]),
         }
     }
@@ -990,9 +994,18 @@ impl<'a, 's> Client<'a, 's> {
         let mut n = b::id(id.name);
         if let Some((start, end)) = id.span {
             n.span = Some(crate::estree::Span::new(start, end));
-            n.loc = Some(self.conv.location(oxc_span::Span::new(start, end)));
+            if id.has_loc() {
+                n.loc = Some(self.conv.location(oxc_span::Span::new(start, end)));
+            }
         }
         n.origin = Some(id.key);
+        n
+    }
+
+    /// `{ ...binding.node }`: a copy of an analysis identifier (its position, not its identity)
+    pub fn id_copy(&self, id: crate::analyze::scope::Id) -> Node {
+        let mut n = self.id_node(id);
+        n.origin = None;
         n
     }
 }

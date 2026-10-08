@@ -137,6 +137,11 @@ pub fn build_template(template: Vec<Node>) -> Vec<Node> {
             if strings.is_empty() {
                 strings.push(String::new());
             }
+            if !matches!(node.kind, NodeKind::Literal(_) | NodeKind::TemplateLiteral(_)) {
+                expressions.push(node);
+                strings.push(String::new());
+                continue;
+            }
             match node.kind {
                 NodeKind::Literal(l) => {
                     let s = match l.value {
@@ -159,10 +164,7 @@ pub fn build_template(template: Vec<Node>) -> Vec<Node> {
                     strings.extend(quasis);
                     expressions.extend(t.expressions);
                 }
-                kind => {
-                    expressions.push(Node { kind, ..b::empty() });
-                    strings.push(String::new());
-                }
+                _ => unreachable!(),
             }
         }
     }

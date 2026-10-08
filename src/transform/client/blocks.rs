@@ -384,7 +384,7 @@ impl<'a, 's> Client<'a, 's> {
                 for &d in &each_meta.transitive_deps {
                     if !seen_bindings.contains(&d) {
                         seen_bindings.push(d);
-                        transitive.push(b::id(self.binding(d).node.name));
+                        transitive.push(self.id_copy(self.binding(d).node));
                     }
                 }
             }
@@ -402,7 +402,7 @@ impl<'a, 's> Client<'a, 's> {
                 for d in deps {
                     if !seen_bindings.contains(&d) {
                         seen_bindings.push(d);
-                        transitive.push(b::id(self.binding(d).node.name));
+                        transitive.push(self.id_copy(self.binding(d).node));
                     }
                 }
             }
@@ -905,7 +905,7 @@ impl<'a, 's> Client<'a, 's> {
         let params: Vec<Node> = match parameters {
             Some(arrow) => {
                 let mut conv = crate::estree::convert::Converter::new(self.locator, self.an.root.ts);
-                conv.preserve_parens = false;
+                conv.preserve_parens = true;
                 match conv.expression(&arrow.expr).kind {
                     NodeKind::ArrowFunctionExpression(a) => a.params,
                     _ => vec![],
