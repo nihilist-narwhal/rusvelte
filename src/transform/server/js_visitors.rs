@@ -31,6 +31,7 @@ impl<'a, 's> Server<'a, 's> {
             NodeKind::CallExpression(_) => self.call_expression(node, st),
             NodeKind::AssignmentExpression(_) => self.assignment_expression(node, st),
             NodeKind::VariableDeclaration(_) => self.variable_declaration(node, st),
+            NodeKind::ClassBody(_) => self.class_body(node, st),
             _ => self.next(node, st),
         }
     }
@@ -101,8 +102,80 @@ impl<'a, 's> Server<'a, 's> {
     }
 
     fn member_expression(&mut self, node: &Node, st: &State) -> Node {
-        // TODO: `#private` derived fields of runes classes
+        let NodeKind::MemberExpression(m) = &node.kind else { unreachable!() };
+        if self.an.runes {
+            if let NodeKind::PrivateIdentifier(p) = &m.property.kind {
+                let name = format!("#{}", p.name);
+                if matches!(self.state_field(st, &name).map(|f| f.rune), Some("$derived" | "$derived.by")) {
+                    return b::call(node.clone(), ());
+                }
+            }
+        }
         self.next(node, st)
+    }
+
+    /// `context.state.state_fields?.get(name)`
+    fn state_field(&self, st: &State, name: &str) -> Option<&crate::analyze::StateField> {
+        self.an.state_fields[st.state_fields? as usize].iter().find(|f| f.name == name)
+    }
+
+    fn class_body(&mut self, node: &Node, st: &State) -> Node {
+        let NodeKind::ClassBody(class) = &node.kind else { unreachable!() };
+        let Some(&fields_idx) = node.origin.and_then(|o| self.an.classes.get(&o)) else {
+            // in legacy mode, do nothing
+            return self.next(node, st);
+        };
+        let fields: Vec<(String, bool, &'static str, String, usize)> = self.an.state_fields[fields_idx as usize]
+            .iter()
+            .map(|f| (f.name.clone(), f.is_assignment, f.rune, f.key.clone(), f.node_key))
+            .collect();
+        let child_state = State { state_fields: Some(fields_idx), ..st.clone() };
+        let mut body = Vec::new();
+
+        for (name, is_assignment, rune, key, _) in &fields {
+            if name.starts_with('#') {
+                continue;
+            }
+            // insert backing fields for stuff declared in the constructor
+            if *is_assignment && matches!(*rune, "$derived" | "$derived.by") {
+                let member = b::member(b::this(), b::private_id(key.as_str()));
+                body.push(b::prop_def(b::private_id(key.as_str()), None));
+                body.push(b::method("get", b::key(name), vec![], vec![b::r#return(b::call(member.clone(), ()))]));
+                body.push(b::method("set", b::key(name), vec![b::id("$$value")], vec![b::r#return(b::call(member, vec![b::id("$$value")]))]));
+            }
+        }
+
+        self.path.push(PathNode::Js(node));
+        for definition in &class.body {
+            let NodeKind::PropertyDefinition(d) = &definition.kind else {
+                body.push(self.visit_js(definition, &child_state));
+                continue;
+            };
+            let name = js::get_name(&d.key);
+            let field = name.as_ref().and_then(|n| fields.iter().find(|f| &f.0 == n));
+            let Some((name, _, rune, key, node_key)) = field.cloned() else {
+                body.push(self.visit_js(definition, &child_state));
+                continue;
+            };
+            if name.starts_with('#') || rune == "$state" || rune == "$state.raw" {
+                body.push(self.visit_js(definition, &child_state));
+            } else if definition.origin == Some(node_key) {
+                // $derived / $derived.by
+                let member = b::member(b::this(), b::private_id(key.as_str()));
+                let value = d.value.as_deref().cloned().unwrap_or_else(b::void0);
+                let value = self.visit_js(&value, &child_state);
+                body.push(b::prop_def(b::private_id(key.as_str()), value));
+                body.push(b::method("get", (*d.key).clone(), vec![], vec![b::r#return(b::call(member.clone(), ()))]));
+                body.push(b::method("set", b::key(&name), vec![b::id("$$value")], vec![b::r#return(b::call(member, vec![b::id("$$value")]))]));
+            }
+        }
+        self.path.pop();
+
+        let mut out = node.clone();
+        if let NodeKind::ClassBody(c) = &mut out.kind {
+            c.body = body;
+        }
+        out
     }
 
     fn update_expression(&mut self, node: &Node, st: &State) -> Node {
@@ -468,7 +541,31 @@ impl<'a, 's> Server<'a, 's> {
 
     /// The server's `build_assignment`
     fn build_assignment(&mut self, operator: &str, left: &Node, right: &Node, node: &Node, st: &State) -> Option<Node> {
-        // TODO: state fields of runes classes (`this.x = $state(...)` in constructors)
+        if self.an.runes {
+            if let NodeKind::MemberExpression(m) = &left.kind {
+                if matches!(m.object.kind, NodeKind::ThisExpression) && !m.computed {
+                    let name = js::get_name(&m.property);
+                    let field = name.as_deref().and_then(|n| self.state_field(st, n)).map(|f| (f.is_assignment, f.node_key, f.rune, f.key.clone()));
+                    let is_field_left = matches!(&node.kind, NodeKind::AssignmentExpression(a) if std::ptr::eq(&*a.left, left));
+                    if let Some((is_assignment, node_key, rune_ty, key)) = field {
+                        if is_assignment && node.origin == Some(node_key) && is_field_left {
+                            // special case — state declaration in class constructor
+                            if let Some(rune) = js::get_rune(Some(right), &self.an.sc, st.scope) {
+                                let is_private = matches!(m.property.kind, NodeKind::PrivateIdentifier(_));
+                                let key = if is_private || rune == "$state" || rune == "$state.raw" { (*m.property).clone() } else { b::private_id(key.as_str()) };
+                                let computed = matches!(key.kind, NodeKind::Literal(_));
+                                let value = self.visit_in(node, right, st);
+                                return Some(b::assignment(operator, b::member_with(b::this(), key, computed, false), value));
+                            }
+                        } else if matches!(rune_ty, "$derived" | "$derived.by") && matches!(m.property.kind, NodeKind::PrivateIdentifier(_)) {
+                            let value = js::build_assignment_value(operator, left.clone(), right.clone());
+                            let value = self.visit_in(node, &value, st);
+                            return Some(b::call(b::member(b::this(), b::id(name.unwrap().as_str())), vec![value]));
+                        }
+                    }
+                }
+            }
+        }
         let object = {
             let mut o = left;
             while let NodeKind::MemberExpression(m) = &o.kind {
