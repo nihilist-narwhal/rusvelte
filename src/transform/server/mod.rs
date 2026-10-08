@@ -7,6 +7,7 @@
 //! [`Server::visit_node`] and friends. `state` is copied like the JS spreads it; the arrays the
 //! JS shares between state copies (`init`, `template`) are shared [`Shared`] vectors here.
 
+mod component;
 mod element;
 mod js_visitors;
 mod template;

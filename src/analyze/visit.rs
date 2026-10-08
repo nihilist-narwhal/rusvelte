@@ -1870,7 +1870,21 @@ impl<'s> Analyzer<'s> {
             Node::Element(el) => match el.kind {
                 "RegularElement" => self.regular_element(p, n, st),
                 "SvelteElement" => self.svelte_element(p, n, st),
-                "Component" => self.visit_component(p, n, st),
+                "Component" => {
+                    // `metadata.dynamic`: a runes component whose name refers to something that can change
+                    let base = el.name.split('.').next().unwrap_or(el.name);
+                    let binding = self.get(st.scope, base);
+                    let dynamic = self.runes && binding.is_some_and(|b| self.binding(b).kind != Kind::Normal || el.name.contains('.'));
+                    self.node_meta_mut(n).dynamic = dynamic;
+                    let meta = self.new_meta(p);
+                    if let Some(b) = binding {
+                        let m = &mut self.metas[meta as usize];
+                        m.has_state = dynamic;
+                        m.dependencies.push(b);
+                        m.references.push(b);
+                    }
+                    self.visit_component(p, n, st)
+                }
                 "SvelteComponent" => {
                     if self.runes {
                         self.warn(Some(p), w::svelte_component_deprecated());

@@ -383,9 +383,23 @@ impl<'a, 's> Server<'a, 's> {
         self.fragment(f, Parent::Root, st)
     }
 
-    /// The `Fragment` visitor
+    /// The `Fragment` visitor (with `set_scope`)
     pub fn fragment(&mut self, f: FragId, parent: Parent, st: &State) -> Node {
         let nodes = self.ast().fragments[f].nodes.clone();
+        let scoped;
+        let st = match self.scope_of_key(P::Fragment(f).key()) {
+            Some(scope) if scope != st.scope => {
+                scoped = State { scope, ..st.clone() };
+                &scoped
+            }
+            _ => st,
+        };
+        self.fragment_nodes(f, &nodes, parent, st)
+    }
+
+    /// The `Fragment` visitor for `{ ...fragment, nodes }` (a component's slot)
+    pub fn fragment_nodes(&mut self, f: FragId, nodes: &[NodeId], parent: Parent, st: &State) -> Node {
+        let nodes = nodes.to_vec();
         let namespace = self.infer_namespace(st.namespace, parent, &nodes);
         let cleaned = self.clean_nodes(parent, &nodes, namespace, st.preserve_whitespace, self.options.preserve_comments);
         let state = State { init: shared(), template: shared(), namespace, is_standalone: cleaned.is_standalone, async_consts: None, ..st.clone() };
@@ -438,6 +452,10 @@ impl<'a, 's> Server<'a, 's> {
                     return;
                 }
                 "TitleElement" => self.title_element(n, st),
+                "Component" => {
+                    let expression = self.component_expression(el.name, st);
+                    self.build_inline_component(n, expression, st);
+                }
                 "SvelteHead" => self.svelte_head(n, st),
                 _ => {}
             },
