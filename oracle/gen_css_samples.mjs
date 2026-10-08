@@ -170,6 +170,55 @@ if (want('mut-css') || want('mut-scss') || want('mut-less')) {
     }
 }
 
+// heavier mutations (more edits per file) with other seeds
+if (want('mut2-css') || want('mut2-scss') || want('mut2-less')) {
+    const contents = styleContents();
+    for (const [lang, seed] of [
+        ['css', 31],
+        ['scss', 32],
+        ['less', 33]
+    ]) {
+        if (!want('mut2-' + lang)) continue;
+        const r = rng(seed);
+        const files = [];
+        for (const { css, from } of contents) {
+            if (css.length > 3000) continue;
+            for (let i = 0; i < 3; i++) {
+                let s = css;
+                const rounds = 2 + Math.floor(r() * 4);
+                for (let k = 0; k < rounds; k++) s = mutate(s, r);
+                files.push({ text: wrap(s, lang === 'css' ? '' : lang), from });
+            }
+        }
+        writeCorpus('mut2-' + lang, files);
+    }
+}
+
+// random token soups
+const SOUP_EXTRA = [
+    'a', 'b', '.c', '#d', 'div', 'color', 'red', '1px', '2', '50%', 'x-y', '--v', 'var(--v)', '"s"', "'t'", ' ', ' ', '\n',
+    '{', '}', '{', '}', ';', ';', ':', '(', ')', ',', 'and', 'not', '@media', '@if', '@include', '@mixin', '.m(', '@x:', '$y:', '&'
+];
+if (want('soup-css') || want('soup-scss') || want('soup-less')) {
+    const pool = [...INSERTS, ...SOUP_EXTRA, ...SOUP_EXTRA];
+    for (const [lang, seed] of [
+        ['css', 41],
+        ['scss', 42],
+        ['less', 43]
+    ]) {
+        if (!want('soup-' + lang)) continue;
+        const r = rng(seed);
+        const files = [];
+        for (let i = 0; i < 4000; i++) {
+            const n = 1 + Math.floor(r() * 40);
+            let s = '';
+            for (let k = 0; k < n; k++) s += pool[Math.floor(r() * pool.length)];
+            files.push({ text: wrap(s, lang === 'css' ? '' : lang), from: 'soup' });
+        }
+        writeCorpus('soup-' + lang, files);
+    }
+}
+
 // --- markup around the style tag ---
 const HTML_INSERTS = [
     '{#if a}', '{/if}', '{#each xs as x}', '{/each}', '{#await p}', '{/await}', '{@html x}', '{@html "<style>"}', '{', '}',
