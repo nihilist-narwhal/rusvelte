@@ -11,10 +11,10 @@ pub(crate) mod css;
 pub mod blockers;
 pub mod evaluate;
 pub(crate) mod acorn;
-mod nodes;
-mod scope;
+pub(crate) mod nodes;
+pub(crate) mod scope;
 mod ts;
-mod utils;
+pub(crate) mod utils;
 mod visit;
 #[allow(clippy::all)]
 pub mod warnings;

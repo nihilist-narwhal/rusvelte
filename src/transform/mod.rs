@@ -2,6 +2,9 @@
 //! (`css/index.js`), through [`compile_css`].
 
 pub mod css;
+pub mod js;
+pub mod options;
+pub mod server;
 
 use oxc_allocator::Allocator;
 
@@ -166,6 +169,164 @@ pub fn compile_styles(source: &str, filename: &str, options: &CssOptions) -> Res
     } else {
         let code = render(false)?;
         Ok(CssResult { css: Some(CssOutput { code, has_global: analysis.css_has_global }), injected: None })
+    }
+}
+
+/// The output of [`compile`]: `js.code` and `css` (source maps aren't produced yet)
+#[derive(Debug, Clone)]
+pub struct CompileOutput {
+    pub js: String,
+    pub css: Option<CssOutput>,
+}
+
+/// `compile(source, options)` (only `generate: 'server'` so far)
+pub fn compile(source: &str, options: &options::CompileOptions) -> Result<CompileOutput, CompileError> {
+    let alloc = Allocator::default();
+    let mut warnings: Vec<Warning> = Vec::new();
+    let component = crate::parse_with_warnings(&alloc, source, &mut warnings)
+        .map_err(|err| analyze::acorn::reword_parse_error(err, source))?;
+    let root = &component.root;
+    let mut scripts: Vec<&crate::ast::Script> = [&root.instance, &root.module].into_iter().flatten().collect();
+    scripts.sort_by_key(|s| s.start);
+    if let Some(err) = scripts.iter().find_map(|s| analyze::acorn::check(&s.content.program, source, root.ts)) {
+        return Err(err);
+    }
+
+    // `<svelte:options>` overrides the options
+    let parsed = root.options.as_ref().map(|o| &o.values);
+    let parsed_str = |k: &str| parsed.and_then(|v| v.get(k)).and_then(|v| v.as_str()).map(str::to_string);
+    let parsed_bool = |k: &str| parsed.and_then(|v| v.get(k)).and_then(|v| v.as_bool());
+    let runes = match parsed.and_then(|v| v.get("runes")) {
+        Some(v) => v.as_bool(),
+        None => options.runes,
+    };
+    let namespace = parsed_str("namespace").unwrap_or_else(|| options.namespace.clone());
+    let preserve_whitespace = parsed_bool("preserveWhitespace").unwrap_or(options.preserve_whitespace);
+    let combined = options::CompileOptions {
+        filename: options.filename.clone(),
+        root_dir: options.root_dir.clone(),
+        namespace,
+        preserve_whitespace,
+        runes,
+        accessors: parsed_bool("accessors").unwrap_or(options.accessors),
+        immutable: parsed_bool("immutable").unwrap_or(options.immutable),
+        css_injected: match parsed_str("css") {
+            Some(c) => c == "injected",
+            None => options.css_injected,
+        },
+        css_hash: match &options.css_hash {
+            options::CssHash::Constant(c) => options::CssHash::Constant(c.clone()),
+            _ => options::CssHash::Default,
+        },
+        ..options::CompileOptions { ..clone_simple(options) }
+    };
+
+    let analyze_options = analyze::CompileOptions {
+        runes,
+        custom_element: options.custom_element,
+        experimental_async: options.experimental_async,
+        namespace: Some(combined.namespace.clone()),
+    };
+    let mut analysis = analyze::analyze_component(&alloc, &component, source, &options.filename, &analyze_options, &mut warnings)?;
+
+    // `state.filename`: backslashes replaced, made relative to `rootDir`
+    let mut state_filename = options.filename.replace('\\', "/");
+    if let Some(root_dir) = &options.root_dir {
+        let root_dir = root_dir.replace('\\', "/");
+        if state_filename.starts_with(&root_dir) {
+            let rest = state_filename.replacen(&root_dir, "", 1);
+            state_filename = rest.strip_prefix(['/', '\\']).unwrap_or(&rest).to_string();
+        }
+    }
+
+    // the CSS hash and scoped elements
+    let css_hash = match &root.css {
+        Some(sheet) => {
+            let styles = &source[sheet.css.content_start..sheet.css.content_end];
+            match &combined.css_hash {
+                options::CssHash::Constant(c) => c.clone(),
+                _ => format!("svelte-{}", hash(if state_filename == "(unknown)" { styles } else { &state_filename })),
+            }
+        }
+        None => String::new(),
+    };
+    let scoped = analysis.css.as_ref().map(|m| m.scoped_elements.clone()).unwrap_or_default();
+
+    let css = match (&root.css, &analysis.css) {
+        (Some(sheet), Some(meta)) if !combined.css_injected && !analysis.custom_element => {
+            let code = css::render_stylesheet(source, &sheet.css, meta, &css::RenderOptions { hash: &css_hash, minify: false, dev: options.dev })
+                .map_err(|e| CompileError { code: "magic_string", message: e.0, position: None })?;
+            Some(CssOutput { code, has_global: analysis.css_has_global })
+        }
+        _ => None,
+    };
+
+    let locator = component.locator.clone();
+    let comments: Vec<crate::estree::Comment> = root
+        .comments
+        .iter()
+        .map(|c| {
+            let (l1, c1) = locator.acorn_line_column(c.start);
+            let (l2, c2) = locator.acorn_line_column(c.end);
+            crate::estree::Comment {
+                kind: if c.block { crate::estree::CommentKind::Block } else { crate::estree::CommentKind::Line },
+                value: c.value.as_str().into(),
+                span: Some(crate::estree::Span::new(c.start as u32, c.end as u32)),
+                loc: Some(crate::estree::SourceLocation {
+                    start: crate::estree::Position::new(l1 as u32, c1 as u32),
+                    end: crate::estree::Position::new(l2 as u32, c2 as u32),
+                }),
+            }
+        })
+        .collect();
+
+    let program = match options.generate {
+        options::Generate::Server => {
+            let conv = crate::estree::convert::Converter::new(&locator, root.ts);
+            let mut s = server::Server {
+                an: &mut analysis.an,
+                options: &combined,
+                conv,
+                locator: &locator,
+                css_hash,
+                scoped,
+                path: Vec::new(),
+                hoisted: Vec::new(),
+                legacy_reactive_statements: Vec::new(),
+                filename: state_filename,
+                dev: options.dev,
+                instance_nodes: Default::default(),
+            };
+            server::server_component(&mut s)
+        }
+        _ => return Err(CompileError { code: "unsupported", message: "only generate: 'server' is implemented".into(), position: None }),
+    };
+    let printed = crate::estree::print::print(&program, &crate::estree::print::PrintOptions { comments: &comments, ..Default::default() });
+    Ok(CompileOutput { js: printed.code, css })
+}
+
+/// The plain (cloneable) fields of the options
+fn clone_simple(o: &options::CompileOptions) -> options::CompileOptions {
+    options::CompileOptions {
+        filename: o.filename.clone(),
+        root_dir: o.root_dir.clone(),
+        dev: o.dev,
+        generate: o.generate,
+        experimental_async: o.experimental_async,
+        accessors: o.accessors,
+        css_injected: o.css_injected,
+        css_hash: options::CssHash::Default,
+        custom_element: o.custom_element,
+        disclose_version: o.disclose_version,
+        immutable: o.immutable,
+        component_api_4: o.component_api_4,
+        name: o.name.clone(),
+        namespace: o.namespace.clone(),
+        preserve_comments: o.preserve_comments,
+        fragments_tree: o.fragments_tree,
+        preserve_whitespace: o.preserve_whitespace,
+        runes: o.runes,
+        hmr: o.hmr,
     }
 }
 

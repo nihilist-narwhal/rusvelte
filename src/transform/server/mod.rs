@@ -7,6 +7,7 @@
 //! [`Server::visit_node`] and friends. `state` is copied like the JS spreads it; the arrays the
 //! JS shares between state copies (`init`, `template`) are shared [`Shared`] vectors here.
 
+mod element;
 mod js_visitors;
 mod template;
 mod utils;
@@ -67,6 +68,10 @@ pub struct Server<'a, 's> {
     pub an: &'a mut Analyzer<'s>,
     pub options: &'a CompileOptions,
     pub conv: Converter<'a>,
+    pub locator: &'a crate::locator::Locator<'a>,
+    /// `analysis.css.hash` and the elements the CSS scopes
+    pub css_hash: String,
+    pub scoped: rustc_hash::FxHashSet<crate::ast::NodeId>,
     pub path: Vec<PathNode<'s>>,
     /// `state.hoisted`
     pub hoisted: Vec<Node>,
@@ -101,7 +106,7 @@ impl<'a, 's> Server<'a, 's> {
     pub fn convert_program(&self, p: P<'s>) -> Node {
         match p {
             P::Js(oxc_ast::AstKind::Program(program)) => self.conv.program(program),
-            _ => b::program(vec![]),
+            _ => program_node(vec![]),
         }
     }
 }
@@ -181,12 +186,12 @@ pub fn server_component(s: &mut Server) -> Node {
             let program = s.convert_program(p);
             s.visit_js(&program, &base)
         }
-        None => b::program(vec![]),
+        None => program_node(vec![]),
     };
 
     // instance
     let instance_state = State { scope: s.an.instance_scope, is_instance: true, ..base.clone() };
-    let instance_program = instance_program.unwrap_or_else(|| b::program(vec![]));
+    let instance_program = instance_program.unwrap_or_else(|| program_node(vec![]));
     let instance = s.visit_js(&instance_program, &instance_state);
 
     // template
@@ -267,7 +272,7 @@ pub fn server_component(s: &mut Server) -> Node {
     let mut body = std::mem::take(&mut s.hoisted);
     body.extend(program_body(module));
 
-    let should_inject_props = should_inject_context || has_props || s.an.needs_props() || s.an.uses_slots || !s.an.slot_names.is_empty();
+    let should_inject_props = should_inject_context || has_props || s.an.needs_props || s.an.uses_slots || !s.an.slot_names.is_empty();
     let params = if should_inject_props { vec![b::id("$$renderer"), b::id("$$props")] } else { vec![b::id("$$renderer")] };
     let component_function = b::function_declaration(b::id(s.an.name.as_str()), params, component_block);
 
@@ -301,7 +306,7 @@ pub fn server_component(s: &mut Server) -> Node {
         body.insert(0, b::imports(&[], "svelte/internal/flags/async"));
     }
 
-    b::program(body)
+    program_node(body)
 }
 
 fn program_body(node: Node) -> Vec<Node> {
@@ -309,4 +314,9 @@ fn program_body(node: Node) -> Vec<Node> {
         NodeKind::Program(p) => p.body,
         _ => vec![],
     }
+}
+
+/// `{ type: 'Program', sourceType: 'module', body }`
+fn program_node(body: Vec<Node>) -> Node {
+    Node::new(NodeKind::Program(crate::estree::Program { body, source_type: crate::estree::SourceType::Module }))
 }
