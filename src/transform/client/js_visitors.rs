@@ -250,7 +250,9 @@ impl<'a, 's> Client<'a, 's> {
                                 let class_name = self.enclosing_class_name();
                                 value = b::call("$.tag", vec![value, b::literal(format!("{}.{}", class_name, name))]);
                             }
-                            return Some(b::assignment(operator, b::member(b::this(), b::private_id(key.as_str())), value));
+                            // a private field's key is the original `left.property`
+                            let key = if name.starts_with('#') { (*m.property).clone() } else { b::private_id(key.as_str()) };
+                            return Some(b::assignment(operator, b::member(b::this(), key), value));
                         }
                     }
                     // assignment to a private state field
