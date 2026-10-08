@@ -22,7 +22,10 @@ const option_sets = [
 	{ generate: 'client', dev: true, hmr: true, css: 'external' },
 	{ generate: 'server', dev: false, css: 'external' },
 	{ generate: 'server', dev: true, css: 'external' },
-	{ generate: 'client', dev: false, css: 'injected' }
+	{ generate: 'client', dev: false, css: 'injected' },
+	// relative filenames (the default `rootDir` is the working directory, here outside `dir`)
+	{ generate: 'server', dev: true, css: 'external', rootDir: path.resolve(dir) },
+	{ generate: 'client', dev: true, hmr: true, css: 'external', rootDir: path.resolve(dir) }
 ];
 
 function plain(result) {
@@ -52,7 +55,7 @@ for (const file of fs.globSync('**/*.{svelte,svelte.js,svelte.ts}', { cwd: dir }
 	}
 	for (const set of option_sets) {
 		if (module && (set.css === 'injected' || set.hmr)) continue;
-		const options = module ? { filename, generate: set.generate, dev: set.dev } : { filename, ...set };
+		const options = module ? { filename, generate: set.generate, dev: set.dev, rootDir: set.rootDir } : { filename, ...set };
 		let a, b;
 		try {
 			b = plain((module ? real.compileModule : real.compile)(source, { ...options }));

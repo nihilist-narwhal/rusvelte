@@ -7,6 +7,8 @@
 import * as native from './native.js';
 
 const debug = !!process.env.RUSVELTE_DEBUG;
+// `RUSVELTE_VERIFY=1` also runs the real compiler on every compilation and reports differences
+const verify = !!process.env.RUSVELTE_VERIFY;
 
 /** Counts of native compilations and fallbacks (by reason), for `RUSVELTE_DEBUG` and tests */
 export const stats = { native: 0, fallback: {} };
@@ -142,6 +144,9 @@ class JsSourceMap {
 export function create(svelte) {
 	const { real, state, CompileDiagnostic, merge_with_preprocessor_map, get_source_name, MagicSourceMap } = svelte;
 
+	/** results rusvelte produced (not the real compiler) */
+	const native_results = new WeakSet();
+
 	class CompileWarning extends CompileDiagnostic {
 		name = 'CompileWarning';
 	}
@@ -158,6 +163,8 @@ export function create(svelte) {
 	 * @param {boolean} module
 	 */
 	function run(source, options, module) {
+		// `validate-options.js` defaults `rootDir` to the working directory
+		if (options.rootDir === undefined && typeof process !== 'undefined') options = { ...options, rootDir: process.cwd() };
 		if (!version_ok) return fell_back(`svelte ${real.VERSION}`), null;
 		const bad = unsupported_option(options, module ? MODULE_OPTIONS : COMPONENT_OPTIONS);
 		if (bad) return fell_back(`option ${bad}`), null;
@@ -173,7 +180,7 @@ export function create(svelte) {
 	function set_state(source, options, runes) {
 		state.reset({ warning: options.warningFilter, filename: options.filename });
 		state.set_source(source);
-		state.adjust({ dev: !!options.dev, rootDir: options.rootDir, runes });
+		state.adjust({ dev: !!options.dev, rootDir: options.rootDir ?? process.cwd(), runes });
 	}
 
 	function warnings_of(result, options) {
@@ -186,8 +193,38 @@ export function create(svelte) {
 		return out;
 	}
 
+	/** Reports the first difference between our result and the real compiler's */
+	function check(kind, source, options, ours) {
+		const theirs = (kind === 'module' ? real.compileModule : real.compile)(source, options);
+		const pairs = [
+			['js', ours.js.code, theirs.js.code],
+			['css', ours.css?.code, theirs.css?.code],
+			['warnings', JSON.stringify(ours.warnings), JSON.stringify(theirs.warnings)]
+		];
+		for (const [what, a, b] of pairs) {
+			if (a === b) continue;
+			const al = (a ?? '').split('\n');
+			const bl = (b ?? '').split('\n');
+			let i = 0;
+			while (i < al.length && al[i] === bl[i]) i++;
+			const shown = Object.fromEntries(Object.entries(options).filter(([, v]) => typeof v !== 'function'));
+			console.warn(
+				`[rusvelte] ${what} differs for ${options.filename} with ${JSON.stringify({ ...shown, sourcemap: undefined })}\n  line ${i + 1}\n  svelte:   ${bl[i]}\n  rusvelte: ${al[i]}`
+			);
+			stats.verify_failures = (stats.verify_failures ?? 0) + 1;
+			return;
+		}
+	}
+
 	/** @type {typeof real.compile} */
 	function compile(source, options) {
+		const result = compile_native(source, options);
+		if (verify && native_results.has(result)) check('component', remove_bom(source), options, result);
+		return result;
+	}
+
+	/** @type {typeof real.compile} */
+	function compile_native(source, options) {
 		source = remove_bom(source);
 		const result = run(source, options, false);
 		if (!result) return real.compile(source, options);
@@ -216,7 +253,7 @@ export function create(svelte) {
 
 		const warnings = warnings_of(result, options);
 		let ast;
-		return {
+		const compiled = {
 			js,
 			css,
 			warnings,
@@ -229,6 +266,8 @@ export function create(svelte) {
 				ast = value;
 			}
 		};
+		native_results.add(compiled);
+		return compiled;
 	}
 
 	/** @type {typeof real.compileModule} */
