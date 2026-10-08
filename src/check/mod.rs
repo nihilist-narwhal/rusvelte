@@ -100,7 +100,7 @@ fn find_files(dir: &Path, workspace: &Path, ignored: &[Box<dyn Fn(&str) -> bool 
             if !ignored.iter().any(|i| i(&rel)) {
                 out.push(path);
             }
-        } else if (name.ends_with(".ts") || name.ends_with(".js")) && is_kit_file(&path.to_string_lossy(), &KitFilesSettings::default()) {
+        } else if name.ends_with(".ts") || name.ends_with(".js") {
             let rel = relative_posix(workspace, &path);
             if !ignored.iter().any(|i| i(&rel)) {
                 kit.push(path);
@@ -179,20 +179,36 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
     let use_svelte = opts.sources.iter().any(|s| s == "svelte");
 
     // find and convert the components
-    let (files, kit_files) = timed(opts.timings, "find files", || {
+    let (files, scripts) = timed(opts.timings, "find files", || {
         let mut files = Vec::new();
-        let mut kit = Vec::new();
-        find_files(&workspace, &workspace, &ignored, &mut files, &mut kit);
-        (files, kit)
+        let mut scripts = Vec::new();
+        find_files(&workspace, &workspace, &ignored, &mut files, &mut scripts);
+        (files, scripts)
     });
-    // start on the compiler warnings right away (they don't depend on the emit)
-    let mut warnings_cache = if use_svelte && opts.incremental { WarningsCache::load(&workspace, &cache) } else { WarningsCache::default() };
-    let svelte_warnings = if use_svelte {
-        let todo: Vec<PathBuf> = files.iter().filter(|f| !warnings_cache.is_fresh(f)).cloned().collect();
-        if todo.is_empty() { None } else { Some(svelte_warnings_start(&workspace, &cache, &todo, (opts.threads / 2).max(1))?) }
+    let _ = std::fs::create_dir_all(&cache);
+    // the Svelte config, the way the language server resolves it (or known without Node)
+    let static_config = static_config_guess(&workspace);
+    let probe = if static_config.is_some() { None } else { config_probe_start(&workspace, &cache) };
+    // Compiler warnings: natively unless preprocessors may change the code. When the config
+    // mentions preprocessors, start the Node path right away; otherwise wait for the probe.
+    let mut engine = if !use_svelte {
+        Engine::None
+    } else if probe.is_some() && config_mentions_preprocess(&workspace) {
+        Engine::Node
     } else {
-        None
+        Engine::Undecided
     };
+    let mut warnings_cache = WarningsCache::default();
+    let mut svelte_warnings = None;
+    if engine == Engine::Node {
+        if opts.incremental {
+            warnings_cache = WarningsCache::load(&workspace, &cache, "node");
+        }
+        let todo: Vec<PathBuf> = files.iter().filter(|f| !warnings_cache.is_fresh(f)).cloned().collect();
+        if !todo.is_empty() {
+            svelte_warnings = Some(svelte_warnings_start(&workspace, &cache, &todo, (opts.threads / 2).max(1))?);
+        }
+    }
 
     let previous_outputs: Vec<PathBuf> = if opts.incremental {
         std::fs::read_to_string(cache.join("emitted.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
@@ -238,26 +254,9 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
         results.into_iter().map(|m| m.into_inner().unwrap()).collect()
     });
     let mut entries: Vec<Entry> = entries.into_iter().flatten().collect();
-    // SvelteKit files, with the types svelte-check adds (`emitSvelteFiles`)
-    for path in &kit_files {
-        let Ok(source) = std::fs::read_to_string(path) else { continue };
-        let out_path = emit_dir.join(path.strip_prefix(&workspace).unwrap_or(path));
-        let rewrite = RewriteExternalImports { source_path: path.clone(), generated_path: out_path.clone(), workspace_path: workspace.clone() };
-        let Some(r) = upsert_kit_file(&path.to_string_lossy(), &source, &KitFilesSettings::default(), Some(&rewrite), None) else { continue };
-        let _ = std::fs::create_dir_all(out_path.parent().unwrap());
-        if write_if_changed(&out_path, &r.text).is_err() {
-            continue;
-        }
-        entries.push(Entry {
-            source_path: path.clone(),
-            dts_path: out_path.clone(),
-            out_path,
-            is_ts_file: path.extension().is_some_and(|e| e == "ts"),
-            source,
-            code: r.text,
-            kit: Some(r.added_code),
-        });
-    }
+    let svelte_entry_count = entries.len();
+    let mut kit_settings = KitFilesSettings::default();
+    entries.extend(emit_kit_files(&scripts, &kit_settings, &workspace, &emit_dir));
     if opts.incremental {
         // remove what earlier runs generated for files that are gone or failed now
         let current: std::collections::HashSet<&Path> = entries.iter().flat_map(|e| [e.out_path.as_path(), e.dts_path.as_path()]).collect();
@@ -279,22 +278,86 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
     }
 
     // type-check while the compiler warnings finish
-    let tsgo = if use_ts {
-        timed(opts.timings, "overlay tsconfig", || write_overlay(&tsconfig_path, &tsconfig_dir, &workspace, &cache, &overlay_path, &entries, opts.incremental))?;
+    let build_info = opts.incremental.then(|| cache.join("tsbuildinfo.json"));
+    let start_tsgo = |entries: &[Entry]| -> Result<(std::time::Instant, std::process::Child), String> {
+        timed(opts.timings, "overlay tsconfig", || write_overlay(&tsconfig_path, &tsconfig_dir, &workspace, &cache, &overlay_path, entries, opts.incremental))?;
         let exe = tsc::find_tsgo(&tsconfig_dir)?;
-        let build_info = opts.incremental.then(|| cache.join("tsbuildinfo.json"));
-        Some((std::time::Instant::now(), tsc::start(&exe, &overlay_path, &workspace, build_info.as_deref())?))
-    } else {
-        None
+        Ok((std::time::Instant::now(), tsc::start(&exe, &overlay_path, &workspace, build_info.as_deref())?))
     };
+    let mut tsgo = if use_ts { Some(start_tsgo(&entries)?) } else { None };
+
+    // the probe's results: SvelteKit's `files` settings and what the compiler warnings need
+    let config = match static_config {
+        Some(c) => Some(c),
+        None => probe.and_then(|p| timed(opts.timings, "config probe (wait)", || config_probe_finish(p))),
+    };
+    if let Some(settings) = config.as_ref().and_then(|c| c.kit_files.clone()) {
+        if settings != kit_settings {
+            // other SvelteKit file settings (often just the defaults as absolute paths): only
+            // when that changes the kit files, redo them and the type-check
+            let new_kit = emit_kit_files(&scripts, &settings, &workspace, &emit_dir);
+            let same = new_kit.len() == entries.len() - svelte_entry_count
+                && new_kit.iter().zip(&entries[svelte_entry_count..]).all(|(a, b)| a.source_path == b.source_path && a.code == b.code);
+            kit_settings = settings;
+            if !same {
+                let new_paths: std::collections::HashSet<&Path> = new_kit.iter().map(|e| e.out_path.as_path()).collect();
+                for e in &entries[svelte_entry_count..] {
+                    if !new_paths.contains(e.out_path.as_path()) {
+                        let _ = std::fs::remove_file(&e.out_path);
+                    }
+                }
+                entries.truncate(svelte_entry_count);
+                entries.extend(new_kit);
+                if let Some((_, mut child)) = tsgo.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tsgo = Some(start_tsgo(&entries)?);
+                }
+            }
+        }
+    }
+    let _ = &kit_settings;
+    if engine == Engine::Undecided {
+        engine = match &config {
+            Some(c) if c.native_ok => Engine::Native,
+            Some(_) => Engine::Node,
+            // no config: the language server's fallback preprocessor only touches `lang` scripts/styles
+            None if !files.iter().any(|f| std::fs::read_to_string(f).is_ok_and(|s| has_lang_attribute(&s))) => Engine::Native,
+            None => Engine::Node,
+        };
+        if opts.incremental {
+            warnings_cache = WarningsCache::load(&workspace, &cache, if engine == Engine::Native { "native" } else { "node" });
+        }
+        if engine == Engine::Node {
+            let todo: Vec<PathBuf> = files.iter().filter(|f| !warnings_cache.is_fresh(f)).cloned().collect();
+            if !todo.is_empty() {
+                svelte_warnings = Some(svelte_warnings_start(&workspace, &cache, &todo, (opts.threads / 2).max(1))?);
+            }
+        }
+    }
+    if opts.timings && use_svelte {
+        eprintln!("[timing] compiler warnings engine: {engine:?}");
+    }
 
     // compiler warnings come first in each file
     if use_svelte {
         let fresh = match svelte_warnings {
             Some(handle) => timed(opts.timings, "svelte compiler warnings (wait)", || svelte_warnings_finish(handle))?,
+            None if engine == Engine::Native => {
+                let todo: Vec<PathBuf> = files.iter().filter(|f| !warnings_cache.is_fresh(f)).cloned().collect();
+                let options = config.as_ref().map(|c| c.compile_options.clone()).unwrap_or_default();
+                let results = timed(opts.timings, "svelte compiler warnings (native)", || native_compiler_results(&todo, &options, opts.threads));
+                (results, false)
+            }
             None => (Vec::new(), warnings_cache.has_preprocess),
         };
-        let has_preprocess = if fresh.0.is_empty() { warnings_cache.has_preprocess } else { fresh.1 };
+        let has_preprocess = if engine == Engine::Native {
+            config.as_ref().is_some_and(|c| c.has_preprocess)
+        } else if fresh.0.is_empty() {
+            warnings_cache.has_preprocess
+        } else {
+            fresh.1
+        };
         warnings_cache.has_preprocess = has_preprocess;
         for (path, raw) in fresh.0 {
             warnings_cache.insert(&path, raw);
@@ -669,6 +732,17 @@ function originalPositionFor(lines, line, column) {
 }
 
 async function loadConfig() {
+    // the way the language server finds it (vite.config or svelte.config)
+    try {
+        const r = await req('@sveltejs/load-config').loadConfig(workspace, { traverse: false });
+        if (r && 'config' in r) {
+            let config = r.config;
+            if ('kit' in config && !('prerender' in config)) config = { ...config, ...config.kit };
+            return config;
+        }
+        if (r && 'error' in r) return { loadError: String(r.error) };
+        return null;
+    } catch {}
     for (const name of ['svelte.config.js', 'svelte.config.mjs', 'svelte.config.cjs']) {
         const p = path.join(workspace, name);
         if (fs.existsSync(p)) {
@@ -805,15 +879,26 @@ struct WarningsCache {
 impl WarningsCache {
     fn config_key(workspace: &Path) -> String {
         let mut parts = Vec::new();
-        for name in ["svelte.config.js", "svelte.config.mjs", "svelte.config.cjs", "package.json", "node_modules/svelte/package.json"] {
+        for name in [
+            "svelte.config.js",
+            "svelte.config.mjs",
+            "svelte.config.cjs",
+            "svelte.config.ts",
+            "vite.config.js",
+            "vite.config.mjs",
+            "vite.config.ts",
+            "vite.config.mts",
+            "package.json",
+            "node_modules/svelte/package.json",
+        ] {
             parts.extend(std::fs::read(workspace.join(name)).unwrap_or_default());
             parts.push(0);
         }
         hash_bytes(&parts)
     }
 
-    fn load(workspace: &Path, cache: &Path) -> Self {
-        let key = Self::config_key(workspace);
+    fn load(workspace: &Path, cache: &Path, engine: &str) -> Self {
+        let key = format!("{engine}:{}", Self::config_key(workspace));
         let mut c = WarningsCache { key: key.clone(), ..Default::default() };
         if let Some(Value::Object(m)) = std::fs::read_to_string(cache.join("compiler-warnings.json")).ok().and_then(|t| serde_json::from_str(&t).ok()) {
             if m.get("key").and_then(Value::as_str) == Some(&key) {
@@ -998,4 +1083,233 @@ pub fn watch(opts: &CheckOptions, out: &mut impl std::io::Write) -> ! {
             }
         }
     }
+}
+
+// --- the Svelte config and native compiler warnings ----------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Engine {
+    None,
+    Undecided,
+    Native,
+    Node,
+}
+
+/// Emit the SvelteKit files among `scripts` (`emitSvelteFiles`' kit part)
+fn emit_kit_files(scripts: &[PathBuf], settings: &KitFilesSettings, workspace: &Path, emit_dir: &Path) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    for path in scripts.iter().filter(|p| is_kit_file(&p.to_string_lossy(), settings)) {
+        let Ok(source) = std::fs::read_to_string(path) else { continue };
+        let out_path = emit_dir.join(path.strip_prefix(workspace).unwrap_or(path));
+        let rewrite = RewriteExternalImports { source_path: path.clone(), generated_path: out_path.clone(), workspace_path: workspace.to_path_buf() };
+        let Some(r) = upsert_kit_file(&path.to_string_lossy(), &source, settings, Some(&rewrite), None) else { continue };
+        let _ = std::fs::create_dir_all(out_path.parent().unwrap());
+        if write_if_changed(&out_path, &r.text).is_err() {
+            continue;
+        }
+        entries.push(Entry {
+            source_path: path.clone(),
+            dts_path: out_path.clone(),
+            out_path,
+            is_ts_file: path.extension().is_some_and(|e| e == "ts"),
+            source,
+            code: r.text,
+            kit: Some(r.added_code),
+        });
+    }
+    entries
+}
+
+const CONFIG_FILES: [&str; 11] = [
+    "vite.config.js",
+    "vite.config.mjs",
+    "vite.config.cjs",
+    "vite.config.ts",
+    "vite.config.mts",
+    "vite.config.cts",
+    "svelte.config.js",
+    "svelte.config.mjs",
+    "svelte.config.cjs",
+    "svelte.config.ts",
+    "svelte.config.mts",
+];
+
+/// A cheap guess: does any config file mention preprocessing?
+fn config_mentions_preprocess(workspace: &Path) -> bool {
+    CONFIG_FILES.iter().any(|n| std::fs::read_to_string(workspace.join(n)).is_ok_and(|t| t.contains("reprocess")))
+}
+
+/// `lang=` (or `type=`) on a script, style or template tag
+fn has_lang_attribute(source: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"<(script|style|template)\b[^>]*\b(lang|type)\s*="#).unwrap());
+    RE.is_match(source)
+}
+
+const CONFIG_PROBE_SCRIPT: &str = r#"
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+import fs from 'node:fs';
+import path from 'node:path';
+const ws = process.argv[2];
+const req = createRequire(path.join(ws, 'noop.js'));
+let result;
+try {
+    result = await req('@sveltejs/load-config').loadConfig(ws, { traverse: false });
+} catch {
+    for (const n of ['svelte.config.js', 'svelte.config.mjs', 'svelte.config.cjs']) {
+        const p = path.join(ws, n);
+        if (fs.existsSync(p)) {
+            try { result = { config: (await import(pathToFileURL(p).href)).default ?? {} }; } catch (e) { result = { error: e }; }
+            break;
+        }
+    }
+}
+const out = { found: false };
+if (result && 'config' in result) {
+    let config = result.config;
+    const files = 'files' in config ? config.files : config.kit && config.kit.files;
+    if ('kit' in config && !('prerender' in config)) config = { ...config, ...config.kit };
+    const pre = config.preprocess;
+    const list = pre == null ? [] : Array.isArray(pre) ? pre : [pre];
+    const co = config.compilerOptions || {};
+    Object.assign(out, {
+        found: true,
+        preprocess: list.map((p) => (p && typeof p.name === 'string' ? p.name : null)),
+        compilerOptionKeys: Object.keys(co),
+        runes: typeof co.runes === 'boolean' ? co.runes : null,
+        customElement: co.customElement === true,
+        customElementOther: co.customElement !== undefined && typeof co.customElement !== 'boolean',
+        experimentalKeys: Object.keys(co.experimental || {}),
+        experimentalAsync: !!(co.experimental && co.experimental.async),
+        files: files ? { params: files.params, hooks: files.hooks } : null
+    });
+} else if (result && 'error' in result) {
+    out.error = String(result.error);
+}
+process.stdout.write(JSON.stringify(out));
+"#;
+
+struct ConfigProbe(std::process::Child);
+
+/// Start the probe, if the workspace has a config file (and Node)
+fn config_probe_start(workspace: &Path, cache: &Path) -> Option<ConfigProbe> {
+    if !CONFIG_FILES.iter().any(|n| workspace.join(n).is_file()) {
+        return None;
+    }
+    let script = cache.join("config-probe.mjs");
+    std::fs::write(&script, CONFIG_PROBE_SCRIPT).ok()?;
+    let child = std::process::Command::new("node")
+        .arg(&script)
+        .arg(workspace)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    Some(ConfigProbe(child))
+}
+
+pub struct ProbedConfig {
+    /// the compiler warnings can be computed natively: no preprocessor that changes code, and
+    /// only compiler options the native analysis knows
+    native_ok: bool,
+    has_preprocess: bool,
+    compile_options: crate::analyze::CompileOptions,
+    kit_files: Option<KitFilesSettings>,
+}
+
+/// Preprocessors that never change the code
+const NOOP_PREPROCESSORS: [&str; 1] = ["sveltekit:warnings"];
+/// Compiler options that don't affect warnings, or that the native analysis takes
+const KNOWN_COMPILER_OPTIONS: [&str; 12] =
+    ["runes", "customElement", "experimental", "dev", "generate", "css", "cssHash", "hmr", "discloseVersion", "preserveComments", "preserveWhitespace", "modernAst"];
+
+fn config_probe_finish(p: ConfigProbe) -> Option<ProbedConfig> {
+    let fallback = ProbedConfig { native_ok: false, has_preprocess: false, compile_options: Default::default(), kit_files: None };
+    let Ok(out) = p.0.wait_with_output() else { return Some(fallback) };
+    let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) else { return Some(fallback) };
+    if v.get("error").is_some() {
+        return Some(fallback);
+    }
+    if v["found"] != Value::Bool(true) {
+        // no Svelte config: the language server's fallback preprocessor applies
+        return None;
+    }
+    let preprocess: Vec<Option<&str>> = v["preprocess"].as_array().map(|a| a.iter().map(Value::as_str).collect()).unwrap_or_default();
+    let noop = preprocess.iter().all(|p| p.is_some_and(|n| NOOP_PREPROCESSORS.contains(&n)));
+    let keys_ok = v["compilerOptionKeys"].as_array().is_some_and(|a| a.iter().all(|k| k.as_str().is_some_and(|k| KNOWN_COMPILER_OPTIONS.contains(&k))));
+    let experimental_ok = v["experimentalKeys"].as_array().is_some_and(|a| a.iter().all(|k| k == "async"));
+    let custom_element_ok = v["customElementOther"] != Value::Bool(true);
+    let kit_files = v["files"].as_object().map(|f| {
+        let d = KitFilesSettings::default();
+        let hooks = f.get("hooks");
+        let s = |v: Option<&Value>, d: &str| v.and_then(Value::as_str).map_or_else(|| d.to_string(), str::to_string);
+        KitFilesSettings {
+            params_path: s(f.get("params"), &d.params_path),
+            server_hooks_path: s(hooks.and_then(|h| h.get("server")), &d.server_hooks_path),
+            client_hooks_path: s(hooks.and_then(|h| h.get("client")), &d.client_hooks_path),
+            universal_hooks_path: s(hooks.and_then(|h| h.get("universal")), &d.universal_hooks_path),
+        }
+    });
+    Some(ProbedConfig {
+        native_ok: noop && keys_ok && experimental_ok && custom_element_ok,
+        has_preprocess: !preprocess.is_empty(),
+        compile_options: crate::analyze::CompileOptions {
+            runes: v["runes"].as_bool(),
+            custom_element: v["customElement"] == Value::Bool(true),
+            experimental_async: v["experimentalAsync"] == Value::Bool(true),
+        },
+        kit_files,
+    })
+}
+
+/// The compiler results the Node helper would produce, computed natively
+fn native_compiler_results(files: &[PathBuf], options: &crate::analyze::CompileOptions, threads: usize) -> Vec<(PathBuf, Value)> {
+    let position = |p: &Option<crate::analyze::Position>| p.as_ref().map(|p| json!({ "line": p.line as i64 - 1, "character": p.column }));
+    let range = |start: &Option<crate::analyze::Position>, end: &Option<crate::analyze::Position>| {
+        let s = position(start).unwrap_or_else(|| json!({ "line": 0, "character": 0 }));
+        let e = position(end).unwrap_or_else(|| s.clone());
+        json!({ "start": s, "end": e })
+    };
+    let next = AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<Value>>> = files.iter().map(|_| Default::default()).collect();
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(path) = files.get(i) else { break };
+                let Ok(source) = std::fs::read_to_string(path) else { continue };
+                let v = match crate::analyze::compile_diagnostics_with(&source, &path.to_string_lossy(), options) {
+                    Ok(ws) => json!({ "warnings": ws.iter().map(|w| json!({ "code": w.code, "message": w.message, "range": range(&w.start, &w.end) })).collect::<Vec<_>>() }),
+                    Err(e) => json!({ "error": { "code": e.code, "message": e.message, "range": range(&e.start, &e.end) } }),
+                };
+                *results[i].lock().unwrap() = Some(v);
+            });
+        }
+    });
+    files.iter().cloned().zip(results).filter_map(|(f, m)| m.into_inner().unwrap().map(|v| (f, v))).collect()
+}
+
+/// The resolved config for the SvelteKit 3 default shape, without running Node: a vite config
+/// with `sveltekit(...)` and no `svelte.config`, that doesn't mention preprocessing, compiler
+/// options or file locations and imports nothing local. SvelteKit then adds only its
+/// `sveltekit:warnings` preprocessor, which never changes code.
+fn static_config_guess(workspace: &Path) -> Option<ProbedConfig> {
+    let present: Vec<&str> = CONFIG_FILES.iter().copied().filter(|n| workspace.join(n).is_file()).collect();
+    if present.len() != 1 || !present[0].starts_with("vite.config.") {
+        return None;
+    }
+    let text = std::fs::read_to_string(workspace.join(present[0])).ok()?;
+    // (comments removed; a `//` inside a string only makes this more conservative)
+    static COMMENTS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?s)/\*.*?\*/|//[^\n]*").unwrap());
+    let code = COMMENTS.replace_all(&text, "");
+    static LOCAL_IMPORT: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"(from|import|require)\s*\(?\s*['"]\.{1,2}/"#).unwrap());
+    static MENTIONS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b(preprocess|sveltePreprocess|vitePreprocess|compilerOptions|files|vitePlugin)\b|svelte\.config|vite-plugin-svelte").unwrap()
+    });
+    if !code.contains("sveltekit(") || MENTIONS.is_match(&code) || LOCAL_IMPORT.is_match(&code) {
+        return None;
+    }
+    Some(ProbedConfig { native_ok: true, has_preprocess: true, compile_options: Default::default(), kit_files: None })
 }
