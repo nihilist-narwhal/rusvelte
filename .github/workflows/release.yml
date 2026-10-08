@@ -106,12 +106,3 @@ jobs:
             if npm view "$spec" version > /dev/null 2>&1; then echo "$spec is published already"; continue; fi
             (cd "$dir" && npm publish --access public --provenance $DRY_RUN)
           done
-      - name: Deprecate the unscoped packages of the first attempt
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-        continue-on-error: true
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          for p in darwin-arm64 darwin-x64 linux-x64-gnu linux-arm64-gnu linux-x64-musl; do
-            npm deprecate "rusvelte-$p" "Moved to @rusveltejs/$p; install @rusveltejs/compiler instead"
-          done
