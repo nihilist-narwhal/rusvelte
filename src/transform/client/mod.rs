@@ -955,6 +955,30 @@ pub fn client_component(c: &mut Client, inject_css: Option<(String, String)>) ->
     program
 }
 
+/// `client_module(analysis, options)`: a `.svelte.js` module
+pub fn client_module(c: &mut Client) -> Node {
+    let program = match c.an.module_program {
+        Some(p) => c.convert_program(p),
+        None => program_node(vec![]),
+    };
+    let ptr = c.register_program(program);
+    let state = root_state(c);
+    // SAFETY: the program is kept alive in `c.programs` and not modified
+    let module = c.visit_js(unsafe { &*ptr }, &state);
+
+    let mut body = vec![b::import_all("$", "svelte/internal/client")];
+    // (the analysis only sets `tracing` in dev)
+    if c.dev && c.an.tracing {
+        body.push(b::imports(&[], "svelte/internal/flags/tracing"));
+    }
+    body.extend(program_body(module));
+    let mut program = program_node(body);
+    let names = std::mem::take(&mut c.memo_names);
+    rename_memo_ids(&mut program, &names);
+    program
+}
+
+
 /// The identifier of a binding's declaration (`binding.node`)
 fn binding_id_node(c: &Client, b: BindingId) -> Node {
     c.id_node(c.binding(b).node)

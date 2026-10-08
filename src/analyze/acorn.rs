@@ -10,8 +10,8 @@
 //! - `Private field '#x' must be declared in an enclosing class`
 //! - `'super' keyword outside a method`, `super() call outside constructor of a subclass`
 //!
-//! acorn's `Export 'x' is not defined` never fires: components can export snippets declared
-//! in the template.
+//! acorn's `Export 'x' is not defined` never fires for components (they can export snippets
+//! declared in the template); [`check_module`] raises it for `.svelte.js` modules.
 
 use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, walk};
@@ -735,6 +735,16 @@ fn binding_end(source: &str, pos: usize) -> Option<usize> {
 /// The first error acorn would raise while parsing `program` that oxc's parser didn't.
 /// `source` is the whole component (spans are offsets into it).
 pub fn check(program: &Program, source: &str, ts: bool) -> Option<CompileError> {
+    check_program(program, source, ts, false)
+}
+
+/// [`check`] for a `.svelte.js` module (`compileModule`), which acorn parses as a plain module:
+/// `export { x }` of an undeclared `x` raises `Export 'x' is not defined` too
+pub fn check_module(program: &Program, source: &str) -> Option<CompileError> {
+    check_program(program, source, false, true)
+}
+
+fn check_program(program: &Program, source: &str, ts: bool, module: bool) -> Option<CompileError> {
     let mut c = Checker {
         source,
         scopes: Vec::new(),
@@ -749,6 +759,24 @@ pub fn check(program: &Program, source: &str, ts: bool) -> Option<CompileError> 
         c.visit_statement(s);
         if c.error.is_some() {
             break;
+        }
+    }
+    if module && c.error.is_none() {
+        // `undefinedExports`, reported once the whole program is parsed
+        let top = &c.scopes[0];
+        let undefined = program.body.iter().find_map(|s| {
+            // (`export { x } from '...'` is an ExportFromDeclaration)
+            let Statement::ExportNamedDeclaration(d) = s else { return None };
+            d.specifiers.iter().find_map(|spec| match &spec.local {
+                ModuleExportName::IdentifierReference(local) => {
+                    let name = local.name.as_str();
+                    (!top.lexical.contains(&name) && !top.var.contains(&name)).then_some((local.span.start, name))
+                }
+                _ => None,
+            })
+        });
+        if let Some((pos, name)) = undefined {
+            c.error = Some((pos, format!("Export '{name}' is not defined")));
         }
     }
     c.error.map(|(pos, message)| e::js_parse_error(pos as usize, &message))

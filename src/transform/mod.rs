@@ -1,5 +1,6 @@
-//! A port of Svelte's code generation (`phases/3-transform`). So far: the CSS output
-//! (`css/index.js`), through [`compile_css`].
+//! A port of Svelte's code generation (`phases/3-transform`): [`compile`] for components,
+//! [`compile_module`] for `.svelte.js` modules, and the CSS output (`css/index.js`) through
+//! [`compile_css`].
 
 pub mod client;
 pub mod css;
@@ -370,6 +371,145 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
     Ok(CompileOutput { js: printed.code, css })
 }
 
+/// The Svelte version `compileModule` names in its header comment
+pub const VERSION: &str = "5.57.2";
+
+/// `compileModule(source, options)`: a `.svelte.js` module (JavaScript with runes). Only
+/// `filename`, `generate`, `dev`, `rootDir` and `experimental` matter.
+pub fn compile_module(source: &str, options: &options::CompileOptions) -> Result<CompileOutput, CompileError> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let alloc = Allocator::default();
+    let locator = std::rc::Rc::new(crate::locator::Locator::new(source));
+
+    // `parse(source, comments, false, false)`
+    let parser = crate::js::JsParser::new(false, locator.clone(), &alloc);
+    let mut js_comments = Vec::new();
+    let content = parser.parse_program(source, 0, &mut js_comments)?;
+    if let Some(err) = analyze::acorn::check_module(&content.program, source) {
+        return Err(err);
+    }
+    let mut ast = crate::ast::Ast::default();
+    let fragment = ast.new_fragment(false);
+    let root = crate::ast::Root {
+        start: 0,
+        end: source.len(),
+        fragment,
+        css: None,
+        instance: None,
+        module: Some(crate::ast::Script {
+            start: 0,
+            end: source.len(),
+            context: "module",
+            content,
+            attributes: Vec::new(),
+            leading_comment: None,
+        }),
+        options: None,
+        comments: js_comments,
+        ts: false,
+    };
+    let component = crate::Component { ast, root, locator: locator.clone() };
+
+    let mut warnings: Vec<Warning> = Vec::new();
+    let analyze_options = analyze::CompileOptions { runes: Some(true), experimental_async: options.experimental_async, ..Default::default() };
+    let mut an = analyze::analyze_module(&alloc, &component, source, &options.filename, &analyze_options, &mut warnings)?;
+
+    // `state.filename`: backslashes replaced, made relative to `rootDir`
+    let mut state_filename = options.filename.replace('\\', "/");
+    if let Some(root_dir) = &options.root_dir {
+        let root_dir = root_dir.replace('\\', "/");
+        if state_filename.starts_with(&root_dir) {
+            let rest = state_filename.replacen(&root_dir, "", 1);
+            state_filename = rest.strip_prefix(['/', '\\']).unwrap_or(&rest).to_string();
+        }
+    }
+
+    let comments = estree_comments(&component.root.comments, &locator);
+    let combined = clone_simple(options);
+    let program = match options.generate {
+        options::Generate::Server => {
+            let conv = crate::estree::convert::Converter::new(&locator, false);
+            let mut s = server::Server {
+                an: &mut an,
+                options: &combined,
+                conv,
+                locator: &locator,
+                css_hash: String::new(),
+                scoped: Default::default(),
+                path: Vec::new(),
+                hoisted: Vec::new(),
+                legacy_reactive_statements: Vec::new(),
+                filename: state_filename,
+                dev: options.dev,
+                instance_nodes: Default::default(),
+                snippet_fns: Vec::new(),
+                synthetic_class: Default::default(),
+                synthetic_style: Default::default(),
+            };
+            server::server_module(&mut s)
+        }
+        options::Generate::Client => {
+            let conv = crate::estree::convert::Converter::new(&locator, false);
+            let mut c = client::Client {
+                an: &mut an,
+                options: &combined,
+                conv,
+                locator: &locator,
+                css_hash: String::new(),
+                scoped: Default::default(),
+                path: Vec::new(),
+                hoisted: Vec::new(),
+                templates: Default::default(),
+                legacy_reactive_imports: Vec::new(),
+                legacy_reactive_statements: Vec::new(),
+                events: Vec::new(),
+                instance_level_snippets: Vec::new(),
+                module_level_snippets: Vec::new(),
+                filename: state_filename,
+                dev: options.dev,
+                synthetic_class: Default::default(),
+                synthetic_style: Default::default(),
+                js_nodes: Default::default(),
+                programs: Vec::new(),
+                is_controlled: Default::default(),
+                needs_mutation_validation: false,
+                needs_props: false,
+                memo_names: Default::default(),
+                next_memo: 0,
+                store_cache: Default::default(),
+                // `analysis.immutable`, `analysis.accessors`
+                immutable: true,
+                accessors: false,
+            };
+            client::client_module(&mut c)
+        }
+        _ => return Err(CompileError { code: "unsupported", message: "generate: false is not supported".into(), position: None }),
+    };
+    let printed = crate::estree::print::print(&program, &crate::estree::print::PrintOptions { comments: &comments, ..Default::default() });
+    let basename = options.filename.rsplit(['/', '\\']).next().unwrap_or("");
+    Ok(CompileOutput { js: format!("/* {basename} generated by Svelte v{VERSION} */\n{}", printed.code), css: None })
+}
+
+/// The JS comments, as esrap gets them (`analysis.comments`)
+fn estree_comments(comments: &[crate::js::JsComment], locator: &crate::locator::Locator) -> Vec<crate::estree::Comment> {
+    comments
+        .iter()
+        .map(|c| {
+            let (l1, c1) = locator.acorn_line_column(c.start);
+            let (l2, c2) = locator.acorn_line_column(c.end);
+            crate::estree::Comment {
+                kind: if c.block { crate::estree::CommentKind::Block } else { crate::estree::CommentKind::Line },
+                value: c.value.as_str().into(),
+                span: Some(crate::estree::Span::new(c.start as u32, c.end as u32)),
+                loc: Some(crate::estree::SourceLocation {
+                    start: crate::estree::Position::new(l1 as u32, c1 as u32),
+                    end: crate::estree::Position::new(l2 as u32, c2 as u32),
+                }),
+            }
+        })
+        .collect()
+}
+
 /// Standard base64 (with padding)
 fn base64(bytes: &[u8]) -> String {
     const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -436,5 +576,36 @@ mod tests {
         let injected = compile_styles(source, "A.svelte", &CssOptions { css: CssMode::Injected, ..Default::default() }).unwrap();
         assert!(injected.css.is_none());
         assert_eq!(injected.injected.unwrap().code, format!(".a.{h} {{color:red;}} @keyframes {h}-k {{}}.a.{h} {{ animation: {h}-k 1s;}}"));
+    }
+
+    #[test]
+    fn compile_module_classes() {
+        // (checked against svelte 5.57.2)
+        let source = "class A { #x = $derived(1); constructor(){ this.#x = 3; this.#x += 1 } get x(){ return this.#x } }";
+        let compile = |generate| {
+            let options = options::CompileOptions { filename: "a.svelte.js".into(), generate, ..Default::default() };
+            compile_module(source, &options).unwrap().js
+        };
+        assert_eq!(
+            compile(options::Generate::Client),
+            "/* a.svelte.js generated by Svelte v5.57.2 */\nimport * as $ from 'svelte/internal/client';\n\nclass A {\n\t#x = $.derived(() => 1);\n\n\tconstructor() {\n\t\t$.set(this.#x, 3);\n\t\t$.set(this.#x, $.get(this.#x) + 1);\n\t}\n\n\tget x() {\n\t\treturn $.get(this.#x);\n\t}\n}"
+        );
+        assert_eq!(
+            compile(options::Generate::Server),
+            "/* a.svelte.js generated by Svelte v5.57.2 */\nimport * as $ from 'svelte/internal/server';\n\nclass A {\n\t#x = $.derived(() => 1);\n\n\tconstructor() {\n\t\tthis.#x(3);\n\t\tthis.#x(this.#x() + 1);\n\t}\n\n\tget x() {\n\t\treturn this.#x();\n\t}\n}"
+        );
+    }
+
+    #[test]
+    fn compile_module_errors() {
+        let options = options::CompileOptions { filename: "a.svelte.js".into(), ..Default::default() };
+        let code = |source: &str| compile_module(source, &options).err().map(|e| e.code);
+        assert_eq!(code("export { x };"), Some("js_parse_error"));
+        assert_eq!(code("export { f }; function f() {}"), None);
+        assert_eq!(code("export { y }; { var y = 1 }"), None);
+        assert_eq!(code("export default x;"), None);
+        assert_eq!(code("let a = $state(0); export default a; a = 2;"), Some("state_invalid_export"));
+        assert_eq!(code("export const x = [$state(0)];"), Some("state_invalid_placement"));
+        assert_eq!(code("import { writable } from 'svelte/store'; const s = writable(1); export const v = () => $s;"), Some("store_invalid_subscription_module"));
     }
 }

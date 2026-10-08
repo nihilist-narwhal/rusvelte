@@ -210,6 +210,8 @@ pub(crate) enum AstType {
     Module,
     Instance,
     Template,
+    /// `null`: a `.svelte.js` module (`analyze_module`)
+    None,
 }
 
 /// The analysis state (zimmerframe `state`), copied when visitors change it
@@ -530,6 +532,92 @@ impl<'s> Analyzer<'s> {
     }
 }
 
+impl<'s> Analyzer<'s> {
+    /// An analyzer with nothing analysed yet
+    pub(crate) fn blank(
+        ast: &'s Ast<'s>,
+        root: &'s Root<'s>,
+        source: &'s str,
+        alloc: &'s Allocator,
+        sc: Scopes<'s>,
+        warnings: &'s mut Vec<Warning>,
+        filename: &'s str,
+    ) -> Analyzer<'s> {
+        Analyzer {
+            ast,
+            root,
+            source,
+            alloc,
+            sc,
+            path: Vec::new(),
+            warnings,
+            ignore_sets: Vec::new(),
+            ignore_stack: Vec::new(),
+            ignore_map: FxHashMap::default(),
+            runes: false,
+            maybe_runes: false,
+            custom_element: false,
+            experimental_async: false,
+            namespace: "html",
+            custom_element_props: false,
+            name: String::new(),
+            module_scope: 0,
+            instance_scope: 0,
+            module_program: None,
+            instance_program: None,
+            uses_slots: false,
+            uses_render_tags: false,
+            uses_event_attributes: false,
+            event_directive_node: None,
+            slot_names: Vec::new(),
+            snippets: Vec::new(),
+            snippet_renderers: Vec::new(),
+            renderer_snippets: FxHashMap::default(),
+            snippet_sites: FxHashMap::default(),
+            elements: Vec::new(),
+            node_paths: FxHashMap::default(),
+            path_store: Vec::new(),
+            props_id: None,
+            has_props_rune: false,
+            metas: Vec::new(),
+            needs_context: false,
+            needs_props: false,
+            uses_props: false,
+            uses_rest_props: false,
+            uses_component_bindings: false,
+            exports: Vec::new(),
+            instance_body: blockers::InstanceBody::default(),
+            node_meta: FxHashMap::default(),
+            attr_meta: FxHashMap::default(),
+            bind_meta: FxHashMap::default(),
+            binding_groups: Vec::new(),
+            fragment_dynamic: FxHashSet::default(),
+            pickled_awaits: FxHashSet::default(),
+            async_deriveds: Vec::new(),
+            meta_of: FxHashMap::default(),
+            component_slots: Vec::new(),
+            state_fields: vec![Vec::new()],
+            classes: FxHashMap::default(),
+            exclude_props: FxHashMap::default(),
+            legacy_indirect_bindings: FxHashMap::default(),
+            scope_tracing: FxHashMap::default(),
+            tracing: false,
+            async_runs: vec![None],
+            promise_ids: Vec::new(),
+            promises_id: FxHashMap::default(),
+            next_blocker: 1 << 20,
+            reactive_statements: Vec::new(),
+            slot_fragments: Vec::new(),
+            emptied_fragment: None,
+            textarea_values: FxHashSet::default(),
+            leading_comments: FxHashMap::default(),
+            filename,
+            child_index: 0,
+            has_comments: !root.comments.is_empty() || ast.nodes.iter().any(|n| matches!(n, Node::Comment { .. })),
+        }
+    }
+}
+
 /// `get_component_name(filename)`
 fn get_component_name(filename: &str) -> String {
     let mut parts: Vec<&str> = filename.split(['/', '\\']).collect();
@@ -595,82 +683,19 @@ pub(crate) fn analyze_component<'s>(
     };
     let custom_element_options = options.and_then(|o| o.values.get("customElement"));
 
-    let mut an = Analyzer {
-        ast,
-        root,
-        source,
-        alloc,
-        sc,
-        path: Vec::new(),
-        warnings,
-        ignore_sets: Vec::new(),
-        ignore_stack: Vec::new(),
-        ignore_map: FxHashMap::default(),
-        runes: false,
-        maybe_runes: false,
-        custom_element: custom_element_options.is_some() || compile_options.custom_element,
-        experimental_async: compile_options.experimental_async,
-        namespace: match root.options.as_ref().and_then(|o| o.values.get("namespace")).and_then(|v| v.as_str()).or(compile_options.namespace.as_deref()) {
-            Some("svg") => "svg",
-            Some("mathml") => "mathml",
-            _ => "html",
-        },
-        custom_element_props: custom_element_options.and_then(|c| c.get("props")).is_some_and(|p| !p.is_null()),
-        name: String::new(),
-        module_scope: module.scope,
-        instance_scope: instance.scope,
-        module_program,
-        instance_program,
-        uses_slots: false,
-        uses_render_tags: false,
-        uses_event_attributes: false,
-        event_directive_node: None,
-        slot_names: Vec::new(),
-        snippets: Vec::new(),
-        snippet_renderers: Vec::new(),
-        renderer_snippets: FxHashMap::default(),
-        snippet_sites: FxHashMap::default(),
-        elements: Vec::new(),
-        node_paths: FxHashMap::default(),
-        path_store: Vec::new(),
-        props_id: None,
-        has_props_rune: false,
-        metas: Vec::new(),
-        needs_context: false,
-        needs_props: false,
-        uses_props: false,
-        uses_rest_props: false,
-        uses_component_bindings: false,
-        exports: Vec::new(),
-        instance_body: blockers::InstanceBody::default(),
-        node_meta: FxHashMap::default(),
-        attr_meta: FxHashMap::default(),
-        bind_meta: FxHashMap::default(),
-        binding_groups: Vec::new(),
-        fragment_dynamic: FxHashSet::default(),
-        pickled_awaits: FxHashSet::default(),
-        async_deriveds: Vec::new(),
-        meta_of: FxHashMap::default(),
-        component_slots: Vec::new(),
-        state_fields: vec![Vec::new()],
-        classes: FxHashMap::default(),
-        exclude_props: FxHashMap::default(),
-        legacy_indirect_bindings: FxHashMap::default(),
-        scope_tracing: FxHashMap::default(),
-        tracing: false,
-        async_runs: vec![None],
-        promise_ids: Vec::new(),
-        promises_id: FxHashMap::default(),
-        next_blocker: 1 << 20,
-        reactive_statements: Vec::new(),
-        slot_fragments: Vec::new(),
-        emptied_fragment: None,
-        textarea_values: FxHashSet::default(),
-        leading_comments: FxHashMap::default(),
-        filename,
-        child_index: 0,
-        has_comments: !root.comments.is_empty() || ast.nodes.iter().any(|n| matches!(n, Node::Comment { .. })),
+    let mut an = Analyzer::blank(ast, root, source, alloc, sc, warnings, filename);
+    an.custom_element = custom_element_options.is_some() || compile_options.custom_element;
+    an.experimental_async = compile_options.experimental_async;
+    an.namespace = match root.options.as_ref().and_then(|o| o.values.get("namespace")).and_then(|v| v.as_str()).or(compile_options.namespace.as_deref()) {
+        Some("svg") => "svg",
+        Some("mathml") => "mathml",
+        _ => "html",
     };
+    an.custom_element_props = custom_element_options.and_then(|c| c.get("props")).is_some_and(|p| !p.is_null());
+    an.module_scope = module.scope;
+    an.instance_scope = instance.scope;
+    an.module_program = module_program;
+    an.instance_program = instance_program;
 
     comments::attach_all(&mut an);
 
@@ -929,6 +954,68 @@ pub(crate) fn analyze_component<'s>(
         css,
         an,
     })
+}
+
+/// `analyze_module(source, options)`: the analysis of a `.svelte.js` module. `component` is
+/// the module wrapped as a component without template, its program as the module script.
+pub(crate) fn analyze_module<'s>(
+    alloc: &'s Allocator,
+    component: &'s crate::Component<'s>,
+    source: &'s str,
+    filename: &'s str,
+    compile_options: &CompileOptions,
+    warnings: &'s mut Vec<Warning>,
+) -> Result<Analyzer<'s>> {
+    let ast = &component.ast;
+    let root = &component.root;
+    let script = root.module.as_ref().expect("a module program");
+    let program = P::Js(AstKind::Program(&script.content.program));
+
+    let mut sc = Scopes::default();
+    let created = scope::create_scopes(&mut sc, ast, alloc, Some(program), false, None)?;
+    let scope = created.scope;
+
+    for (name, references) in sc.scope(scope).references.iter() {
+        let name: &str = name;
+        if !name.starts_with('$') || RESERVED.contains(&name) {
+            continue;
+        }
+        let first = sc.refs[references[0] as usize].node;
+        if name == "$" || name.as_bytes().get(1) == Some(&b'$') {
+            return Err(e::global_reference_invalid(first.err_loc(), name));
+        }
+        if sc.get(scope, &name[1..]).is_some() && utils::is_rune(name).is_none() {
+            return Err(e::store_invalid_subscription_module(first.err_loc()));
+        }
+    }
+
+    let mut an = Analyzer::blank(ast, root, source, alloc, sc, warnings, filename);
+    an.experimental_async = compile_options.experimental_async;
+    an.module_scope = scope;
+    // there is no instance; the visitors only look at it for `ast_type === 'instance'`
+    an.instance_scope = scope;
+    an.module_program = Some(program);
+    an.runes = true;
+    an.name = filename.to_string();
+
+    comments::attach_all(&mut an);
+
+    an.component_slots.push(FxHashSet::default());
+    let state = State {
+        scope,
+        ast_type: AstType::None,
+        parent_element: None,
+        in_declaration_tag: false,
+        component_slots: (an.component_slots.len() - 1) as u32,
+        expression: None,
+        state_fields: 0,
+        function_depth: 0,
+        derived_function_depth: -1,
+        reactive_statement: None,
+        async_consts: 0,
+    };
+    an.visit(program, &state)?;
+    Ok(an)
 }
 
 /// Whether the module script exports a snippet (which sets `analysis.css.has_global`, so that

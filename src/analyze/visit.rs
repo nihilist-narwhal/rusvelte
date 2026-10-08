@@ -435,7 +435,16 @@ impl<'s> Analyzer<'s> {
                 }
                 self.next(p, st)
             }
-            K::ExportDefaultDeclaration(_) => Err(e::module_illegal_default_export(self.loc(p))),
+            K::ExportDefaultDeclaration(d) => {
+                if st.ast_type != AstType::None {
+                    return Err(e::module_illegal_default_export(self.loc(p)));
+                }
+                // a `.svelte.js` module
+                if let ExportDefaultDeclarationKind::Identifier(id) = &d.declaration {
+                    self.validate_export(p, st.scope, id.name.as_str())?;
+                }
+                self.next(p, st)
+            }
             K::ExportDeclaration(_) | K::ExportNamedDeclaration(_) | K::ExportFromDeclaration(_) => {
                 self.export_named_declaration(p, k, st)
             }
@@ -1502,7 +1511,9 @@ impl<'s> Analyzer<'s> {
             AstKind::ExportFromDeclaration(d) => &d.specifiers,
             _ => &[],
         };
-        if specifiers.iter().any(|s| !s.export_kind.is_type() && module_export_name_str(&s.exported) == "default") {
+        if st.ast_type != AstType::None
+            && specifiers.iter().any(|s| !s.export_kind.is_type() && module_export_name_str(&s.exported) == "default")
+        {
             return Err(e::module_illegal_default_export(self.loc(p)));
         }
         if let AstKind::ExportDeclaration(d) = k {
