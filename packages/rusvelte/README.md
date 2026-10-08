@@ -1,4 +1,4 @@
-# rusvelte (npm)
+# @rusveltejs/compiler
 
 The rusvelte compiler as a drop-in for `svelte/compiler` in Vite builds. vite-plugin-svelte and
 SvelteKit keep working as they are; their calls to `compile` and `compileModule` go to the Rust
@@ -10,24 +10,24 @@ the official compiler does the work.
 ## Use
 
 ```sh
-npm install -D rusvelte
+npm install -D @rusveltejs/compiler
 ```
 
-Prebuilt native modules cover macOS (arm64, x64) and Linux (x64 and arm64 with glibc 2.17 or
-newer, x64 with musl). Windows is coming in the next release; until then, and on any other
-platform, the package warns and uses the official compiler. From a checkout of the repository instead:
+Prebuilt native modules cover macOS (arm64, x64), Linux (x64 and arm64 with glibc 2.17 or newer,
+x64 with musl) and Windows (x64). On any other platform the package warns and uses the official
+compiler. From a checkout of the repository instead:
 `cargo build --release -p rusvelte-node && node packages/rusvelte/build.js`.
 
 Then either load it for the whole process:
 
 ```sh
-NODE_OPTIONS="--import rusvelte/register" vite build
+NODE_OPTIONS="--import @rusveltejs/compiler/register" vite build
 ```
 
 or wrap the Svelte plugin in `vite.config`:
 
 ```js
-import { rusvelte } from 'rusvelte/vite';
+import { rusvelte } from '@rusveltejs/compiler/vite';
 
 export default defineConfig({
 	plugins: [rusvelte(() => import('@sveltejs/kit/vite').then((m) => m.sveltekit()))]

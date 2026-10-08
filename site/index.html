@@ -272,9 +272,9 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
 
     <section id="try">
       <h2>Try it</h2>
-      <p class="sub">In a Vite or SvelteKit app on Svelte 5.57.2, after building the package from the repository (see <code>packages/rusvelte</code>):</p>
-<pre><code>npm install /path/to/rusvelte/packages/rusvelte
-NODE_OPTIONS="--import rusvelte/register" vite build</code></pre>
+      <p class="sub">In a Vite or SvelteKit app on Svelte 5.57.2:</p>
+<pre><code>npm install -D @rusveltejs/compiler
+NODE_OPTIONS="--import @rusveltejs/compiler/register" vite build</code></pre>
       <p class="note">Anything rusvelte doesn't handle (other Svelte versions, some options, components with errors) falls back to the official compiler. <code>RUSVELTE_VERIFY=1</code> compiles everything both ways and reports any difference.</p>
       <h2 style="margin-top:32px">svelte-check-rs</h2>
       <p class="sub">The project needs TypeScript 7 (<code>@typescript/native-preview</code> or <code>typescript@7</code>), as with <code>svelte-check --tsgo</code>.</p>

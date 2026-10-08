@@ -1,7 +1,7 @@
 // Use rusvelte from vite.config without NODE_OPTIONS: wrap the import of the Svelte plugin so it
 // happens after the `svelte/compiler` hook is registered.
 //
-//   import { rusvelte } from 'rusvelte/vite';
+//   import { rusvelte } from '@rusveltejs/compiler/vite';
 //   export default defineConfig({
 //     plugins: [rusvelte(() => import('@sveltejs/kit/vite').then((m) => m.sveltekit()))]
 //   });

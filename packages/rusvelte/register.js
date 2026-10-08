@@ -2,7 +2,7 @@
 // after this) get a module that re-exports the installed svelte/compiler with `compile` and
 // `compileModule` replaced by rusvelte's (see compiler.js). Load it before those packages:
 //
-//   NODE_OPTIONS="--import rusvelte/register" vite build
+//   NODE_OPTIONS="--import @rusveltejs/compiler/register" vite build
 //
 // or call `register()` before importing them dynamically (vite.js does).
 import { registerHooks } from 'node:module';

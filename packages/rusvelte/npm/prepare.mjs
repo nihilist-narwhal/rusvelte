@@ -2,9 +2,9 @@
 //
 //   node prepare.mjs <artifacts dir> <out dir>
 //
-// <artifacts dir> holds one `rusvelte.<target>.node` per target. Writes <out dir>/rusvelte (the
-// main package) and one <out dir>/rusvelte-<platform> package per binary, all at the main
-// package's version, with the license files.
+// <artifacts dir> holds one `rusvelte.<target>.node` per target. Writes <out dir>/compiler (the
+// main package, @rusveltejs/compiler) and one <out dir>/platform-<platform> package
+// (@rusveltejs/<platform>) per binary, all at the main package's version, with the license files.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,7 +29,7 @@ const licenses = ['LICENSE', 'THIRD_PARTY_NOTICES.md'];
 fs.rmSync(out, { recursive: true, force: true });
 
 for (const [target, t] of Object.entries(TARGETS)) {
-	const name = `rusvelte-${t.name}`;
+	const name = `@rusveltejs/${t.name}`;
 	// only the platforms the main package lists are published
 	if (!(name in main.optionalDependencies)) continue;
 	if (main.optionalDependencies[name] !== main.version) {
@@ -37,14 +37,14 @@ for (const [target, t] of Object.entries(TARGETS)) {
 	}
 	const binary = path.join(artifacts, `rusvelte.${target}.node`);
 	if (!fs.existsSync(binary)) throw new Error(`missing ${binary}`);
-	const dir = path.join(out, name);
+	const dir = path.join(out, `platform-${t.name}`);
 	fs.mkdirSync(dir, { recursive: true });
 	fs.copyFileSync(binary, path.join(dir, 'rusvelte.node'));
 	for (const f of licenses) fs.copyFileSync(path.join(repo, f), path.join(dir, f));
 	const manifest = {
 		name,
 		version: main.version,
-		description: `The ${t.name} native module of rusvelte`,
+		description: `The ${t.name} native module of rusvelte (@rusveltejs/compiler)`,
 		homepage: main.homepage,
 		repository: main.repository,
 		license: main.license,
@@ -55,10 +55,10 @@ for (const [target, t] of Object.entries(TARGETS)) {
 		...(t.libc && { libc: [t.libc] })
 	};
 	fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
-	fs.writeFileSync(path.join(dir, 'README.md'), `# ${name}\n\nThe ${t.name} native module of [rusvelte](https://github.com/nihilist-narwhal/rusvelte). Install \`rusvelte\` instead; it depends on this.\n`);
+	fs.writeFileSync(path.join(dir, 'README.md'), `# ${name}\n\nThe ${t.name} native module of [rusvelte](https://github.com/nihilist-narwhal/rusvelte). Install \`@rusveltejs/compiler\` instead; it depends on this.\n`);
 }
 
-const dir = path.join(out, 'rusvelte');
+const dir = path.join(out, 'compiler');
 fs.mkdirSync(dir, { recursive: true });
 for (const f of main.files) {
 	const from = licenses.includes(f) ? path.join(repo, f) : path.join(pkg_dir, f);
@@ -66,4 +66,4 @@ for (const f of main.files) {
 }
 const { scripts, ...published } = main;
 fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(published, null, 2) + '\n');
-console.log(`prepared rusvelte ${main.version} and ${Object.keys(main.optionalDependencies).length} platform packages in ${out}`);
+console.log(`prepared ${main.name} ${main.version} and ${Object.keys(main.optionalDependencies).length} platform packages in ${out}`);

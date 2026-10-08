@@ -1,7 +1,7 @@
 // The native module: `compile(source, optionsJson)` and `compileModule(source, optionsJson)`
 // return JSON (see bindings/node/src/lib.rs). It comes from `RUSVELTE_NATIVE` if set, else a
 // local build (`rusvelte.node`, made by `npm run build`), else the prebuilt package for this
-// platform (`rusvelte-<platform>-<arch>[-<libc>]`, an optional dependency).
+// platform (`@rusveltejs/<platform>-<arch>[-<libc>]`, an optional dependency).
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -13,10 +13,10 @@ function platform_package() {
 	const { platform, arch } = process;
 	if (platform === 'linux') {
 		const glibc = process.report?.getReport?.().header?.glibcVersionRuntime;
-		return `rusvelte-linux-${arch}-${glibc ? 'gnu' : 'musl'}`;
+		return `@rusveltejs/linux-${arch}-${glibc ? 'gnu' : 'musl'}`;
 	}
-	if (platform === 'win32') return `rusvelte-win32-${arch}-msvc`;
-	return `rusvelte-${platform}-${arch}`;
+	if (platform === 'win32') return `@rusveltejs/win32-${arch}-msvc`;
+	return `@rusveltejs/${platform}-${arch}`;
 }
 
 function load() {
