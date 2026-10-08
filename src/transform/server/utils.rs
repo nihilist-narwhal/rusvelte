@@ -55,7 +55,7 @@ impl<'a, 's> Server<'a, 's> {
                     let meta = self.meta_of_node(*n);
                     if self.meta_is_async(meta) {
                         self.flush_sequence(&mut sequence, st);
-                        let expression = self.visit_template_expr(*n, expression, st);
+                        let expression = self.visit_template_expr_here(expression, st);
                         let has_await = self.an.metas[meta as usize].has_await;
                         let mut call = b::call("$$renderer.push", vec![b::thunk_with(b::call("$.escape", vec![expression]), has_await)]);
                         let blockers = self.meta_blockers_array(meta);
@@ -101,7 +101,7 @@ impl<'a, 's> Server<'a, 's> {
                     if evaluated.is_known {
                         quasis.last_mut().unwrap().0.push_str(&escape_html(&evaluated_string(&evaluated.value), false));
                     } else {
-                        let e = self.visit_template_expr(*n, expression, st);
+                        let e = self.visit_template_expr_here(expression, st);
                         expressions.push(b::call("$.escape", vec![e]));
                         quasis.push(quasi(String::new(), i + 1 == len));
                     }
