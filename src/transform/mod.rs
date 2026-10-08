@@ -123,6 +123,7 @@ pub fn compile_styles(source: &str, filename: &str, options: &CssOptions) -> Res
         runes: options.runes,
         custom_element: options.custom_element,
         experimental_async: options.experimental_async,
+        ..Default::default()
     };
     let analysis = analyze::analyze_component(&alloc, &component, source, filename, &analyze_options, &mut warnings)?;
 
