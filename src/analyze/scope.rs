@@ -113,6 +113,18 @@ pub struct Scope<'s> {
     pub lookup_parent: Option<ScopeId>,
 }
 
+impl Scope<'_> {
+    /// `declarations.get(name)`; small maps are scanned instead of hashed
+    #[inline]
+    pub fn declared(&self, name: &str) -> Option<BindingId> {
+        if self.declarations.len() <= 8 {
+            self.declarations.iter().find(|(k, _)| **k == name).map(|(_, b)| *b)
+        } else {
+            self.declarations.get(name).copied()
+        }
+    }
+}
+
 /// All scopes and bindings of a component (Svelte's `ScopeRoot` plus the per-AST `scopes` maps)
 #[derive(Default)]
 pub struct Scopes<'s> {
@@ -170,7 +182,7 @@ impl<'s> Scopes<'s> {
     pub fn get(&self, mut scope: ScopeId, name: &str) -> Option<BindingId> {
         loop {
             let s = &self.scopes[scope as usize];
-            if let Some(&b) = s.declarations.get(name) {
+            if let Some(b) = s.declared(name) {
                 return Some(b);
             }
             scope = s.lookup_parent?;
@@ -180,7 +192,7 @@ impl<'s> Scopes<'s> {
     pub fn owner(&self, mut scope: ScopeId, name: &str) -> Option<ScopeId> {
         loop {
             let s = &self.scopes[scope as usize];
-            if s.declarations.contains_key(name) {
+            if s.declared(name).is_some() {
                 return Some(scope);
             }
             scope = s.lookup_parent?;
@@ -266,7 +278,7 @@ impl<'s> Scopes<'s> {
             if s.track_refs {
                 s.references.entry(name).or_default().push(r);
             }
-            if let Some(&b) = s.declarations.get(name) {
+            if let Some(b) = s.declared(name) {
                 self.bindings[b as usize].references.push(r);
                 return;
             }
@@ -383,8 +395,11 @@ pub fn object<'s>(mut p: P<'s>) -> Option<Id<'s>> {
     ident(p)
 }
 
+pub type Nodes<'s> = smallvec::SmallVec<[P<'s>; 4]>;
+pub type Ids<'s> = smallvec::SmallVec<[Id<'s>; 4]>;
+
 /// `unwrap_pattern`: the identifiers and member expressions a pattern assigns to
-pub fn unwrap_pattern<'s>(p: P<'s>, out: &mut Vec<P<'s>>) {
+pub fn unwrap_pattern<'s>(p: P<'s>, out: &mut Nodes<'s>) {
     use AstKind as K;
     match p {
         P::PatIdent(_) | P::TplExpr(Expr::Ident { .. }) => out.push(p),
@@ -439,8 +454,13 @@ pub fn unwrap_pattern<'s>(p: P<'s>, out: &mut Vec<P<'s>>) {
     }
 }
 
-pub fn extract_identifiers<'s>(p: P<'s>) -> Vec<Id<'s>> {
-    let mut nodes = Vec::new();
+pub fn extract_identifiers<'s>(p: P<'s>) -> Ids<'s> {
+    if let Some(id) = ident(p) {
+        let mut ids = Ids::new();
+        ids.push(id);
+        return ids;
+    }
+    let mut nodes = Nodes::new();
     unwrap_pattern(p, &mut nodes);
     nodes.into_iter().filter_map(ident).collect()
 }
@@ -641,7 +661,7 @@ pub fn create_scopes<'s>(
     }
 
     for (s, node) in std::mem::take(&mut b.updates) {
-        let mut targets = Vec::new();
+        let mut targets = Nodes::new();
         unwrap_pattern(node, &mut targets);
         for expression in targets {
             let Some(left) = object(expression) else { continue };

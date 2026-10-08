@@ -472,9 +472,9 @@ impl<'s> Analyzer<'s> {
         let Some(b) = self.get(st.scope, node.name) else { return Ok(()) };
 
         if let Some(m) = st.expression {
-            let deps = &mut self.metas[m as usize].dependencies;
-            if !deps.contains(&b) {
-                deps.push(b);
+            let meta = &mut self.metas[m as usize];
+            if meta.track_deps && !meta.dependencies.contains(&b) {
+                meta.dependencies.push(b);
             }
         }
 
@@ -1181,7 +1181,7 @@ impl<'s> Analyzer<'s> {
                         let mut ids = scope::extract_identifiers(left);
                         if is_member(left) {
                             if let Some(id) = object(left) {
-                                ids = vec![id];
+                                ids = smallvec::smallvec![id];
                             }
                         }
                         for id in ids {
@@ -1328,10 +1328,10 @@ impl<'s> Analyzer<'s> {
 }
 
 /// `extract_paths(param)`: the identifiers (and member expressions) of a pattern, with `is_rest`
-fn extract_paths<'s>(p: P<'s>) -> Vec<(P<'s>, bool)> {
+fn extract_paths<'s>(p: P<'s>) -> smallvec::SmallVec<[(P<'s>, bool); 4]> {
     use AstKind as K;
-    let mut out = Vec::new();
-    fn go<'s>(p: P<'s>, out: &mut Vec<(P<'s>, bool)>) {
+    let mut out = smallvec::SmallVec::new();
+    fn go<'s>(p: P<'s>, out: &mut smallvec::SmallVec<[(P<'s>, bool); 4]>) {
         use AstKind as K;
         match p {
             _ if ident(p).is_some() || is_member(p) => out.push((p, false)),
@@ -1886,6 +1886,7 @@ impl<'s> Analyzer<'s> {
         }
 
         let meta = self.new_meta();
+        self.metas[meta as usize].track_deps = !self.runes;
         let parent_scope = self.sc.scope(st.scope).parent.unwrap_or(st.scope);
         self.visit_child(
             p,
@@ -2721,8 +2722,9 @@ impl<'s> Analyzer<'s> {
                     }
                 }
                 None => {
-                    let names: Vec<&str> = utils::BINDING_PROPERTIES.iter().map(|b| b.name).collect();
-                    if let Some(m) = utils::fuzzymatch(name, &names) {
+                    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+                    let names = NAMES.get_or_init(|| utils::BINDING_PROPERTIES.iter().map(|b| b.name).collect());
+                    if let Some(m) = utils::fuzzymatch(name, names) {
                         let property = utils::binding_property(&m).unwrap();
                         if property.valid_elements.is_none_or(|v| v.contains(&pname)) {
                             return Err(e::bind_invalid_name(loc, name, Some(&format!("Did you mean '{m}'?"))));
@@ -2824,7 +2826,10 @@ impl<'s> Analyzer<'s> {
 }
 
 /// `node.name.replace(/[a-zA-Z-]*:/g, '')`
-fn strip_namespaces(name: &str) -> String {
+fn strip_namespaces(name: &str) -> std::borrow::Cow<'_, str> {
+    if !name.contains(':') {
+        return name.into();
+    }
     let mut out = String::new();
     let mut run = String::new();
     for c in name.chars() {
@@ -2839,7 +2844,7 @@ fn strip_namespaces(name: &str) -> String {
         }
     }
     out.push_str(&run);
-    out
+    out.into()
 }
 
 /// `regex_illegal_attribute_character`: `/(^[0-9-.])|[\^$@%&#?!|()[\]{}^*+~;]/`

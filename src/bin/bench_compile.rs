@@ -30,7 +30,11 @@ fn main() {
         }
     };
     println!("{} files, {:.2} MB", files.len(), bytes as f64 / 1e6);
+    let only = std::env::var("BENCH_ONLY").ok();
     for (label, run) in [("parse", &parse_only as &dyn Fn()), ("parse + analysis", &diagnostics)] {
+        if only.as_deref().is_some_and(|o| o != label) {
+            continue;
+        }
         for _ in 0..3 {
             run();
         }

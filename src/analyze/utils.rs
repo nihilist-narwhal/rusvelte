@@ -273,13 +273,21 @@ fn gram_counter(value: &str, gram_size: usize) -> Vec<(Vec<u16>, usize)> {
 
 struct FuzzySet {
     exact_set: Vec<(String, String)>,
+    exact_index: rustc_hash::FxHashMap<String, usize>,
     match_dict: [Vec<(Vec<u16>, Vec<(usize, usize)>)>; 4],
+    dict_index: [rustc_hash::FxHashMap<Vec<u16>, usize>; 4],
     items: [Vec<(f64, String)>; 4],
 }
 
 impl FuzzySet {
     fn new(arr: &[&str]) -> Self {
-        let mut set = FuzzySet { exact_set: Vec::new(), match_dict: Default::default(), items: Default::default() };
+        let mut set = FuzzySet {
+            exact_set: Vec::new(),
+            exact_index: Default::default(),
+            match_dict: Default::default(),
+            dict_index: Default::default(),
+            items: Default::default(),
+        };
         for v in arr {
             set.add(v);
         }
@@ -287,7 +295,7 @@ impl FuzzySet {
     }
 
     fn exact(&self, normalized: &str) -> Option<&str> {
-        self.exact_set.iter().find(|(k, _)| k == normalized).map(|(_, v)| v.as_str())
+        self.exact_index.get(normalized).map(|&i| self.exact_set[i].1.as_str())
     }
 
     fn add(&mut self, value: &str) {
@@ -301,15 +309,21 @@ impl FuzzySet {
             let mut sum = 0.0;
             for (gram, count) in counts {
                 sum += (count * count) as f64;
-                match self.match_dict[gram_size].iter_mut().find(|(g, _)| *g == gram) {
-                    Some(entry) => entry.1.push((index, count)),
-                    None => self.match_dict[gram_size].push((gram, vec![(index, count)])),
+                match self.dict_index[gram_size].get(&gram) {
+                    Some(&i) => self.match_dict[gram_size][i].1.push((index, count)),
+                    None => {
+                        self.dict_index[gram_size].insert(gram.clone(), self.match_dict[gram_size].len());
+                        self.match_dict[gram_size].push((gram, vec![(index, count)]));
+                    }
                 }
             }
             self.items[gram_size].push((sum.sqrt(), normalized.clone()));
-            match self.exact_set.iter_mut().find(|(k, _)| *k == normalized) {
-                Some(entry) => entry.1 = value.to_string(),
-                None => self.exact_set.push((normalized.clone(), value.to_string())),
+            match self.exact_index.get(&normalized) {
+                Some(&i) => self.exact_set[i].1 = value.to_string(),
+                None => {
+                    self.exact_index.insert(normalized.clone(), self.exact_set.len());
+                    self.exact_set.push((normalized.clone(), value.to_string()));
+                }
             }
         }
     }
@@ -339,8 +353,8 @@ impl FuzzySet {
         let mut sum = 0.0;
         for (gram, count) in counts {
             sum += (count * count) as f64;
-            if let Some((_, list)) = self.match_dict[gram_size].iter().find(|(g, _)| *g == gram) {
-                for &(index, other) in list {
+            if let Some(&i) = self.dict_index[gram_size].get(&gram) {
+                for &(index, other) in &self.match_dict[gram_size][i].1 {
                     *matches.entry(index).or_insert(0) += count * other;
                 }
             }
@@ -366,12 +380,26 @@ impl FuzzySet {
     }
 }
 
-/// `fuzzymatch(name, names)`
+/// `fuzzymatch(name, names)`. The sets are cached per list of names (always static here).
 pub fn fuzzymatch(name: &str, names: &[&str]) -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<Vec<(usize, usize, &'static FuzzySet)>>> = OnceLock::new();
     if names.is_empty() {
         return None;
     }
-    let set = FuzzySet::new(names);
+    let key = (names.as_ptr() as usize, names.len());
+    let cache = CACHE.get_or_init(Default::default);
+    let set: &'static FuzzySet = {
+        let mut cache = cache.lock().unwrap();
+        match cache.iter().find(|(p, l, _)| (*p, *l) == key) {
+            Some(&(_, _, set)) => set,
+            None => {
+                let set: &'static FuzzySet = Box::leak(Box::new(FuzzySet::new(names)));
+                cache.push((key.0, key.1, set));
+                set
+            }
+        }
+    };
     let matches = set.get(name)?;
     if matches[0].0 > 0.7 { Some(matches[0].1.clone()) } else { None }
 }

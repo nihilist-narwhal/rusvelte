@@ -94,6 +94,8 @@ pub fn compile_diagnostics(source: &str, filename: &str) -> std::result::Result<
 #[derive(Default, Debug)]
 pub(crate) struct ExprMeta {
     pub has_await: bool,
+    /// whether `dependencies` are collected (only legacy each blocks need them)
+    pub track_deps: bool,
     pub dependencies: Vec<BindingId>,
 }
 

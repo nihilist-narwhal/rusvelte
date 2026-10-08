@@ -711,6 +711,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "serde_json",
+ "smallvec",
  "unicode-id-start",
 ]
 
