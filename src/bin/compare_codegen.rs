@@ -23,6 +23,9 @@ fn main() {
     // `MODULES=1`: only modules, `MODULES=0`: only components
     let modules: Option<bool> = std::env::var("MODULES").ok().map(|m| m == "1");
     let groups_shown: usize = std::env::var("GROUPS").ok().and_then(|g| g.parse().ok()).unwrap_or(25);
+    // `MAPS=1` also compares the source maps' mappings, `WARNINGS=1` the warnings and `metadata.runes`
+    let check_maps = std::env::var("MAPS").is_ok();
+    let check_warnings = std::env::var("WARNINGS").is_ok();
     let oracle_cwd = Path::new(env!("CARGO_MANIFEST_DIR")).join("oracle");
 
     let manifest: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
@@ -112,6 +115,19 @@ fn main() {
                     first_diff(&expected_js, &js)
                 } else if out.css.as_ref().map(|c| c.code.as_str()) != record["css"].as_str() {
                     ("css differs".to_string(), String::new())
+                } else if check_maps && record.get("js_map").is_some() && Some(out.js_mappings.as_str()) != record["js_map"]["mappings"].as_str() {
+                    first_diff_mappings("js map", record["js_map"]["mappings"].as_str().unwrap_or(""), &out.js_mappings)
+                } else if check_maps
+                    && record.get("css_map").is_some()
+                    && out.css.as_ref().map(|c| c.mappings.as_str()) != record["css_map"]["mappings"].as_str()
+                {
+                    first_diff_mappings("css map", record["css_map"]["mappings"].as_str().unwrap_or(""), out.css.as_ref().map_or("", |c| c.mappings.as_str()))
+                } else if check_warnings && record.get("warnings").is_some() && warnings_json(&out.warnings) != record["warnings"] {
+                    let expected: Vec<String> = record["warnings"].as_array().unwrap().iter().map(|w| w["code"].as_str().unwrap_or("").to_string()).collect();
+                    let actual: Vec<&str> = out.warnings.iter().map(|w| w.code).collect();
+                    (format!("warnings differ: expected {expected:?} got {actual:?}"), String::new())
+                } else if check_warnings && record.get("runes").is_some() && Some(out.runes) != record["runes"].as_bool() {
+                    ("metadata.runes differs".to_string(), String::new())
                 } else {
                     matched += 1;
                     continue;
@@ -170,4 +186,28 @@ fn first_diff(expected: &str, actual: &str) -> (String, String) {
 fn shorten(s: &str) -> String {
     let s: String = s.chars().take(70).collect();
     s
+}
+
+/// The warnings as the oracle records them: `[{ code, position }]`
+fn warnings_json(warnings: &[rusvelte::analyze::Warning]) -> Value {
+    Value::Array(
+        warnings
+            .iter()
+            .map(|w| serde_json::json!({ "code": w.code, "position": w.position.map(|(s, e)| vec![s, e]) }))
+            .collect(),
+    )
+}
+
+/// The first generated line whose mappings differ
+fn first_diff_mappings(what: &str, expected: &str, actual: &str) -> (String, String) {
+    let e: Vec<&str> = expected.split(';').collect();
+    let a: Vec<&str> = actual.split(';').collect();
+    for i in 0..e.len().max(a.len()) {
+        let el = e.get(i).copied().unwrap_or("<eof>");
+        let al = a.get(i).copied().unwrap_or("<eof>");
+        if el != al {
+            return (format!("{what} differs (line {})", i + 1), format!("expected: {el}\nactual:   {al}"));
+        }
+    }
+    (format!("{what} differs"), String::new())
 }

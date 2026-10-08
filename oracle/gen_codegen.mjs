@@ -25,10 +25,14 @@ for (const job of jobs) {
 		if (job.stripped?.error) throw new Error(`TypeScript not strippable: ${job.stripped.error}`);
 		const r = job.module ? compileModule(job.text, job.options) : compile(job.text, job.options);
 		record.js = r.js.code;
+		record.js_map = { sources: r.js.map.sources, mappings: r.js.map.mappings };
 		if (r.css) {
 			record.css = r.css.code;
 			record.has_global = r.css.hasGlobal;
+			record.css_map = { file: r.css.map.file, sources: r.css.map.sources, mappings: r.css.map.mappings };
 		}
+		record.warnings = r.warnings.map((w) => ({ code: w.code, position: w.position ?? null }));
+		record.runes = r.metadata.runes;
 	} catch (e) {
 		errors++;
 		record.error = e.code ? { code: e.code, message: e.message } : { crash: String(e.message).split('\n')[0] };
