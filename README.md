@@ -24,7 +24,7 @@ original by diffing outputs over large corpora.
 | svelte-check-rs, TypeScript diagnostics | identical to `svelte-check --tsgo` 4.7.6 on the private app (2,477 diagnostics under strict options) and Windmill (7,922) |
 | svelte-check-rs, compiler warnings | identical to svelte-check on the private app and Windmill (89 warnings) |
 | svelte-check-rs, CSS diagnostics (`css`/`scss`/`less`) | identical to svelte-check on Windmill (96 warnings in all); the CSS linter matches svelte-check's on 4,567/4,567 Svelte tests, Windmill, the private app and 47,072 synthetic files |
-| CSS output (`css.code`, `css.hasGlobal`, injected styles) | byte-identical on every component of the code generation oracle (Svelte test suites 6,929 compilations, the private app 342, Windmill 3,964), plus `dev`/`css: 'injected'` variants and 36,000 synthetic files (1 differs: a JS parse difference) |
+| CSS output (`css.code`, `css.hasGlobal`, injected styles) | byte-identical on every component of the code generation oracle (Svelte test suites 6,929 compilations, the private app 342, Windmill 3,964), plus `dev`/`css: 'injected'` variants and the CSS linter's 31,418 synthetic files (1 differs: oxc rejects a mangled TypeScript expression acorn accepts) |
 
 The remaining svelte2tsx mismatches are 2 scripts that oxc can't parse but TypeScript
 recovers from, and 2 samples where npm 0.7.61 throws but the current language-tools source
