@@ -246,3 +246,51 @@ impl LineOffsets {
         Position { line: line as u32, character: (offset - self.offsets[line]) as u32 }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Flat = (u32, u32, u32, u32, Severity, String, String, String);
+
+    fn diags(src: &str) -> Vec<Flat> {
+        style_diagnostics(src)
+            .into_iter()
+            .map(|d| {
+                let r = d.range;
+                (r.start.line, r.start.character, r.end.line, r.end.character, d.severity, d.message, d.code, d.source)
+            })
+            .collect()
+    }
+
+    fn w(range: (u32, u32, u32, u32), message: &str, code: &str, source: &str) -> Flat {
+        (range.0, range.1, range.2, range.3, Severity::Warning, message.into(), code.into(), source.into())
+    }
+
+    #[test]
+    fn unknown_at_rule() {
+        let src = "<div class=\"a\"></div>\n<style>\n\t.a {\n\t\t@apply font-bold;\n\t}\n</style>\n";
+        assert_eq!(diags(src), [w((3, 2, 3, 8), "Unknown at rule @apply", "unknownAtRules", "css")]);
+    }
+
+    #[test]
+    fn languages() {
+        let d = diags("<style lang=\"scss\">$a: 1; .a {}</style>");
+        assert_eq!(d, [w((0, 26, 0, 28), "Do not use empty rulesets", "emptyRules", "scss")]);
+        assert!(diags("<style lang=\"postcss\">.a {}</style>").is_empty());
+        assert!(diags("<p>no style</p>").is_empty());
+    }
+
+    #[test]
+    fn utf16_positions_and_crlf() {
+        let d = diags("<p>😀</p>\r\n<style>\r\n.é { colr: red }\r\n</style>");
+        assert_eq!(d, [w((2, 5, 2, 9), "Unknown property: 'colr'", "unknownProperties", "css")]);
+    }
+
+    #[test]
+    fn parse_error() {
+        let d = diags("<style>.a { color: red</style>");
+        // (what svelte-check reports: at EOF the declaration list wants a `;` first)
+        assert_eq!(d, [(0, 22, 0, 22, Severity::Error, "semi-colon expected".into(), "css-semicolonexpected".into(), "css".into())]);
+    }
+}
