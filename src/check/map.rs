@@ -161,7 +161,7 @@ impl U16Text {
 }
 
 /// trace-mapping's `originalPositionFor` (greatest lower bound) on decoded mappings
-fn original_position_for(mappings: &[Vec<[u32; 4]>], line: i64, column: i64) -> Option<(u32, u32)> {
+pub fn original_position_for(mappings: &[Vec<[u32; 4]>], line: i64, column: i64) -> Option<(u32, u32)> {
     if line < 0 || column < 0 {
         return None;
     }

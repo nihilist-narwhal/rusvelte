@@ -22,7 +22,7 @@ original by diffing outputs over large corpora.
 | svelte2tsx | Svelte tests 4,566/4,567, svelte2tsx's samples 247/250 (`dts` mode skipped), the private app 171/171, Windmill 1,982/1,982 |
 | SvelteKit route/hook/param files (`upsertKitFile`) | all real-world files; 118/121 synthetic samples |
 | svelte-check-rs, TypeScript diagnostics | identical to `svelte-check --tsgo` 4.7.6 on the private app (2,477 diagnostics under strict options) and Windmill (7,922) |
-| svelte-check-rs, compiler warnings | identical to svelte-check on Windmill (89 warnings; runs the project's preprocessors) |
+| svelte-check-rs, compiler warnings | identical to svelte-check on the private app and Windmill (89 warnings) |
 | svelte-check-rs, CSS diagnostics | not yet |
 
 The remaining svelte2tsx mismatches are 2 scripts that oxc can't parse but TypeScript
@@ -36,11 +36,11 @@ recovers from, and 2 samples where npm 0.7.61 throws but the current language-to
 | Parse the Svelte test corpus | 157 ms | 19 ms |
 | svelte2tsx, Windmill (1,982 files, warm) | 3,425 ms | 539 ms, 91 ms on 12 threads |
 | Full check, the private app (`svelte-check` vs `svelte-check-rs`) | 10.6 s | 1.7 s |
-| Full check, Windmill | 73.5 s (needs an 8 GB heap) | 12.3 s |
+| Full check, Windmill | 73.5 s (needs an 8 GB heap) | 9.3 s |
 | Incremental re-run, Windmill, no changes | 2.4 s (svelte-fast-check) | 2.0 s |
 
-On Windmill the type-check itself (tsgo, about 7 s) and the project's PostCSS/Melt UI
-preprocessors in Node are now most of the time.
+On Windmill the type-check itself (tsgo, about 8 s) is now most of the time; the project's
+PostCSS/Melt UI preprocessors run alongside it in Node.
 
 ### Differences from svelte-check 4.7 `--tsgo`
 
@@ -65,8 +65,10 @@ cd my-app && /path/to/svelte-check-rs --tsconfig ./tsconfig.json
 ```
 
 The project needs TypeScript 7 (`@typescript/native`, an alias of `typescript@7`, or
-`@typescript/native-preview`), as with `svelte-check --tsgo`. Compiler warnings still use
-the project's `svelte/compiler` through Node.
+`@typescript/native-preview`), as with `svelte-check --tsgo`. Compiler warnings come from the Rust analysis. Node is
+only started when the project's config has preprocessors (which then run in Node, and the
+analysis maps positions back through their source maps) or compiler options the analysis
+doesn't support (then the project's `svelte/compiler` does the whole job).
 
 Options follow svelte-check:
 - `--workspace`, `--tsconfig`

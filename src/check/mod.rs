@@ -342,7 +342,7 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
     // compiler warnings come first in each file
     if use_svelte {
         let fresh = match svelte_warnings {
-            Some(handle) => timed(opts.timings, "svelte compiler warnings (wait)", || svelte_warnings_finish(handle))?,
+            Some(handle) => timed(opts.timings, "svelte compiler warnings (wait)", || svelte_warnings_finish(handle, opts.threads))?,
             None if engine == Engine::Native => {
                 let todo: Vec<PathBuf> = files.iter().filter(|f| !warnings_cache.is_fresh(f)).cloned().collect();
                 let options = config.as_ref().map(|c| c.compile_options.clone()).unwrap_or_default();
@@ -756,13 +756,21 @@ function wrap(preprocessors) {
     return (Array.isArray(preprocessors) ? preprocessors : [preprocessors]).map((p) => ({ markup: p.markup, script: p.script, style: p.style }));
 }
 
+const KNOWN_OPTIONS = ['runes', 'customElement', 'experimental', 'dev', 'generate', 'css', 'cssHash', 'hmr', 'discloseVersion', 'preserveComments', 'preserveWhitespace', 'modernAst'];
+
 (async () => {
     const config = await loadConfig();
+    const co = (config && config.compilerOptions) || {};
+    // the compile step can run natively (in Rust) with these options
+    const nativeOk =
+        Object.keys(co).every((k) => KNOWN_OPTIONS.includes(k)) &&
+        Object.keys(co.experimental || {}).every((k) => k === 'async') &&
+        (co.customElement === undefined || typeof co.customElement === 'boolean');
     const files = JSON.parse(fs.readFileSync(listFile, 'utf8'));
     const out = {};
     for (const f of files) {
         const text = fs.readFileSync(f, 'utf8');
-        let code = text, lines = null;
+        let code = text, lines = null, preMappings = null;
         try {
             if (config && config.preprocess) {
                 const pre = await preprocess(text, wrap(config.preprocess), { filename: f });
@@ -770,11 +778,16 @@ function wrap(preprocessors) {
                 if (result !== text) {
                     code = result;
                     const map = pre.map && (typeof pre.map === 'string' ? JSON.parse(pre.map) : pre.map);
-                    lines = map && map.mappings !== undefined ? decode(typeof map.mappings === 'string' ? map.mappings : '') : null;
+                    preMappings = map && typeof map.mappings === 'string' ? map.mappings : null;
+                    lines = preMappings !== null ? decode(preMappings) : null;
                 }
             }
         } catch (e) {
             out[f] = { preprocessError: String(e && e.message || e) };
+            continue;
+        }
+        if (nativeOk) {
+            out[f] = code === text ? { preprocessed: true } : { preprocessed: true, code, mappings: preMappings };
             continue;
         }
         // positions as the language server gets them, mapped through the preprocessor's map
@@ -796,7 +809,12 @@ function wrap(preprocessors) {
             out[f] = { error: { code: e.code, message: e.message, range: range(e) } };
         }
     }
-    out['\0config'] = { preprocess: !!(config && config.preprocess) };
+    out['\0config'] = {
+        preprocess: !!(config && config.preprocess),
+        runes: typeof co.runes === 'boolean' ? co.runes : null,
+        customElement: co.customElement === true,
+        experimentalAsync: !!(co.experimental && co.experimental.async)
+    };
     process.stdout.write(JSON.stringify(out));
 })();
 "#;
@@ -830,17 +848,114 @@ fn svelte_warnings_start(workspace: &Path, cache: &Path, files: &[PathBuf], proc
 /// Per file: `Ok(warnings)` or `Err(error)`, as JSON
 type CompilerResult = Result<Vec<Value>, Value>;
 
-fn svelte_warnings_finish(h: WarningsHandle) -> Result<(Vec<(PathBuf, Value)>, bool), String> {
+fn svelte_warnings_finish(h: WarningsHandle, threads: usize) -> Result<(Vec<(PathBuf, Value)>, bool), String> {
     let mut results = Vec::new();
     let mut has_preprocess = false;
+    let mut options = crate::analyze::CompileOptions::default();
     for child in h.0 {
         let out = child.wait_with_output().map_err(|e| e.to_string())?;
         let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("compiler warnings: {e}"))?;
         let Value::Object(mut m) = v else { continue };
-        has_preprocess |= m.remove("\0config").is_some_and(|c| c["preprocess"] == Value::Bool(true));
+        if let Some(c) = m.remove("\0config") {
+            has_preprocess |= c["preprocess"] == Value::Bool(true);
+            options = crate::analyze::CompileOptions {
+                runes: c["runes"].as_bool(),
+                custom_element: c["customElement"] == Value::Bool(true),
+                experimental_async: c["experimentalAsync"] == Value::Bool(true),
+            };
+        }
         results.extend(m.into_iter().map(|(k, v)| (PathBuf::from(k), v)));
     }
+    // files that were only preprocessed in Node: compile them here
+    let pending: Vec<usize> = (0..results.len()).filter(|&i| results[i].1.get("preprocessed").is_some()).collect();
+    if !pending.is_empty() {
+        let next = AtomicUsize::new(0);
+        let computed: Vec<std::sync::Mutex<Option<Value>>> = pending.iter().map(|_| Default::default()).collect();
+        std::thread::scope(|s| {
+            for _ in 0..threads.max(1) {
+                s.spawn(|| loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&i) = pending.get(k) else { break };
+                    let (path, raw) = &results[i];
+                    *computed[k].lock().unwrap() = Some(compile_preprocessed(path, raw, &options));
+                });
+            }
+        });
+        for (k, i) in pending.into_iter().enumerate() {
+            if let Some(v) = computed[k].lock().unwrap().take() {
+                results[i].1 = v;
+            }
+        }
+    }
     Ok((results, has_preprocess))
+}
+
+/// Compile a file Node preprocessed (or left unchanged), mapping positions back through the
+/// preprocessor's source map like the language server
+fn compile_preprocessed(path: &Path, raw: &Value, options: &crate::analyze::CompileOptions) -> Value {
+    let original;
+    let code = match raw["code"].as_str() {
+        Some(c) => c,
+        None => {
+            original = std::fs::read_to_string(path).unwrap_or_default();
+            &original
+        }
+    };
+    let mappings = raw["mappings"].as_str().map(decode_mappings);
+    let range = |start: &Option<crate::analyze::Position>, end: &Option<crate::analyze::Position>| -> Value {
+        let p = |p: &Option<crate::analyze::Position>, d: (i64, i64)| p.as_ref().map_or(d, |p| (p.line as i64 - 1, p.column as i64));
+        let s = p(start, (0, 0));
+        let e = p(end, s);
+        let Some(m) = &mappings else {
+            return json!({ "start": { "line": s.0, "character": s.1 }, "end": { "line": e.0, "character": e.1 } });
+        };
+        let map = |(l, c): (i64, i64)| map::original_position_for(m, l, c).map_or((-1, -1), |(l, c)| (l as i64, c as i64));
+        let (os, mut oe) = (map(s), map(e));
+        if os.0 == oe.0 && s.0 == e.0 && oe.1 - os.1 == e.1 - s.1 - 1 {
+            oe.1 += 1;
+        }
+        json!({ "start": { "line": os.0, "character": os.1 }, "end": { "line": oe.0, "character": oe.1 } })
+    };
+    match crate::analyze::compile_diagnostics_with(code, &path.to_string_lossy(), options) {
+        Ok(ws) => json!({ "warnings": ws.iter().map(|w| json!({ "code": w.code, "message": w.message, "range": range(&w.start, &w.end) })).collect::<Vec<_>>() }),
+        Err(e) => json!({ "error": { "code": e.code, "message": e.message, "range": range(&e.start, &e.end) } }),
+    }
+}
+
+/// Decode a source map's `mappings` into absolute segments, sorted per line like trace-mapping
+fn decode_mappings(mappings: &str) -> Vec<Vec<[u32; 4]>> {
+    const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let (mut src, mut sl, mut sc) = (0i64, 0i64, 0i64);
+    let mut lines = Vec::new();
+    for line in mappings.split(';') {
+        let mut col = 0i64;
+        let mut out: Vec<[u32; 4]> = Vec::new();
+        for seg in line.split(',').filter(|s| !s.is_empty()) {
+            let mut fields = Vec::with_capacity(5);
+            let (mut value, mut shift) = (0i64, 0);
+            for b in seg.bytes() {
+                let Some(d) = B64.iter().position(|&c| c == b) else { break };
+                let d = d as i64;
+                value |= (d & 31) << shift;
+                if d & 32 != 0 {
+                    shift += 5;
+                } else {
+                    fields.push(if value & 1 != 0 { -(value >> 1) } else { value >> 1 });
+                    (value, shift) = (0, 0);
+                }
+            }
+            col += fields.first().copied().unwrap_or(0);
+            if fields.len() >= 4 {
+                src += fields[1];
+                sl += fields[2];
+                sc += fields[3];
+                out.push([col as u32, src as u32, sl as u32, sc as u32]);
+            }
+        }
+        out.sort_by_key(|s| s[0]);
+        lines.push(out);
+    }
+    lines
 }
 
 fn to_compiler_result(v: &Value) -> CompilerResult {
