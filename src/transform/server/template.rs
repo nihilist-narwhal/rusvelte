@@ -595,9 +595,10 @@ impl<'a, 's> Server<'a, 's> {
         // keep the number of thunks pushed in sync with analysis phase
         let has_await = self.an.metas[meta as usize].has_await || assignments.iter().any(b::has_await_expression);
         let body = if assignments.len() == 1 {
-            match assignments.into_iter().next().unwrap().kind {
+            let assignment = assignments.into_iter().next().unwrap();
+            match assignment.kind {
                 NodeKind::ExpressionStatement(e) => *e.expression,
-                kind => Node { kind, ..b::empty() },
+                _ => assignment,
             }
         } else {
             b::block(assignments)
