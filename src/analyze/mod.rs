@@ -903,6 +903,25 @@ pub(crate) fn analyze_component<'s>(
         None => None,
     };
 
+    // scoped custom elements get their class through properties, set at runtime
+    if let Some(meta) = &css {
+        for n in an.elements.clone() {
+            if meta.scoped_elements.contains(&n) && an.is_custom_element_node(n) {
+                let path = an.saved_path(n).to_vec();
+                for p in path.into_iter().rev() {
+                    let key = match p {
+                        P::Fragment(f) => f,
+                        P::SlotFragment(s) => an.slot_fragments[s as usize].0,
+                        _ => continue,
+                    };
+                    if !an.fragment_dynamic.insert(key) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     Ok(ComponentAnalysis {
         css_has_global: exports_snippet || css.as_ref().is_some_and(|c| c.has_global),
         component_name,

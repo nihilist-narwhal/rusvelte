@@ -69,9 +69,11 @@ impl<'a, 's> Tracer<'a, 's> {
 
     fn reference(&self, p: P<'s>, scope: ScopeId) -> Option<BindingId> {
         let id = scope::ident(p)?;
-        let parent = *self.path.last()?;
-        if !scope::is_reference(p, parent) {
-            return None;
+        // `is_reference(node, undefined)` is true: a walk's root identifier is a reference
+        if let Some(&parent) = self.path.last() {
+            if !scope::is_reference(p, parent) {
+                return None;
+            }
         }
         self.an.get(scope, id.name)
     }
