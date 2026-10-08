@@ -74,7 +74,7 @@ pub fn compile_diagnostics(source: &str, filename: &str) -> std::result::Result<
             };
             (result, component.locator.clone())
         }
-        Err(err) => (Err(err), std::rc::Rc::new(Locator::new(source))),
+        Err(err) => (Err(acorn::reword_parse_error(err, source)), std::rc::Rc::new(Locator::new(source))),
     };
     let pos = |b: usize| {
         let (line, column, character) = locator.line_column(b);

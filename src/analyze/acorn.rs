@@ -672,6 +672,37 @@ impl<'a> Visit<'a> for Checker<'a> {
     fn visit_ts_type_annotation(&mut self, _it: &TSTypeAnnotation<'a>) {}
 }
 
+/// Reword a `js_parse_error` from oxc the way acorn reports it, for the errors where both
+/// agree on the position (or where acorn's is the next token)
+pub fn reword_parse_error(err: CompileError, source: &str) -> CompileError {
+    if err.code != "js_parse_error" {
+        return err;
+    }
+    let Some((pos, _)) = err.position else { return err };
+    let message = err.first_line();
+    let (message, pos) = if message == "Expected a semicolon or an implicit semicolon after a statement, but found none" {
+        // acorn complains at the next token
+        let rest = source.get(pos..).unwrap_or("");
+        let skipped = rest.len() - rest.trim_start_matches(super::utils::is_js_whitespace).len();
+        ("Unexpected token".to_string(), pos + skipped)
+    } else if message.starts_with("Expected `") && message.contains("` but found `") && !message.contains("` or `") {
+        ("Unexpected token".to_string(), pos)
+    } else if message == "Cannot assign to this expression" {
+        ("Assigning to rvalue".to_string(), pos)
+    } else if let Some(c) = message.strip_prefix("Invalid Character `").and_then(|m| m.strip_suffix('`')) {
+        (format!("Unexpected character '{c}'"), pos)
+    } else if message == "`await` is only allowed within async functions and at the top levels of modules" {
+        ("Cannot use keyword 'await' outside an async function".to_string(), pos)
+    } else if message == "A 'return' statement can only be used within a function body." {
+        ("'return' outside of function".to_string(), pos)
+    } else if message == "Unexpected new.target expression" {
+        ("'new.target' can only be used in functions and class static block".to_string(), pos)
+    } else {
+        return err;
+    };
+    e::js_parse_error(pos, &message)
+}
+
 /// The first error acorn would raise while parsing `program` that oxc's parser didn't.
 /// `source` is the whole component (spans are offsets into it).
 pub fn check(program: &Program, source: &str, ts: bool) -> Option<CompileError> {
