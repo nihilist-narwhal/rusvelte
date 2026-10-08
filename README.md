@@ -1,46 +1,119 @@
 # svelte-rs
 
-An experimental Rust port of the Svelte 5 compiler. So far: the parser, equivalent to
-`parse(source, { modern: true })` from `svelte/compiler` 5.57.2. JavaScript inside
-components is parsed with [oxc](https://oxc.rs).
+An experimental Rust port of Svelte 5 tooling, aimed at a faster `svelte-check`. JavaScript
+inside components is parsed with [oxc](https://oxc.rs). Every layer is checked against the JS
+original by diffing outputs over large corpora.
+
+- **Parser**: `parse(source, { modern: true })` and the legacy AST from `svelte/compiler`
+  5.57.2.
+- **svelte2tsx**: the component-to-TypeScript transform from `svelte2tsx` 0.7.61, which
+  svelte-check type-checks.
+- **svelte-check-rs**: a native `svelte-check --tsgo`. It converts every component in
+  parallel, writes svelte-check's overlay, runs TypeScript 7 (tsgo) and maps the
+  diagnostics back.
 
 ## Status
 
-- Output matches the JS parser exactly on all 4,567 `.svelte` files in Svelte's test suite
-  (ASTs, or error code + message). For 3 files with invalid JS, the error position differs
-  from acorn's.
-- Parsing to the Rust AST takes ~19 ms for the whole corpus (1.1 MB), vs ~157 ms for
-  `svelte/compiler`'s `parse` on Node — about 8× faster. JS stays as oxc's typed AST; the
-  acorn-compatible JSON is only produced on request (`Component::to_json`, `parse_modern`),
-  which is slow (~260 ms) and meant for compatibility testing.
+| Part | Parity with the JS original |
+|---|---|
+| Parser | 4,567/4,567 Svelte test files (3 differ only in a JS error's position), the private app 171/171 |
+| Legacy AST | 4,567/4,567, 171/171 |
+| svelte2tsx | Svelte tests 4,566/4,567, svelte2tsx's samples 247/250 (`dts` mode skipped), the private app 171/171, Windmill 1,982/1,982 |
+| SvelteKit route/hook/param files (`upsertKitFile`) | all real-world files; 118/121 synthetic samples |
+| svelte-check-rs, TypeScript diagnostics | identical to `svelte-check --tsgo` 4.7.6 on the private app (2,477 diagnostics under strict options) and Windmill (7,922) |
+| svelte-check-rs, compiler warnings | identical to svelte-check on Windmill (89 warnings; runs the project's preprocessors) |
+| svelte-check-rs, CSS diagnostics | not yet |
 
-## Setup
+The remaining svelte2tsx mismatches are 2 scripts that oxc can't parse but TypeScript
+recovers from, and 2 samples where npm 0.7.61 throws but the current language-tools source
+(followed here) doesn't.
+
+### Speed
+
+| | JS | Rust |
+|---|---|---|
+| Parse the Svelte test corpus | 157 ms | 19 ms |
+| svelte2tsx, Windmill (1,982 files, warm) | 3,425 ms | 539 ms, 91 ms on 12 threads |
+| Full check, the private app (`svelte-check` vs `svelte-check-rs`) | 10.6 s | 1.7 s |
+| Full check, Windmill | 73.5 s (needs an 8 GB heap) | 12.3 s |
+| Incremental re-run, Windmill, no changes | 2.4 s (svelte-fast-check) | 2.0 s |
+
+On Windmill the type-check itself (tsgo, about 7 s) and the project's PostCSS/Melt UI
+preprocessors in Node are now most of the time.
+
+### Differences from svelte-check 4.7 `--tsgo`
+
+These are deliberate fixes:
+
+- **Excludes covering the cache directory are dropped.** A tsconfig that excludes
+  `.svelte-kit` made svelte-check exclude its own output, so no component got type-checked.
+- **package.json subpath imports (`#lib/*`) get overlay `paths`** that try the generated
+  files first. svelte-check only redirects relative imports and `paths`, so `#lib/X.svelte`
+  became an untyped module.
+- **The overlay keeps the project's `rootDir` default.** With `outDir` and no `rootDir`,
+  TypeScript 6+ would make the overlay's own directory the root, report only TS6059 errors
+  and skip type-checking.
+- **Compiler errors are reported for components svelte2tsx can't convert.** svelte-check
+  drops such files silently.
+
+## svelte-check-rs
+
+```sh
+cargo build --release --bin svelte-check-rs
+cd my-app && /path/to/svelte-check-rs --tsconfig ./tsconfig.json
+```
+
+The project needs TypeScript 7 (`@typescript/native`, an alias of `typescript@7`, or
+`@typescript/native-preview`), as with `svelte-check --tsgo`. Compiler warnings still use
+the project's `svelte/compiler` through Node.
+
+Options follow svelte-check:
+- `--workspace`, `--tsconfig`
+- `--output human|human-verbose|machine|machine-verbose`
+- `--threshold`, `--ignore`, `--fail-on-warnings`
+- `--diagnostic-sources js,svelte`, `--compiler-warnings code:ignore|error,...`
+- `--incremental`, `--watch`, `--preserveWatchOutput`
+
+`--timings` prints where the time went.
+
+## Setup for the parity checks
 
 ```sh
 git clone https://github.com/sveltejs/svelte.git svelte-upstream
 git -C svelte-upstream checkout 707c28146b0f0a6d5404a1bd4769874c3c24851a
-cd oracle && npm install && node gen.mjs ../svelte-upstream/packages/svelte/tests expected && cd ..
+git clone https://github.com/sveltejs/language-tools.git language-tools-upstream
+cd oracle && npm install && cd ..
 ```
 
-`oracle/gen.mjs` runs the real Svelte parser over every `.svelte` file in the test suite and
-stores the results in `oracle/expected`.
+Each oracle script runs the JS original over a corpus and writes one JSON file per
+component. The matching binary compares and groups failures, and `VERBOSE=1` prints the
+first difference.
 
-## Checking and benchmarking
+| Oracle | Compare binary |
+|---|---|
+| `oracle/gen.mjs` | `compare` (parser, legacy AST) |
+| `oracle/gen_htmlx2jsx.mjs` | `compare_s2t` (template half) |
+| `oracle/gen_svelte2tsx.mjs <corpus> <out> [check\|samples\|svelte-check]` | `compare_s2t` (full svelte2tsx) |
+| `oracle/gen_kit.mjs` | `compare_kit` (SvelteKit files) |
 
-```sh
-cargo run --release --bin compare -- svelte-upstream/packages/svelte/tests oracle/expected
-cargo run --release --bin bench -- svelte-upstream/packages/svelte/tests oracle/expected
-(cd oracle && node bench.mjs ../svelte-upstream/packages/svelte/tests)
-```
-
-`VERBOSE=1` makes `compare` print the first difference for each failing file.
+`tools/check_sanity.py <language-tools> <node_modules>` runs svelte-check's own sanity
+fixtures against svelte-check-rs.
 
 ## Layout
 
-- `src/parser/` — port of `phases/1-parse` (template, tags, elements, CSS, options)
-- `src/js.rs` — oxc integration: acorn-style `parseExpressionAt`, and `ToJson`, which
-  replays Svelte's comment attachment and rewrites and normalizes oxc's ESTree output to
-  acorn's shape
-- `src/ast.rs` — the Svelte template AST and its JSON serialization
-- `src/css.rs` — the CSS AST
-- `src/errors.rs` — generated from Svelte's `errors.js` by `tools/gen_errors.mjs`
+- **Parser**
+  - `src/parser/`: port of `phases/1-parse`.
+  - `src/js.rs`: oxc integration and acorn-compatible JSON (`ToJson`).
+  - `src/ast.rs`, `src/css.rs`: the typed template and CSS ASTs.
+  - `src/legacy.rs`: the Svelte 4-shaped AST that svelte2tsx consumes.
+  - `src/errors.rs`, `src/warning_codes.rs`: generated from Svelte's messages.
+- **svelte2tsx**
+  - `src/magic_string.rs`: port of magic-string.
+  - `src/svelte2tsx/template.rs`, `elements.rs`, `slots.rs`, `periscope.rs`: the template
+    half (`htmlxtojsx_v2`).
+  - `src/svelte2tsx/script/`: the script half, which walks oxc's AST the way svelte2tsx
+    walks TypeScript's.
+  - `src/svelte2tsx/kit.rs`, `rewrite_imports.rs`: SvelteKit files and external imports.
+- **The checker**
+  - `src/check/`: the overlay, tsconfig handling, tsgo, diagnostic mapping and filtering,
+    output writers, watch mode.
