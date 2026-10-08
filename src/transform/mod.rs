@@ -181,6 +181,8 @@ pub struct CompileOutput {
     pub js_mappings: String,
     pub css: Option<CssOutput>,
     pub warnings: Vec<Warning>,
+    /// how many of `warnings` came before the analysis made the filename relative to `rootDir`
+    pub early_warnings: usize,
     pub runes: bool,
 }
 
@@ -437,9 +439,10 @@ fn compile_component(source: &str, options: &options::CompileOptions) -> Result<
         _ => return Err(CompileError { code: "unsupported", message: "generate: false is not supported".into(), position: None }),
     };
     let runes = analysis.an.runes;
+    let early_warnings = analysis.an.warnings_before_adjust;
     drop(analysis);
     let printed = crate::estree::print::print(&program, &crate::estree::print::PrintOptions { comments: &comments, source_map: true, ..Default::default() });
-    Ok(CompileOutput { js_mappings: printed.encode_mappings(), js: printed.code, css, warnings, runes })
+    Ok(CompileOutput { js_mappings: printed.encode_mappings(), js: printed.code, css, warnings, early_warnings, runes })
 }
 
 /// The Svelte version `compileModule` names in its header comment
@@ -575,6 +578,7 @@ fn compile_module_inner(source: &str, options: &options::CompileOptions) -> Resu
         _ => return Err(CompileError { code: "unsupported", message: "generate: false is not supported".into(), position: None }),
     };
     let printed = crate::estree::print::print(&program, &crate::estree::print::PrintOptions { comments: &comments, source_map: true, ..Default::default() });
+    let early_warnings = an.warnings_before_adjust;
     drop(an);
     let basename = options.filename.rsplit(['/', '\\']).next().unwrap_or("");
     // prepend the comment (and an empty line to the mappings)
@@ -583,6 +587,7 @@ fn compile_module_inner(source: &str, options: &options::CompileOptions) -> Resu
         js_mappings: format!(";{}", printed.encode_mappings()),
         css: None,
         warnings,
+        early_warnings,
         runes: true,
     })
 }

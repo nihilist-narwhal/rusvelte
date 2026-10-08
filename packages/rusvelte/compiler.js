@@ -215,20 +215,38 @@ export async function create(real, real_url) {
 		return result;
 	}
 
-	/** `state` as compile leaves it, so `CompileDiagnostic` fills in filename, start/end, frame */
-	function set_state(source, options, runes) {
+	/**
+	 * The result's warnings, made the way compile makes them: `state` is reset, the options are
+	 * validated by the installed compiler (its deprecation warnings, once per instance), the
+	 * warnings emitted before the analysis calls `state.adjust` are made with the filename as
+	 * given, and the rest with the filename relative to `rootDir`. `CompileDiagnostic` fills in
+	 * filename, start/end and frame from `state`. Returns null if the validation throws.
+	 * @param {boolean} module
+	 */
+	function warnings_of(source, options, result, module) {
 		state.reset({ warning: options.warningFilter, filename: options.filename });
 		state.set_source(source);
-		state.adjust({ dev: !!options.dev, rootDir: options.rootDir ?? process.cwd(), runes });
-	}
-
-	function warnings_of(result, options) {
+		if (!module) {
+			try {
+				validate_component_options(options, '');
+			} catch {
+				return null;
+			}
+		}
+		const out = [...state.warnings];
 		const filter = options.warningFilter ?? (() => true);
-		const out = [];
-		for (const w of result.warnings) {
-			if (w.code.startsWith('options_deprecated_')) continue;
+		const early = result.earlyWarnings ?? 0;
+		result.warnings.forEach((w, i) => {
+			if (i === early) {
+				state.adjust({ dev: !!options.dev, rootDir: options.rootDir ?? process.cwd(), runes: result.runes ?? true });
+			}
+			// the deprecation warnings come from the validation above
+			if (w.code.startsWith('options_deprecated_')) return;
 			const warning = new CompileWarning(w.code, w.message, w.position ?? undefined);
 			if (filter(warning)) out.push(warning);
+		});
+		if (result.warnings.length <= early) {
+			state.adjust({ dev: !!options.dev, rootDir: options.rootDir ?? process.cwd(), runes: result.runes ?? true });
 		}
 		return out;
 	}
@@ -268,15 +286,8 @@ export async function create(real, real_url) {
 		source = remove_bom(source);
 		const result = run(source, options, false);
 		if (!result) return real.compile(source, options);
-		set_state(source, options, result.runes);
-		// the option warnings (deprecated options) come from the installed compiler's own
-		// validation, so its once-per-instance memory and the warning filter apply as in compile
-		try {
-			validate_component_options(options, '');
-		} catch {
-			return real.compile(source, options);
-		}
-		const option_warnings = [...state.warnings];
+		const warnings = warnings_of(source, options, result, false);
+		if (!warnings) return real.compile(source, options);
 		// `validate_component_options` defaults the filename
 		options = { ...options, filename: options.filename ?? '(unknown)' };
 
@@ -299,7 +310,6 @@ export async function create(real, real_url) {
 			merge_with_preprocessor_map(css, options, css.map.sources[0]);
 		}
 
-		const warnings = [...option_warnings, ...warnings_of(result, options)];
 		let ast;
 		const compiled = {
 			js,
@@ -331,13 +341,13 @@ export async function create(real, real_url) {
 		source = remove_bom(source);
 		const result = run(source, options, true);
 		if (!result) return real.compileModule(source, options);
-		set_state(source, options, true);
+		const warnings = warnings_of(source, options, result, true);
 		options = { ...options, filename: options.filename ?? '(unknown)' };
 		const js_source_name = get_source_name(options.filename, undefined, 'input.svelte.js');
 		const compiled = {
 			js: { code: result.js.code, map: new JsSourceMap(result.js.mappings, js_source_name, source) },
 			css: null,
-			warnings: warnings_of(result, options),
+			warnings,
 			metadata: { runes: true },
 			ast: null
 		};

@@ -1,6 +1,6 @@
 {
   "name": "@rusveltejs/compiler",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "The Svelte 5 compiler ported to Rust, as a drop-in for svelte/compiler in Vite builds",
   "keywords": [
     "svelte",
@@ -43,11 +43,11 @@
     "svelte": "^5.0.0"
   },
   "optionalDependencies": {
-    "@rusveltejs/darwin-arm64": "0.1.1",
-    "@rusveltejs/darwin-x64": "0.1.1",
-    "@rusveltejs/linux-x64-gnu": "0.1.1",
-    "@rusveltejs/linux-arm64-gnu": "0.1.1",
-    "@rusveltejs/linux-x64-musl": "0.1.1",
-    "@rusveltejs/win32-x64-msvc": "0.1.1"
+    "@rusveltejs/darwin-arm64": "0.1.2",
+    "@rusveltejs/darwin-x64": "0.1.2",
+    "@rusveltejs/linux-x64-gnu": "0.1.2",
+    "@rusveltejs/linux-arm64-gnu": "0.1.2",
+    "@rusveltejs/linux-x64-musl": "0.1.2",
+    "@rusveltejs/win32-x64-msvc": "0.1.2"
   }
 }

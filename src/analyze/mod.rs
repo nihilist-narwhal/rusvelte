@@ -275,6 +275,9 @@ pub(crate) struct Analyzer<'s> {
     pub sc: Scopes<'s>,
     pub path: Vec<P<'s>>,
     pub warnings: &'s mut Vec<Warning>,
+    /// How many warnings were emitted before `state.adjust` makes the filename relative to
+    /// `rootDir` (the earlier ones keep the filename as given)
+    pub warnings_before_adjust: usize,
 
     // svelte-ignore
     pub ignore_sets: Vec<FxHashSet<&'s str>>,
@@ -543,6 +546,7 @@ impl<'s> Analyzer<'s> {
             sc,
             path: Vec::new(),
             warnings,
+            warnings_before_adjust: 0,
             ignore_sets: Vec::new(),
             ignore_stack: Vec::new(),
             ignore_map: FxHashMap::default(),
@@ -807,6 +811,8 @@ pub(crate) fn analyze_component<'s>(
     }
 
     an.name = an.sc.generate(module.scope, compile_options.name.as_deref().unwrap_or(&component_name));
+    // `state.adjust(...)`: later warnings get the filename relative to `rootDir`
+    an.warnings_before_adjust = an.warnings.len();
 
     an.maybe_runes = !runes && runes_option != Some(false) && {
         let refs = &an.sc.scope(module.scope).references;
@@ -989,6 +995,8 @@ pub(crate) fn analyze_module<'s>(
     an.module_program = Some(program);
     an.runes = true;
     an.name = filename.to_string();
+    // `state.adjust(...)` (see `analyze_component`)
+    an.warnings_before_adjust = an.warnings.len();
 
     comments::attach_all(&mut an);
 

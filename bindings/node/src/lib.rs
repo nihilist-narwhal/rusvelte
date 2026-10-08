@@ -119,6 +119,7 @@ fn run(source: &str, options: &str, module: bool) -> String {
             "js": { "code": out.js, "mappings": out.js_mappings },
             "css": out.css.map(|c| json!({ "code": c.code, "mappings": c.mappings, "hasGlobal": c.has_global })),
             "warnings": out.warnings.iter().map(|w| json!({ "code": w.code, "message": w.message, "position": position(w.position) })).collect::<Vec<_>>(),
+            "earlyWarnings": out.early_warnings,
             "runes": out.runes,
         }),
     }
