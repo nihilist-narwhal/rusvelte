@@ -1009,15 +1009,17 @@ fn custom_element_definition(c: &Client, properties: &[(String, BindingId)]) -> 
     }
     let slots_str = b::array(c.an.slot_names.iter().map(|(n, _)| b::literal(*n)).collect::<Vec<_>>());
     let accessors_str = b::array(c.an.exports.iter().map(|(n, a)| b::literal(a.as_deref().unwrap_or(n))).collect::<Vec<_>>());
-    let shadow = ce_obj.as_ref().and_then(|o| o.get("shadow")).and_then(|s| s.as_str()).map(str::to_string);
-    let shadow_root_init = match shadow.as_deref() {
-        None | Some("open") => Some(b::object(vec![b::init("mode", b::literal("open"))])),
-        Some("none") => None,
-        Some(_) => None,
+    let shadow = ce_obj.as_ref().and_then(|o| o.get("shadow")).cloned();
+    let shadow_root_init = match &shadow {
+        None => Some(b::object(vec![b::init("mode", b::literal("open"))])),
+        Some(serde_json::Value::String(s)) if s == "open" => Some(b::object(vec![b::init("mode", b::literal("open"))])),
+        Some(serde_json::Value::String(_)) => None,
+        Some(_) => custom_element_option_expression(c, "shadow"),
     };
+    let extend = if ce_obj.as_ref().is_some_and(|o| o.contains_key("extend")) { custom_element_option_expression(c, "extend") } else { None };
     let create_ce = b::call(
         "$.create_custom_element",
-        vec![Some(b::id(c.an.name.as_str())), Some(b::object(props_str)), Some(slots_str), Some(accessors_str), shadow_root_init, None],
+        vec![Some(b::id(c.an.name.as_str())), Some(b::object(props_str)), Some(slots_str), Some(accessors_str), shadow_root_init, extend],
     );
     let tag = ce_obj.as_ref().and_then(|o| o.get("tag")).and_then(|t| t.as_str()).map(str::to_string).or_else(|| ce.as_ref().and_then(|v| v.as_str()).map(str::to_string));
     match tag {
@@ -1031,6 +1033,31 @@ fn custom_element_definition(c: &Client, properties: &[(String, BindingId)]) -> 
         }
         None => b::stmt(create_ce),
     }
+}
+
+/// The expression of a property of `<svelte:options customElement={{ ... }}>` (as written)
+fn custom_element_option_expression(c: &Client, name: &str) -> Option<Node> {
+    use oxc_ast::ast::{Expression, ObjectPropertyKind, PropertyKey};
+    let options = c.an.root.options.as_ref()?;
+    for a in &options.attributes {
+        let crate::ast::Attr::Attribute { name: "customElement", value, .. } = a else { continue };
+        let chunk = match value {
+            crate::ast::AttrValue::Expression(c) => &**c,
+            crate::ast::AttrValue::Sequence(chunks) => chunks.first()?,
+            crate::ast::AttrValue::True => return None,
+        };
+        let crate::ast::Chunk::Expression { expression: crate::ast::Expr::Js(js), .. } = chunk else { return None };
+        let Expression::ObjectExpression(o) = js.effective_root() else { return None };
+        for p in &o.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = p else { continue };
+            if let PropertyKey::StaticIdentifier(k) = &p.key {
+                if k.name == name {
+                    return Some(c.conv.expression(&p.value));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// A cell the transform's closures share (`uses_index` and the like)

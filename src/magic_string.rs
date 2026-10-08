@@ -438,6 +438,12 @@ impl<'s> MagicString<'s> {
     /// `[generatedColumn, sourceIndex, originalLine, originalColumn]` per segment, per line.
     /// Columns count UTF-16 units.
     pub fn decoded_map_hires(&self) -> Vec<Vec<[u32; 4]>> {
+        self.decoded_map(true, &Default::default())
+    }
+
+    /// `generateDecodedMap({ hires })`: with `hires: false`, unedited chunks get a segment at
+    /// their start, at the start of each line and at the `sourcemapLocations` (byte offsets)
+    pub fn decoded_map(&self, hires: bool, locations: &rustc_hash::FxHashSet<usize>) -> Vec<Vec<[u32; 4]>> {
         let mut m = Mappings { raw: vec![Vec::new()], line: 0, column: 0 };
         let line_starts: Vec<usize> =
             std::iter::once(0).chain(self.original.match_indices('\n').map(|(i, _)| i + 1)).collect();
@@ -477,19 +483,24 @@ impl<'s> MagicString<'s> {
                     m.advance(&content[previous_line_end.map_or(0, |p| p + 1)..]);
                 }
             } else {
-                // addUneditedChunk, hires: a segment for every UTF-16 unit
-                for ch in self.original[c.start..c.end].chars() {
+                // addUneditedChunk (hires: a segment for every UTF-16 unit)
+                let mut first = true;
+                for (offset, ch) in self.original[c.start..c.end].char_indices() {
                     if ch == '\n' {
                         line += 1;
                         column = 0;
                         m.line += 1;
                         m.raw.push(Vec::new());
                         m.column = 0;
+                        first = true;
                     } else {
                         for _ in 0..ch.len_utf16() {
-                            m.push([m.column, 0, line, column]);
+                            if hires || first || locations.contains(&(c.start + offset)) {
+                                m.push([m.column, 0, line, column]);
+                            }
                             column += 1;
                             m.column += 1;
+                            first = false;
                         }
                     }
                 }

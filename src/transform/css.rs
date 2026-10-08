@@ -37,6 +37,8 @@ struct State<'a, 's> {
     dev: bool,
     selector: String,
     meta: &'a Meta<'s>,
+    /// `code.addSourcemapLocation(...)` of the visited nodes' starts and ends
+    locations: rustc_hash::FxHashSet<usize>,
 }
 
 /// Who a selector list belongs to (`path.at(-1)`)
@@ -49,6 +51,17 @@ enum ListParent<'c> {
 
 /// `render_stylesheet(source, analysis, options).code`
 pub fn render_stylesheet<'s>(source: &'s str, sheet: &StyleSheet, meta: &Meta<'s>, options: &RenderOptions) -> Result<String> {
+    Ok(render(source, sheet, meta, options)?.code.to_string())
+}
+
+/// [`render_stylesheet`], with the `mappings` of its source map (`generateMap()`)
+pub fn render_stylesheet_with_mappings<'s>(source: &'s str, sheet: &StyleSheet, meta: &Meta<'s>, options: &RenderOptions) -> Result<(String, String)> {
+    let state = render(source, sheet, meta, options)?;
+    let mappings = crate::magic_string::encode_mappings(&state.code.decoded_map(false, &state.locations));
+    Ok((state.code.to_string(), mappings))
+}
+
+fn render<'a, 's>(source: &'s str, sheet: &StyleSheet, meta: &'a Meta<'s>, options: &'a RenderOptions) -> Result<State<'a, 's>> {
     let mut state = State {
         code: MagicString::new(source),
         original: source,
@@ -57,8 +70,10 @@ pub fn render_stylesheet<'s>(source: &'s str, sheet: &StyleSheet, meta: &Meta<'s
         dev: options.dev,
         selector: format!(".{}", options.hash),
         meta,
+        locations: Default::default(),
     };
 
+    state.locate(sheet.start, sheet.end);
     for child in &sheet.children {
         state.block_child(child, false)?;
     }
@@ -68,7 +83,7 @@ pub fn render_stylesheet<'s>(source: &'s str, sheet: &StyleSheet, meta: &Meta<'s
     if state.minify {
         state.remove_preceding_whitespace(sheet.content_end)?;
     }
-    Ok(state.code.to_string())
+    Ok(state)
 }
 
 /// `/\s/` (JS whitespace)
@@ -100,6 +115,12 @@ fn is_keyframes(a: &Atrule) -> bool {
 }
 
 impl<'s> State<'_, 's> {
+    /// The universal visitor: `addSourcemapLocation(node.start)` and `(node.end)`
+    fn locate(&mut self, start: usize, end: usize) {
+        self.locations.insert(start);
+        self.locations.insert(end);
+    }
+
     fn is_global_block(&self, rule: &Rule) -> bool {
         self.meta.is_global_block.contains(&addr(rule))
     }
@@ -128,6 +149,11 @@ impl<'s> State<'_, 's> {
 
     fn block_child(&mut self, child: &BlockChild, in_global_block: bool) -> Result<()> {
         match child {
+            BlockChild::Rule(r) => self.locate(r.start, r.end),
+            BlockChild::Atrule(a) => self.locate(a.start, a.end),
+            BlockChild::Declaration(d) => self.locate(d.start, d.end),
+        }
+        match child {
             BlockChild::Rule(r) => self.rule(r, in_global_block),
             BlockChild::Atrule(a) => self.atrule(a, in_global_block),
             BlockChild::Declaration(d) => self.declaration(d),
@@ -149,6 +175,7 @@ impl<'s> State<'_, 's> {
             return Ok(()); // don't transform anything within
         }
         if let Some(block) = &node.block {
+            self.locate(block.start, block.end);
             for child in &block.children {
                 self.block_child(child, in_global_block)?;
             }
@@ -241,6 +268,7 @@ impl<'s> State<'_, 's> {
                 }
 
                 // don't recurse into selectors but visit the body
+                self.locate(node.block.start, node.block.end);
                 for child in &node.block.children {
                     self.block_child(child, true)?;
                 }
@@ -251,6 +279,7 @@ impl<'s> State<'_, 's> {
         let inner = in_global_block || is_global_block;
         let mut bumped = false;
         self.selector_list(&node.prelude, ListParent::Rule(node), inner, false, &mut bumped)?;
+        self.locate(node.block.start, node.block.end);
         for child in &node.block.children {
             self.block_child(child, inner)?;
         }
@@ -267,6 +296,7 @@ impl<'s> State<'_, 's> {
         in_unused_complex: bool,
         bumped: &mut bool,
     ) -> Result<()> {
+        self.locate(node.start, node.end);
         let parent_is_global_block = matches!(parent, ListParent::Rule(r) if self.is_global_block(r));
 
         // Only add comments if we're not inside a complex selector that itself is unused or a global block
@@ -348,6 +378,16 @@ impl<'s> State<'_, 's> {
 
     fn complex(&mut self, node: &ComplexSelector, in_global_block: bool, in_unused_complex: bool, bumped: &mut bool) -> Result<()> {
         let before_bumped = *bumped;
+        self.locate(node.start, node.end);
+        for relative in &node.children {
+            self.locate(relative.start, relative.end);
+            if let Some(c) = &relative.combinator {
+                self.locate(c.start, c.end);
+            }
+            for selector in &relative.selectors {
+                self.locate(sel_start(selector), sel_end(selector));
+            }
+        }
 
         for relative in &node.children {
             if self.meta.rel_is_global.contains(&addr(relative)) {
@@ -502,6 +542,20 @@ impl<'s> State<'_, 's> {
             i += 1;
         }
         Ok(())
+    }
+}
+
+fn sel_start(s: &SimpleSelector) -> usize {
+    match s {
+        SimpleSelector::Nesting { start, .. }
+        | SimpleSelector::Type { start, .. }
+        | SimpleSelector::Id { start, .. }
+        | SimpleSelector::Class { start, .. }
+        | SimpleSelector::PseudoElement { start, .. }
+        | SimpleSelector::PseudoClass { start, .. }
+        | SimpleSelector::Attribute { start, .. }
+        | SimpleSelector::Nth { start, .. }
+        | SimpleSelector::Percentage { start, .. } => *start,
     }
 }
 

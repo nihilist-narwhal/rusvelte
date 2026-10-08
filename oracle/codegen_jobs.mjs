@@ -124,12 +124,12 @@ for (const job of jobs) {
 	}
 	let options;
 	if (job.module) {
-		const o = suites.includes(target) ? suite_options(target, job.config, job.generate) : base;
+		const o = suites.includes(target) ? { ...suite_options(target, job.config, job.generate), ...base } : base;
 		options = { filename, generate: job.generate, dev: o.dev, experimental: o.experimental };
 	} else {
 		options = {
 			filename,
-			...(suites.includes(target) ? suite_options(target, job.config, job.generate) : base),
+			...(suites.includes(target) ? { ...suite_options(target, job.config, job.generate), ...base } : base),
 			generate: job.generate
 		};
 		if (target === 'runtime-runes' || target === 'runtime-legacy') options.rootDir = job.cwd;

@@ -5,7 +5,7 @@
 // server-side-rendering, css, snapshot), compiled with the options that suite's harness uses
 // (tests/helpers.js `compile_directory` and each suite's setup) and each sample's
 // `_config.js` `compileOptions`. Anything else is a directory of components compiled with
-// default options, or the given base options (e.g. `'{"dev":true}'`).
+// default options. Base options (e.g. `'{"dev":true}'`) are added to (and override) these.
 // Each record holds the options used, so the Rust side can compile with the same ones.
 // A `cssHash` function in the options is recorded as `{ "fn": <source> }`.
 import { compile, compileModule } from 'svelte/compiler';

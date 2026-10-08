@@ -309,8 +309,21 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
             // styles injected into the JS (`css: 'injected'`, custom elements)
             let inject_css = match (&root.css, &analysis.css) {
                 (Some(sheet), Some(meta)) if combined.css_injected || analysis.custom_element => {
-                    let code = css::render_stylesheet(source, &sheet.css, meta, &css::RenderOptions { hash: &css_hash, minify: !options.dev, dev: options.dev })
+                    let (mut code, mappings) = css::render_stylesheet_with_mappings(source, &sheet.css, meta, &css::RenderOptions { hash: &css_hash, minify: !options.dev, dev: options.dev })
                         .map_err(|e| CompileError { code: "magic_string", message: e.0, position: None })?;
+                    // in dev, the injected styles carry their source map
+                    if options.dev && !code.is_empty() {
+                        let basename = options.filename.rsplit(['/', '\\']).next().unwrap_or("").to_string();
+                        let map = serde_json::json!({
+                            "version": 3,
+                            "file": basename,
+                            "sources": [basename],
+                            "sourcesContent": [source],
+                            "names": [],
+                            "mappings": mappings,
+                        });
+                        code.push_str(&format!("\n/*# sourceMappingURL=data:application/json;charset=utf-8;base64,{} */", base64(map.to_string().as_bytes())));
+                    }
                     Some((css_hash.clone(), code))
                 }
                 _ => None,
@@ -355,6 +368,20 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
     };
     let printed = crate::estree::print::print(&program, &crate::estree::print::PrintOptions { comments: &comments, ..Default::default() });
     Ok(CompileOutput { js: printed.code, css })
+}
+
+/// Standard base64 (with padding)
+fn base64(bytes: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(CHARS[(n >> 18) as usize & 63] as char);
+        out.push(CHARS[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { CHARS[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { CHARS[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 /// The plain (cloneable) fields of the options
