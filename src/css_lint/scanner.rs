@@ -137,10 +137,6 @@ impl<'a> Scanner<'a> {
         Scanner { src, pos: 0, in_url: false, dialect, buf: Vec::new(), texts: Vec::new(), next_id: 1 }
     }
 
-    pub fn source(&self) -> &'a [u16] {
-        self.src
-    }
-
     /// The token's `text`
     pub fn text(&self, t: &Token) -> &[u16] {
         match t.text {
