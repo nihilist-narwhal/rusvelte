@@ -58,6 +58,9 @@ pub struct Parser<'a> {
     pub builder: AstBuilder<'a>,
     /// Warnings the parser emits (`w.*` calls in `phases/1-parse`)
     pub warnings: Vec<crate::analyze::Warning>,
+    /// Raise the errors acorn raises while parsing that oxc's parser doesn't
+    /// (`analyze::acorn`), where they occur in the document
+    pub acorn_checks: bool,
 }
 
 impl Parser<'_> {
@@ -203,18 +206,20 @@ fn lang_in_tag(rest: &str) -> Option<&str> {
 
 /// Parse a component. `source` must already have its BOM removed.
 pub fn parse<'a>(alloc: &'a Allocator, source: &'a str, loc: Rc<Locator<'a>>, loose: bool) -> Result<(Ast<'a>, Root<'a>)> {
-    parse_collecting(alloc, source, loc, loose, None)
+    parse_collecting(alloc, source, loc, loose, None, false)
 }
 
-/// [`parse`], appending the parser's warnings to `warnings`
+/// [`parse`], appending the parser's warnings to `warnings`, and with `acorn_checks`, raising
+/// acorn's errors that oxc's parser leaves out (as `compile` sees them)
 pub fn parse_collecting<'a>(
     alloc: &'a Allocator,
     source: &'a str,
     loc: Rc<Locator<'a>>,
     loose: bool,
     warnings: Option<&mut Vec<crate::analyze::Warning>>,
+    acorn_checks: bool,
 ) -> Result<(Ast<'a>, Root<'a>)> {
-    let result = parse_inner(alloc, source, loc, loose);
+    let result = parse_inner(alloc, source, loc, loose, acorn_checks);
     match result {
         Ok((ast, root, w)) => {
             if let Some(warnings) = warnings {
@@ -231,6 +236,7 @@ fn parse_inner<'a>(
     source: &'a str,
     loc: Rc<Locator<'a>>,
     loose: bool,
+    acorn_checks: bool,
 ) -> Result<(Ast<'a>, Root<'a>, Vec<crate::analyze::Warning>)> {
     let template = js_trim_end(source);
 
@@ -267,7 +273,9 @@ fn parse_inner<'a>(
         loc,
         builder: AstBuilder::new(alloc),
         warnings: Vec::new(),
+        acorn_checks,
     };
+    parser.js.acorn_checks = acorn_checks;
 
     while parser.index < parser.template.len() {
         if parser.match_str("<") {
@@ -474,7 +482,13 @@ impl<'a> Parser<'a> {
     // --- JS ------------------------------------------------------------------------------
 
     pub fn parse_expression_at(&mut self, source: Src<'a>, index: usize) -> Result<JsExpr<'a>> {
-        self.js.parse_expression_at(source, index, &mut self.root.comments)
+        let expr = self.js.parse_expression_at(source, index, &mut self.root.comments)?;
+        if self.acorn_checks {
+            if let Some(err) = crate::analyze::acorn::check_expression(&expr.expr, self.loc.source(), self.ts) {
+                return Err(err);
+            }
+        }
+        Ok(expr)
     }
 
     /// `get_loose_identifier`
@@ -611,7 +625,8 @@ impl<'a> Parser<'a> {
         let template = Src::new(self.js.alloc_str(&format!("{padding}_ as {rest}")), a);
         let a = a + padding.len();
 
-        let mut expr = self.parse_expression_at(template, a)?;
+        // (a type: nothing for `acorn_checks` to check)
+        let mut expr = self.js.parse_expression_at(template, a, &mut self.root.comments)?;
 
         // `foo: bar = baz` gets mangled — fix it
         if let Expression::AssignmentExpression(assign) = expr.inner() {
@@ -619,7 +634,7 @@ impl<'a> Parser<'a> {
             while template.byte(b) != Some(b'=') {
                 b -= 1;
             }
-            expr = self.parse_expression_at(Src::new(template.slice(template.base, b), template.base), a)?;
+            expr = self.js.parse_expression_at(Src::new(template.slice(template.base, b), template.base), a, &mut self.root.comments)?;
         }
 
         // `array as item: string, index` becomes `string, index` — fix that

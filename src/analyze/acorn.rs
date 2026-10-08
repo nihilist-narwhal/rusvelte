@@ -9,6 +9,12 @@
 //! - `Redefinition of __proto__ property`
 //! - `Private field '#x' must be declared in an enclosing class`
 //! - `'super' keyword outside a method`, `super() call outside constructor of a subclass`
+//! - `checkUnreserved`: `The keyword 'x' is reserved` (strict mode reserved words), and the
+//!   `yield`/`await`/`arguments` rules
+//! - `Octal literal in strict mode`, `Invalid escape sequence` (string literals)
+//! - `Unexpected token` for what acorn (ecmaVersion 16) can't parse: a function declaration
+//!   as the body of an `if`, a loop or a label, `using` declarations, import attributes
+//!   written with `assert`, and `import defer` / `import source`
 //!
 //! acorn's `Export 'x' is not defined` never fires for components (they can export snippets
 //! declared in the template); [`check_module`] raises it for `.svelte.js` modules.
@@ -28,7 +34,20 @@ const ARROW: u16 = 16;
 const SUPER: u16 = 32;
 const DIRECT_SUPER: u16 = 64;
 const FIELD_INIT: u16 = 128;
+const ASYNC: u16 = 256;
+const GENERATOR: u16 = 512;
 const VAR: u16 = TOP | FUNCTION | STATIC_BLOCK;
+
+/// acorn's `keywords` (ecmaVersion 6 and up, a module)
+const KEYWORDS: &[&str] = &[
+    "break", "case", "catch", "continue", "debugger", "default", "do", "else", "finally", "for", "function", "if", "return",
+    "switch", "throw", "try", "var", "while", "with", "null", "true", "false", "instanceof", "typeof", "void", "delete",
+    "new", "in", "this", "const", "class", "extends", "export", "import", "super",
+];
+
+/// `reservedWordsStrict` for a module: `enum`, `await` and the strict mode reserved words
+const STRICT_RESERVED: &[&str] =
+    &["enum", "await", "implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Bind {
@@ -93,6 +112,75 @@ impl<'a> Checker<'a> {
         scope.flags & FUNCTION != 0
     }
 
+    /// `currentVarScope().flags`
+    fn var_flags(&self) -> u16 {
+        self.scopes.iter().rev().find(|s| s.flags & VAR != 0).map_or(0, |s| s.flags)
+    }
+
+    /// `checkUnreserved` for an identifier acorn reads with `parseIdent(false)`
+    fn check_unreserved(&mut self, name: &str, pos: u32) {
+        if self.error.is_some() || (name != "arguments" && !STRICT_RESERVED.contains(&name)) {
+            return;
+        }
+        let var = self.var_flags();
+        let (in_async, in_generator, in_static_block) = (var & ASYNC != 0, var & GENERATOR != 0, var & STATIC_BLOCK != 0);
+        if in_generator && name == "yield" {
+            self.fail(pos, "Cannot use 'yield' as identifier inside a generator");
+        } else if in_async && name == "await" {
+            self.fail(pos, "Cannot use 'await' as identifier inside an async function");
+        } else if self.this_flags() & VAR == 0 && name == "arguments" {
+            self.fail(pos, "Cannot use 'arguments' in class field initializer");
+        } else if in_static_block && (name == "arguments" || name == "await") {
+            self.fail(pos, format!("Cannot use {name} in class static initialization block"));
+        } else if STRICT_RESERVED.contains(&name) {
+            if name == "await" {
+                self.fail(pos, "Cannot use keyword 'await' outside an async function");
+            } else {
+                self.fail(pos, format!("The keyword '{name}' is reserved"));
+            }
+        }
+    }
+
+    /// acorn reads a statement in a single-statement context (the body of an `if`, a loop or a
+    /// label) with `parseStatement(context)`, where a function declaration is unexpected
+    fn single_statement(&mut self, s: &Statement<'a>) {
+        if let Statement::FunctionDeclaration(f) = s {
+            self.fail(f.span.start, "Unexpected token");
+        }
+    }
+
+    /// `readEscapedChar` in strict mode: legacy octal escapes and `\8` / `\9`
+    fn check_string(&mut self, raw: &str, start: u32) {
+        let b = raw.as_bytes();
+        let mut i = 1;
+        while i + 1 < b.len() {
+            if b[i] != b'\\' {
+                i += 1;
+                continue;
+            }
+            match b[i + 1] {
+                b'8' | b'9' => {
+                    self.fail(start + i as u32 + 1, "Invalid escape sequence");
+                    return;
+                }
+                b'0'..=b'7' => {
+                    let mut len = b[i + 1..].iter().take(3).take_while(|c| (b'0'..=b'7').contains(c)).count();
+                    let value = |len: usize| b[i + 1..i + 1 + len].iter().fold(0u32, |v, c| v * 8 + u32::from(c - b'0'));
+                    if value(len) > 255 {
+                        len -= 1;
+                    }
+                    let next = b.get(i + 1 + len).copied();
+                    if len > 1 || b[i + 1] != b'0' || matches!(next, Some(b'8' | b'9')) {
+                        self.fail(start + i as u32, "Octal literal in strict mode");
+                        return;
+                    }
+                    i += 1 + len;
+                }
+                _ => i += 2,
+            }
+        }
+    }
+
     /// `currentThisScope().flags`
     fn this_flags(&self) -> u16 {
         for s in self.scopes.iter().rev() {
@@ -141,6 +229,7 @@ impl<'a> Checker<'a> {
     /// `checkLValSimple` for a binding identifier: strict reserved names, clashes, declaration
     fn bind_identifier(&mut self, id: &BindingIdentifier<'a>, bind: Bind, clashes: Option<&mut Vec<&'a str>>) {
         let name = id.name.as_str();
+        self.check_unreserved(name, id.span.start);
         if name == "eval" || name == "arguments" {
             self.fail(id.span.start, format!("Binding {name} in strict mode"));
         }
@@ -198,6 +287,9 @@ impl<'a> Checker<'a> {
         self.visit_formal_parameters(params);
         let labels = std::mem::take(&mut self.labels);
         if let Some(body) = body {
+            for d in &body.directives {
+                self.visit_string_literal(&d.expression);
+            }
             for s in &body.statements {
                 self.visit_statement(s);
             }
@@ -314,6 +406,13 @@ impl<'a> Visit<'a> for Checker<'a> {
         if it.declare {
             return;
         }
+        if matches!(it.kind, VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing) {
+            // acorn reads `using` as an identifier, then stops at the binding
+            if let Some(d) = it.declarations.first() {
+                self.fail(d.id.span().start, "Unexpected token");
+            }
+            return;
+        }
         let bind = if it.kind == VariableDeclarationKind::Var { Bind::Var } else { Bind::Lexical };
         for d in &it.declarations {
             self.declare_pattern(&d.id, bind, None);
@@ -335,6 +434,7 @@ impl<'a> Visit<'a> for Checker<'a> {
         if let Some(u) = &it.update {
             self.visit_expression(u);
         }
+        self.single_statement(&it.body);
         self.loop_body(|me| me.visit_statement(&it.body));
         self.exit();
     }
@@ -343,6 +443,7 @@ impl<'a> Visit<'a> for Checker<'a> {
         self.enter(0);
         self.visit_for_statement_left(&it.left);
         self.visit_expression(&it.right);
+        self.single_statement(&it.body);
         self.loop_body(|me| me.visit_statement(&it.body));
         self.exit();
     }
@@ -351,16 +452,19 @@ impl<'a> Visit<'a> for Checker<'a> {
         self.enter(0);
         self.visit_for_statement_left(&it.left);
         self.visit_expression(&it.right);
+        self.single_statement(&it.body);
         self.loop_body(|me| me.visit_statement(&it.body));
         self.exit();
     }
 
     fn visit_while_statement(&mut self, it: &WhileStatement<'a>) {
         self.visit_expression(&it.test);
+        self.single_statement(&it.body);
         self.loop_body(|me| me.visit_statement(&it.body));
     }
 
     fn visit_do_while_statement(&mut self, it: &DoWhileStatement<'a>) {
+        self.single_statement(&it.body);
         self.loop_body(|me| me.visit_statement(&it.body));
         self.visit_expression(&it.test);
     }
@@ -376,8 +480,19 @@ impl<'a> Visit<'a> for Checker<'a> {
         self.labels.pop();
     }
 
+    fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
+        self.visit_expression(&it.test);
+        self.single_statement(&it.consequent);
+        self.visit_statement(&it.consequent);
+        if let Some(alternate) = &it.alternate {
+            self.single_statement(alternate);
+            self.visit_statement(alternate);
+        }
+    }
+
     fn visit_labeled_statement(&mut self, it: &LabeledStatement<'a>) {
         let name = it.label.name.as_str();
+        self.check_unreserved(name, it.label.span.start);
         if self.labels.iter().any(|l| l.name == Some(name)) {
             self.fail(it.label.span.start, format!("Label '{name}' is already declared"));
         }
@@ -394,16 +509,39 @@ impl<'a> Visit<'a> for Checker<'a> {
             LabelKind::Other
         };
         self.labels.push(Label { name: Some(name), kind });
+        self.single_statement(&it.body);
         self.visit_statement(&it.body);
         self.labels.pop();
     }
 
     fn visit_break_statement(&mut self, it: &BreakStatement<'a>) {
+        if let Some(label) = &it.label {
+            self.check_unreserved(label.name.as_str(), label.span.start);
+        }
         self.break_continue(it.label.as_ref(), true, it.span.start);
     }
 
     fn visit_continue_statement(&mut self, it: &ContinueStatement<'a>) {
+        if let Some(label) = &it.label {
+            self.check_unreserved(label.name.as_str(), label.span.start);
+        }
         self.break_continue(it.label.as_ref(), false, it.span.start);
+    }
+
+    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        self.check_unreserved(it.name.as_str(), it.span.start);
+    }
+
+    fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
+        self.check_unreserved(it.name.as_str(), it.span.start);
+    }
+
+    fn visit_string_literal(&mut self, it: &StringLiteral<'a>) {
+        let raw = match &it.raw {
+            Some(raw) => raw.as_str(),
+            None => self.source.get(it.span.start as usize..it.span.end as usize).unwrap_or(""),
+        };
+        self.check_string(raw, it.span.start);
     }
 
     fn visit_with_statement(&mut self, it: &WithStatement<'a>) {
@@ -439,15 +577,19 @@ impl<'a> Visit<'a> for Checker<'a> {
                 let bind = if as_var { Bind::Var } else { Bind::Lexical };
                 self.bind_identifier(id, bind, None);
             }
+        } else if let Some(id) = &it.id {
+            self.check_unreserved(id.name.as_str(), id.span.start);
         }
-        self.function_inner(FUNCTION | method_flags, &it.params, it.body.as_deref());
+        let flags = FUNCTION | method_flags | if it.r#async { ASYNC } else { 0 } | if it.generator { GENERATOR } else { 0 };
+        self.function_inner(flags, &it.params, it.body.as_deref());
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        let flags = FUNCTION | ARROW | if it.r#async { ASYNC } else { 0 };
         match &it.body {
-            ArrowFunctionBody::FunctionBody(b) => self.function_inner(FUNCTION | ARROW, &it.params, Some(b)),
+            ArrowFunctionBody::FunctionBody(b) => self.function_inner(flags, &it.params, Some(b)),
             body => {
-                self.enter(FUNCTION | ARROW);
+                self.enter(flags);
                 self.declare_params(&it.params);
                 self.visit_formal_parameters(&it.params);
                 self.visit_expression(body.as_expression().unwrap());
@@ -464,6 +606,8 @@ impl<'a> Visit<'a> for Checker<'a> {
             if let Some(id) = &it.id {
                 self.bind_identifier(id, Bind::Lexical, None);
             }
+        } else if let Some(id) = &it.id {
+            self.check_unreserved(id.name.as_str(), id.span.start);
         }
         if let Some(h) = &it.heritage {
             self.visit_expression(&h.expression);
@@ -597,7 +741,10 @@ impl<'a> Visit<'a> for Checker<'a> {
 
     fn visit_numeric_literal(&mut self, it: &NumericLiteral<'a>) {
         // legacy octal and decimal-with-leading-zero literals
-        let raw = &self.source[it.span.start as usize..it.span.end as usize];
+        let raw = match &it.raw {
+            Some(raw) => raw.as_str(),
+            None => self.source.get(it.span.start as usize..it.span.end as usize).unwrap_or(""),
+        };
         let b = raw.as_bytes();
         if b.len() >= 2 && b[0] == b'0' && b[1].is_ascii_digit() {
             self.fail(it.span.start, "Invalid number");
@@ -644,25 +791,50 @@ impl<'a> Visit<'a> for Checker<'a> {
     }
 
     fn visit_import_declaration(&mut self, it: &ImportDeclaration<'a>) {
-        if it.import_kind.is_type() {
+        // `import defer * as x` / `import source x`: acorn reads `defer` / `source` as the
+        // default import and stops at what follows
+        if let (Some(_), Some(first)) = (it.phase, it.specifiers.as_ref().and_then(|s| s.first())) {
+            let pos = match first {
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(x) => x.span.start,
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(x) => x.local.span.start,
+                ImportDeclarationSpecifier::ImportSpecifier(x) => x.span.start,
+            };
+            self.fail(pos, "Unexpected token");
             return;
         }
+        // (acorn-typescript declares type-only imports like any other)
         for s in it.specifiers.iter().flatten() {
             let local = match s {
-                ImportDeclarationSpecifier::ImportSpecifier(x) => {
-                    if x.import_kind.is_type() {
-                        continue;
-                    }
-                    &x.local
-                }
+                ImportDeclarationSpecifier::ImportSpecifier(x) => &x.local,
                 ImportDeclarationSpecifier::ImportDefaultSpecifier(x) => &x.local,
                 ImportDeclarationSpecifier::ImportNamespaceSpecifier(x) => &x.local,
             };
             self.bind_identifier(local, Bind::Lexical, None);
         }
+        self.visit_string_literal(&it.source);
+        if let Some(with) = &it.with_clause {
+            self.visit_with_clause(with);
+        }
     }
 
-    // type-level code declares nothing
+    fn visit_with_clause(&mut self, it: &WithClause<'a>) {
+        // (acorn-typescript reads `assert` too)
+        if it.keyword == WithClauseKeyword::Assert && !self.ts {
+            // the span starts at the `{`: acorn stops at the keyword
+            let start = it.span.start as usize;
+            let pos = if self.source[start..].starts_with("assert") {
+                start
+            } else {
+                self.source[..start].trim_end_matches(super::utils::is_js_whitespace).len().saturating_sub("assert".len())
+            };
+            self.fail(pos as u32, "Unexpected token");
+        }
+    }
+
+    // type-level code declares nothing, and isn't checked
+    fn visit_ts_type(&mut self, _it: &TSType<'a>) {}
+    fn visit_ts_type_parameter_declaration(&mut self, _it: &TSTypeParameterDeclaration<'a>) {}
+    fn visit_ts_type_parameter_instantiation(&mut self, _it: &TSTypeParameterInstantiation<'a>) {}
     fn visit_ts_type_alias_declaration(&mut self, _it: &TSTypeAliasDeclaration<'a>) {}
     fn visit_ts_interface_declaration(&mut self, _it: &TSInterfaceDeclaration<'a>) {}
     fn visit_ts_enum_declaration(&mut self, _it: &TSEnumDeclaration<'a>) {}
@@ -681,10 +853,18 @@ pub fn reword_parse_error(err: CompileError, source: &str) -> CompileError {
     let Some((pos, _)) = err.position else { return err };
     let message = err.first_line();
     let (message, pos) = if message == "Expected a semicolon or an implicit semicolon after a statement, but found none" {
-        // acorn complains at the next token
-        let rest = source.get(pos..).unwrap_or("");
-        let skipped = rest.len() - rest.trim_start_matches(super::utils::is_js_whitespace).len();
-        ("Unexpected token".to_string(), pos + skipped)
+        // acorn complains at the next token (past any comments)
+        let mut next = pos;
+        loop {
+            let rest = source.get(next..).unwrap_or("");
+            let trimmed = rest.trim_start_matches(super::utils::is_js_whitespace);
+            next += rest.len() - trimmed.len();
+            match trimmed.strip_prefix("/*").and_then(|c| c.find("*/")) {
+                Some(end) => next += end + 4,
+                None => break,
+            }
+        }
+        ("Unexpected token".to_string(), next)
     } else if message.starts_with("Expected `") && message.contains("` but found `") && !message.contains("` or `") {
         ("Unexpected token".to_string(), pos)
     } else if message == "Missing initializer in const declaration" {
@@ -705,6 +885,23 @@ pub fn reword_parse_error(err: CompileError, source: &str) -> CompileError {
         ("Cannot use keyword 'await' outside an async function".to_string(), pos)
     } else if message == "A 'return' statement can only be used within a function body." {
         ("'return' outside of function".to_string(), pos)
+    } else if matches!(
+        message,
+        "Invalid class declaration"
+            | "Lexical declaration cannot appear in a single-statement context"
+            | "Async functions can only be declared at the top level or inside a block"
+    ) {
+        // `parseStatement(context)`
+        ("Unexpected token".to_string(), pos)
+    } else if let Some(word) =
+        message.strip_prefix("Identifier expected. '").and_then(|m| m.strip_suffix("' is a reserved word that cannot be used here."))
+    {
+        // `checkUnreserved`
+        if KEYWORDS.contains(&word) {
+            (format!("Unexpected keyword '{word}'"), pos)
+        } else {
+            (format!("The keyword '{word}' is reserved"), pos)
+        }
     } else if message == "Unexpected new.target expression" {
         ("'new.target' can only be used in functions and class static block".to_string(), pos)
     } else {
@@ -744,17 +941,94 @@ pub fn check_module(program: &Program, source: &str) -> Option<CompileError> {
     check_program(program, source, false, true)
 }
 
+/// [`check`]'s error as `(position, message)`
+pub fn first_error(program: &Program, source: &str, ts: bool) -> Option<(usize, String)> {
+    let mut c = Checker::new(source, ts);
+    for d in &program.directives {
+        c.visit_string_literal(&d.expression);
+    }
+    for s in &program.body {
+        c.visit_statement(s);
+        if c.error.is_some() {
+            break;
+        }
+    }
+    c.error.map(|(pos, message)| (pos as usize, message))
+}
+
+/// A strict mode reserved word acorn reads as an identifier at the start of the statement at
+/// `start` (skipping whitespace and comments): `public;`, `let = 1` (but not a `let`
+/// declaration, by `isLet`, nor a TypeScript `interface`)
+pub fn reserved_statement_start(text: &str, start: usize, ts: bool) -> Option<(usize, String)> {
+    let mut i = start;
+    loop {
+        let rest = &text[i..];
+        let trimmed = rest.trim_start_matches(super::utils::is_js_whitespace);
+        i += rest.len() - trimmed.len();
+        if let Some(c) = trimmed.strip_prefix("/*") {
+            i += c.find("*/")? + 4;
+        } else if trimmed.starts_with("//") {
+            i += trimmed.find('\n').unwrap_or(trimmed.len());
+        } else {
+            break;
+        }
+    }
+    let rest = &text[i..];
+    let len = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).unwrap_or(rest.len());
+    let word = &rest[..len];
+    if !STRICT_RESERVED.contains(&word) || word == "await" || word == "enum" || (ts && word == "interface") {
+        return None;
+    }
+    if word == "let" {
+        // `isLet()`: a `[`, `{`, `\` or an identifier (other than `in` / `instanceof`) next
+        // makes it a declaration
+        let after = rest[len..].trim_start_matches(super::utils::is_js_whitespace);
+        let next_len = after.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')).unwrap_or(after.len());
+        let next = &after[..next_len];
+        let declaration = after.starts_with(['[', '{', '\\'])
+            || (!next.is_empty() && !next.starts_with(|c: char| c.is_ascii_digit()) && next != "in" && next != "instanceof");
+        if declaration {
+            return None;
+        }
+    }
+    Some((i, format!("The keyword '{word}' is reserved")))
+}
+
+/// [`check`] for a template expression (`parseExpressionAt`, also a module)
+pub fn check_expression(expression: &Expression, source: &str, ts: bool) -> Option<CompileError> {
+    let mut c = Checker::new(source, ts);
+    c.visit_expression(expression);
+    c.error.map(|(pos, message)| e::js_parse_error(pos as usize, &message))
+}
+
+/// [`check`] for a declaration tag's statement
+pub fn check_statement(statement: &Statement, source: &str, ts: bool) -> Option<CompileError> {
+    let mut c = Checker::new(source, ts);
+    c.visit_statement(statement);
+    c.error.map(|(pos, message)| e::js_parse_error(pos as usize, &message))
+}
+
+impl<'a> Checker<'a> {
+    fn new(source: &'a str, ts: bool) -> Self {
+        let mut c = Checker {
+            source,
+            scopes: Vec::new(),
+            labels: Vec::new(),
+            private: Vec::new(),
+            error: None,
+            ts,
+            next_function_flags: 0,
+        };
+        c.enter(TOP);
+        c
+    }
+}
+
 fn check_program(program: &Program, source: &str, ts: bool, module: bool) -> Option<CompileError> {
-    let mut c = Checker {
-        source,
-        scopes: Vec::new(),
-        labels: Vec::new(),
-        private: Vec::new(),
-        error: None,
-        ts,
-        next_function_flags: 0,
-    };
-    c.enter(TOP);
+    let mut c = Checker::new(source, ts);
+    for d in &program.directives {
+        c.visit_string_literal(&d.expression);
+    }
     for s in &program.body {
         c.visit_statement(s);
         if c.error.is_some() {

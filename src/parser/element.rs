@@ -930,6 +930,11 @@ fn read_script<'a>(parser: &mut Parser<'a>, start: usize, attributes: Vec<Attr<'
     parser.index += close_len;
 
     let content = parser.js.parse_program(data, script_start, &mut parser.root.comments)?;
+    if parser.acorn_checks {
+        if let Some(err) = crate::analyze::acorn::check(&content.program, parser.loc.source(), parser.ts) {
+            return Err(err);
+        }
+    }
 
     let mut context = "default";
     for attribute in &attributes {

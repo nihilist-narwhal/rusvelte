@@ -43,14 +43,15 @@ pub fn parse<'a>(alloc: &'a Allocator, source: &'a str, loose: bool) -> Result<C
     Ok(Component { ast, root, locator })
 }
 
-/// Like [`parse`], also collecting the warnings the parser emits
+/// Like [`parse`], also collecting the warnings the parser emits, and raising the errors acorn
+/// raises while parsing that oxc's parser doesn't (as `compile` does)
 pub fn parse_with_warnings<'a>(
     alloc: &'a Allocator,
     source: &'a str,
     warnings: &mut Vec<analyze::Warning>,
 ) -> Result<Component<'a>, CompileError> {
     let locator = std::rc::Rc::new(Locator::new(source));
-    let (ast, root) = parser::parse_collecting(alloc, source, locator.clone(), false, Some(warnings))?;
+    let (ast, root) = parser::parse_collecting(alloc, source, locator.clone(), false, Some(warnings), true)?;
     Ok(Component { ast, root, locator })
 }
 

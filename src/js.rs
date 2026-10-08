@@ -115,7 +115,7 @@ pub struct JsExpr<'a> {
     pub source: Src<'a>,
     /// `None` for expressions Svelte builds itself (no comment attachment pass)
     pub comments: Option<CommentCtx>,
-    /// parsed despite an oxc error that acorn doesn't raise (see `ACORN_ACCEPTS`)
+    /// parsed despite an oxc error that acorn doesn't raise (see `acorn_accepts`)
     pub lenient: bool,
     /// whether Svelte runs `remove_parens` on the result (everywhere except snippet parameters)
     pub remove_parens: bool,
@@ -204,11 +204,21 @@ pub struct JsParser<'a> {
     /// A string or template literal with a lone surrogate was parsed: oxc keeps its value in an
     /// encoded form, and Rust strings can't hold the real one, so `compile` declines
     pub lone_surrogates: std::cell::Cell<bool>,
+    /// Report acorn's errors where oxc's parser reports a different one (see
+    /// `Parser::acorn_checks`)
+    pub acorn_checks: bool,
 }
 
 impl<'a> JsParser<'a> {
     pub fn new(ts: bool, loc: std::rc::Rc<Locator<'a>>, alloc: &'a Allocator) -> Self {
-        JsParser { ts, loc, alloc, max_depth: std::cell::Cell::new(0), lone_surrogates: std::cell::Cell::new(false) }
+        JsParser {
+            ts,
+            loc,
+            alloc,
+            max_depth: std::cell::Cell::new(0),
+            lone_surrogates: std::cell::Cell::new(false),
+            acorn_checks: false,
+        }
     }
 
     pub fn alloc_str(&self, s: &str) -> &'a str {
@@ -243,7 +253,7 @@ impl<'a> JsParser<'a> {
                     Err(errors) => {
                         // oxc rejects a few things acorn accepts; parse those through a program
                         // (which keeps the AST alongside the diagnostics) and ignore the diagnostics
-                        if !errors.iter().all(|e| ACORN_ACCEPTS.contains(&e.message.as_ref())) {
+                        if !errors.iter().all(|e| acorn_accepts(&e.message)) {
                             return Err(first_error(&errors, base));
                         }
                         match self.lenient_expression(text) {
@@ -274,8 +284,25 @@ impl<'a> JsParser<'a> {
                     parser
                 };
                 let ret = parser.parse();
-                if let Some(err) = ret.diagnostics.first() {
-                    return Err(first_error(std::slice::from_ref(err), base));
+                // (TypeScript grammar rules oxc checks and acorn-typescript doesn't)
+                if ret.fatal_error || !ret.diagnostics.iter().all(|e| acorn_accepts(&e.message)) {
+                    if let Some(err) = ret.diagnostics.first() {
+                        let oxc = first_error(std::slice::from_ref(err), base);
+                        // acorn raises its errors as it reads: one it raises before oxc's wins
+                        if self.acorn_checks && goal == Goal::Program {
+                            let earlier = if ret.fatal_error {
+                                self.earlier_acorn_error(text, base, oxc.0)
+                            } else {
+                                let mut program = ret.program;
+                                rebase.visit_program(&mut program);
+                                crate::analyze::acorn::first_error(&program, self.loc.source(), self.ts)
+                            };
+                            if let Some(earlier) = earlier.filter(|e| e.0 <= oxc.0) {
+                                return Err(earlier);
+                            }
+                        }
+                        return Err(oxc);
+                    }
                 }
                 let comments: Vec<JsComment> = ret
                     .program
@@ -303,13 +330,37 @@ impl<'a> JsParser<'a> {
         }
     }
 
+    /// After oxc gave up on a script at `pos` (with no AST), the error acorn raises before
+    /// reaching `pos` (one oxc leaves to semantic analysis): in the statements before the one
+    /// that fails (the longest prefix of complete statements that parses), or a strict mode
+    /// reserved word opening the failing statement
+    fn earlier_acorn_error(&self, text: &'a str, base: usize, pos: usize) -> Option<(usize, String)> {
+        let rel = pos.checked_sub(base)?.min(text.len());
+        let bytes = text.as_bytes();
+        let boundaries = (1..=rel).rev().filter(|&i| matches!(bytes[i - 1], b';' | b'}' | b'\n')).take(16);
+        for end in boundaries.chain(std::iter::once(0)) {
+            let alloc = Allocator::default();
+            let ret = Parser::new(&alloc, &text[..end], self.source_type()).parse();
+            if ret.fatal_error || !ret.diagnostics.is_empty() {
+                continue;
+            }
+            let mut program = ret.program;
+            Rebase(base as i64, 0, 0, false).visit_program(&mut program);
+            if let Some(error) = crate::analyze::acorn::first_error(&program, self.loc.source(), self.ts) {
+                return Some(error);
+            }
+            return crate::analyze::acorn::reserved_statement_start(text, end, self.ts).map(|(p, m)| (p + base, m));
+        }
+        None
+    }
+
     /// Parse `(<text>\n)` as a program and return the expression inside, with spans relative
     /// to `text`
     fn lenient_expression(&self, text: &str) -> Option<Expression<'a>> {
         let wrapped = self.alloc.alloc_str(&format!("({text}\n)"));
         let options = ParseOptions { preserve_parens: true, ..ParseOptions::default() };
         let ret = Parser::new(self.alloc, wrapped, self.source_type()).with_options(options).parse();
-        if ret.fatal_error || !ret.diagnostics.iter().all(|e| ACORN_ACCEPTS.contains(&e.message.as_ref())) {
+        if ret.fatal_error || !ret.diagnostics.iter().all(|e| acorn_accepts(&e.message)) {
             return None;
         }
         let mut body: ArenaVec<'a, Statement<'a>> = ret.program.body;
@@ -705,7 +756,14 @@ fn find_keyword(source: Src, from: usize, keywords: &[&str]) -> Option<usize> {
 }
 
 /// oxc errors for code that acorn(-typescript) parses without complaint
-const ACORN_ACCEPTS: &[&str] = &["A parameter cannot have a question mark and an initializer."];
+fn acorn_accepts(message: &str) -> bool {
+    matches!(
+        message,
+        "A parameter cannot have a question mark and an initializer."
+            | "A required parameter cannot follow an optional parameter."
+            | "Import declarations in a namespace cannot reference a module."
+    ) || message.starts_with("Type parameter name cannot be '")
+}
 
 /// `x?: T = 1`: oxc rejects it and loses the `?`, acorn-typescript marks `x` optional
 fn mark_optional_defaults(node: &mut Value, text: Src) {

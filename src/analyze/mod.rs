@@ -89,15 +89,7 @@ pub fn compile_diagnostics_with(
     let mut warnings = Vec::new();
     let (result, locator) = match crate::parse_with_warnings(&alloc, source, &mut warnings) {
         Ok(component) => {
-            // acorn's scope checks happen while parsing each script
-            let mut scripts: Vec<&crate::ast::Script> =
-                [&component.root.instance, &component.root.module].into_iter().flatten().collect();
-            scripts.sort_by_key(|s| s.start);
-            let parse_error = scripts.iter().find_map(|s| acorn::check(&s.content.program, source, component.root.ts));
-            let result = match parse_error {
-                Some(err) => Err(err),
-                None => analyze_component(&alloc, &component, source, filename, options, &mut warnings).map(|_| ()),
-            };
+            let result = analyze_component(&alloc, &component, source, filename, options, &mut warnings).map(|_| ());
             (result, component.locator.clone())
         }
         Err(err) => (Err(acorn::reword_parse_error(err, source)), std::rc::Rc::new(Locator::new(source))),

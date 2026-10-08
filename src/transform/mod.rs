@@ -122,11 +122,6 @@ pub fn compile_styles(source: &str, filename: &str, options: &CssOptions) -> Res
     let component = crate::parse_with_warnings(&alloc, source, &mut warnings)
         .map_err(|err| analyze::acorn::reword_parse_error(err, source))?;
     let root = &component.root;
-    let mut scripts: Vec<&crate::ast::Script> = [&root.instance, &root.module].into_iter().flatten().collect();
-    scripts.sort_by_key(|s| s.start);
-    if let Some(err) = scripts.iter().find_map(|s| analyze::acorn::check(&s.content.program, source, root.ts)) {
-        return Err(err);
-    }
     let analyze_options = analyze::CompileOptions {
         runes: options.runes,
         custom_element: options.custom_element,
@@ -252,11 +247,6 @@ fn compile_component(source: &str, options: &options::CompileOptions) -> Result<
         return Err(unrepresentable());
     }
     let root = &component.root;
-    let mut scripts: Vec<&crate::ast::Script> = [&root.instance, &root.module].into_iter().flatten().collect();
-    scripts.sort_by_key(|s| s.start);
-    if let Some(err) = scripts.iter().find_map(|s| analyze::acorn::check(&s.content.program, source, root.ts)) {
-        return Err(err);
-    }
 
     // `<svelte:options>` overrides the options
     let parsed = root.options.as_ref().map(|o| &o.values);

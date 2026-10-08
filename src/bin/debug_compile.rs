@@ -15,6 +15,6 @@ fn main() {
     };
     match result {
         Ok(out) => print!("{}", out.js),
-        Err(e) => println!("error {}: {}", e.code, e.message),
+        Err(e) => println!("error {}: {} @{:?}", e.code, e.first_line(), e.position.map(|p| p.0)),
     }
 }

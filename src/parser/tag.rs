@@ -66,6 +66,10 @@ fn read_declaration<'a>(parser: &mut Parser<'a>) -> Result<Option<Declaration<'a
     let initial_comment_count = parser.root.comments.len();
 
     let statement = match parser.js.parse_statement_at(crate::js::Src::new(t, 0), start, &mut parser.root.comments) {
+        Ok(d) if parser.acorn_checks => match crate::analyze::acorn::check_statement(&d.stmt, parser.loc.source(), parser.ts) {
+            Some(err) => return Err(err),
+            None => d,
+        },
         Ok(d) => d,
         Err(error) => {
             if !parser.loose {
