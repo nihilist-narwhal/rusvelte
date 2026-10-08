@@ -6,9 +6,8 @@
 //! look at are tracked as arguments: whether an ancestor rule is a `:global` block, and whether
 //! an ancestor complex selector is unused.
 //!
-//! Not ported yet: the source map (`addSourcemapLocation` on every node's start and end,
-//! `generateMap` and the preprocessor map merge), and the `sourceMappingURL` comment appended
-//! to injected styles in dev mode.
+//! The source map comes from `addSourcemapLocation` on every visited node's start and end and
+//! `generateMap` (see `render_stylesheet_with_mappings`). Not ported: the preprocessor map merge.
 
 use crate::analyze::css::Meta;
 use crate::css::{Atrule, BlockChild, ComplexSelector, Declaration, RelativeSelector, Rule, SelectorList, SimpleSelector, StyleSheet};
@@ -76,6 +75,10 @@ fn render<'a, 's>(source: &'s str, sheet: &StyleSheet, meta: &'a Meta<'s>, optio
     state.locate(sheet.start, sheet.end);
     for child in &sheet.children {
         state.block_child(child, false)?;
+    }
+    // the walk also visits the stylesheet's `comments`
+    for comment in &sheet.comments {
+        state.locate(comment.start, comment.end);
     }
 
     state.code.remove(0, sheet.content_start)?;
