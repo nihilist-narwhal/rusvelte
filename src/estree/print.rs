@@ -101,8 +101,22 @@ struct Ctx {
     has_newline: bool,
 }
 
+/// A context's commands, with a cache of `measure()`. A write marks the context and every
+/// context it is appended to as dirty (stopping at contexts that already are), and `measure`
+/// only recomputes dirty contexts.
+struct Buf<'a> {
+    cmds: Vec<Cmd<'a>>,
+    /// the UTF-16 length of the strings written directly into this context
+    own: usize,
+    /// `measure()`, valid unless `dirty`
+    total: usize,
+    dirty: bool,
+    /// the contexts this one is appended to
+    parents: smallvec::SmallVec<[u32; 1]>,
+}
+
 struct Printer<'a> {
-    bufs: Vec<Vec<Cmd<'a>>>,
+    bufs: Vec<Buf<'a>>,
     comments: &'a [Comment],
     comment_index: usize,
     quote: char,
@@ -142,13 +156,36 @@ fn end(node: Option<&Node>) -> Option<Position> {
 
 impl<'a> Printer<'a> {
     fn new_ctx(&mut self) -> Ctx {
-        self.bufs.push(Vec::new());
+        self.bufs.push(Buf { cmds: Vec::new(), own: 0, total: 0, dirty: false, parents: smallvec::SmallVec::new() });
         Ctx { buf: (self.bufs.len() - 1) as u32, multiline: false, has_newline: false }
     }
 
     #[inline]
     fn push(&mut self, cx: &Ctx, cmd: Cmd<'a>) {
-        self.bufs[cx.buf as usize].push(cmd);
+        self.bufs[cx.buf as usize].cmds.push(cmd);
+    }
+
+    #[inline]
+    fn push_str(&mut self, cx: &Ctx, s: Cow<'a, str>) {
+        let len = utf16_len(&s);
+        self.bufs[cx.buf as usize].cmds.push(Cmd::Str(s));
+        if len > 0 {
+            self.bufs[cx.buf as usize].own += len;
+            self.mark(cx.buf);
+        }
+    }
+
+    /// Invalidate the measurement of `buf` and of the contexts it is appended to
+    fn mark(&mut self, buf: u32) {
+        let b = &mut self.bufs[buf as usize];
+        if b.dirty {
+            return;
+        }
+        b.dirty = true;
+        for i in 0..b.parents.len() {
+            let p = self.bufs[buf as usize].parents[i];
+            self.mark(p);
+        }
     }
 
     fn indent(&mut self, cx: &Ctx) {
@@ -174,13 +211,15 @@ impl<'a> Printer<'a> {
 
     fn append(&mut self, cx: &mut Ctx, other: &Ctx) {
         self.push(cx, Cmd::Buf(other.buf));
+        self.bufs[other.buf as usize].parents.push(cx.buf);
+        self.mark(cx.buf);
         if cx.has_newline || other.multiline {
             cx.multiline = true;
         }
     }
 
     fn write(&mut self, cx: &mut Ctx, content: impl Into<Cow<'a, str>>) {
-        self.push(cx, Cmd::Str(content.into()));
+        self.push_str(cx, content.into());
         if cx.has_newline {
             cx.multiline = true;
         }
@@ -190,10 +229,10 @@ impl<'a> Printer<'a> {
     fn write_node(&mut self, cx: &mut Ctx, content: impl Into<Cow<'a, str>>, node: &Node) {
         if let Some(loc) = node.loc {
             self.location(cx, loc.start);
-            self.push(cx, Cmd::Str(content.into()));
+            self.push_str(cx, content.into());
             self.location(cx, loc.end);
         } else {
-            self.push(cx, Cmd::Str(content.into()));
+            self.push_str(cx, content.into());
         }
         if cx.has_newline {
             cx.multiline = true;
@@ -207,34 +246,33 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn empty(&self, buf: u32) -> bool {
-        !self.bufs[buf as usize].iter().any(|c| self.has_content(c))
+    /// `context.empty()`: no non-empty string anywhere in it
+    fn empty(&mut self, buf: u32) -> bool {
+        self.measure(buf) == 0
     }
 
-    fn has_content(&self, cmd: &Cmd) -> bool {
-        match cmd {
-            Cmd::Buf(b) => self.bufs[*b as usize].iter().any(|c| self.has_content(c)),
-            Cmd::Str(s) => !s.is_empty(),
-            _ => false,
+    /// `context.measure()`
+    fn measure(&mut self, buf: u32) -> usize {
+        let b = &self.bufs[buf as usize];
+        if !b.dirty {
+            return b.total;
         }
-    }
-
-    fn measure(&self, buf: u32) -> usize {
-        let mut total = 0;
-        for cmd in &self.bufs[buf as usize] {
-            match cmd {
-                Cmd::Str(s) => total += utf16_len(s),
-                Cmd::Buf(b) => total += self.measure(*b),
-                _ => {}
+        let mut total = b.own;
+        for i in 0..self.bufs[buf as usize].cmds.len() {
+            if let Cmd::Buf(child) = self.bufs[buf as usize].cmds[i] {
+                total += self.measure(child);
             }
         }
+        let b = &mut self.bufs[buf as usize];
+        b.total = total;
+        b.dirty = false;
         total
     }
 
     /// esrap's `print` after visiting: run the commands
     fn run(self, root: u32, indent: &str, source_map: bool) -> Printed {
         let mut state = RunState {
-            code: String::new(),
+            code: String::with_capacity(self.bufs[root as usize].total * 11 / 10 + 64),
             current_column: 0,
             mappings: Vec::new(),
             current_line: Vec::new(),
@@ -317,8 +355,8 @@ impl RunState<'_> {
         }
     }
 
-    fn run(&mut self, bufs: &[Vec<Cmd>], buf: u32) {
-        for cmd in &bufs[buf as usize] {
+    fn run(&mut self, bufs: &[Buf], buf: u32) {
+        for cmd in &bufs[buf as usize].cmds {
             match cmd {
                 Cmd::Buf(b) => self.run(bufs, *b),
                 Cmd::Newline => self.needs_newline = true,
@@ -455,6 +493,60 @@ fn binary_operator_str(node: &Node) -> Option<&'static str> {
         NodeKind::LogicalExpression(l) => Some(l.operator.as_str()),
         _ => None,
     }
+}
+
+/// `` ` ${operator} ` `` without allocating
+fn spaced_operator(op: &str) -> Cow<'static, str> {
+    Cow::Borrowed(match op {
+        "||" => " || ",
+        "&&" => " && ",
+        "??" => " ?? ",
+        "|" => " | ",
+        "^" => " ^ ",
+        "&" => " & ",
+        "==" => " == ",
+        "!=" => " != ",
+        "===" => " === ",
+        "!==" => " !== ",
+        "<" => " < ",
+        ">" => " > ",
+        "<=" => " <= ",
+        ">=" => " >= ",
+        "in" => " in ",
+        "instanceof" => " instanceof ",
+        "<<" => " << ",
+        ">>" => " >> ",
+        ">>>" => " >>> ",
+        "+" => " + ",
+        "-" => " - ",
+        "*" => " * ",
+        "%" => " % ",
+        "/" => " / ",
+        "**" => " ** ",
+        _ => return Cow::Owned(format!(" {op} ")),
+    })
+}
+
+fn spaced_assignment_operator(op: AssignmentOperator) -> Cow<'static, str> {
+    use AssignmentOperator::*;
+    Cow::Borrowed(match op {
+        Assign => " = ",
+        Addition => " += ",
+        Subtraction => " -= ",
+        Multiplication => " *= ",
+        Division => " /= ",
+        Remainder => " %= ",
+        Exponential => " **= ",
+        ShiftLeft => " <<= ",
+        ShiftRight => " >>= ",
+        ShiftRightZeroFill => " >>>= ",
+        BitwiseOR => " |= ",
+        BitwiseXOR => " ^= ",
+        BitwiseAnd => " &= ",
+        LogicalOr => " ||= ",
+        LogicalAnd => " &&= ",
+        LogicalNullish => " ??= ",
+    })
 }
 
 fn arrow_concise_body_needs_wrap(body: &Node) -> bool {
@@ -1130,7 +1222,7 @@ impl<'a> Printer<'a> {
                 let wrap = operand_needs_wrap(left, node, false);
                 self.maybe_wrap(cx, left, wrap);
                 let op = binary_operator_str(node).unwrap();
-                self.write(cx, format!(" {op} "));
+                self.write(cx, spaced_operator(op));
                 let wrap = operand_needs_wrap(right, node, true);
                 self.maybe_wrap(cx, right, wrap);
             }
@@ -1323,7 +1415,7 @@ impl<'a> Printer<'a> {
             }
             K::AssignmentExpression(a) => {
                 self.visit(cx, &a.left);
-                self.write(cx, format!(" {} ", a.operator.as_str()));
+                self.write(cx, spaced_assignment_operator(a.operator));
                 self.visit(cx, &a.right);
             }
             K::AssignmentPattern(a) => {

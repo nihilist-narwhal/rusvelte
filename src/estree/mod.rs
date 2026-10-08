@@ -1064,3 +1064,223 @@ pub fn assignment_operator(op: &str) -> Option<AssignmentOperator> {
     .into_iter()
     .find(|o| o.as_str() == op)
 }
+
+// -------------------------------------------------------------------------------------------
+// Rebuilding a node from transformed children
+
+type MapFn<'f> = &'f mut dyn FnMut(&Node) -> Node;
+
+fn m1(f: MapFn, n: &Node) -> BoxNode {
+    Box::new(f(n))
+}
+
+fn mo(f: MapFn, n: &Option<BoxNode>) -> Option<BoxNode> {
+    n.as_ref().map(|n| Box::new(f(n)))
+}
+
+fn ml(f: MapFn, list: &[Node]) -> Vec<Node> {
+    list.iter().map(|n| f(n)).collect()
+}
+
+fn mh(f: MapFn, list: &[Option<Node>]) -> Vec<Option<Node>> {
+    list.iter().map(|n| n.as_ref().map(|n| f(n))).collect()
+}
+
+impl Node {
+    /// A node of the same kind and metadata (`span`, `loc`, `origin`, comments) whose children
+    /// are `f(child)`, called in [`Node::for_each_child`] order. Only scalar fields are copied.
+    pub fn map_children(&self, f: &mut dyn FnMut(&Node) -> Node) -> Node {
+        use NodeKind::*;
+        let kind = match &self.kind {
+            Program(n) => Program(self::Program { body: ml(f, &n.body), source_type: n.source_type }),
+            Identifier(_) | PrivateIdentifier(_) | Literal(_) | ThisExpression | Super | EmptyStatement
+            | DebuggerStatement | TemplateElement(_) => self.kind.clone(),
+            ArrayExpression(n) => ArrayExpression(self::ArrayExpression { elements: mh(f, &n.elements) }),
+            ArrayPattern(n) => ArrayPattern(self::ArrayExpression { elements: mh(f, &n.elements) }),
+            ObjectExpression(n) => ObjectExpression(self::ObjectExpression { properties: ml(f, &n.properties) }),
+            ObjectPattern(n) => ObjectPattern(self::ObjectExpression { properties: ml(f, &n.properties) }),
+            Property(n) => Property(self::Property {
+                key: m1(f, &n.key),
+                value: m1(f, &n.value),
+                kind: n.kind,
+                method: n.method,
+                shorthand: n.shorthand,
+                computed: n.computed,
+            }),
+            FunctionDeclaration(n) => FunctionDeclaration(map_function(f, n)),
+            FunctionExpression(n) => FunctionExpression(map_function(f, n)),
+            ArrowFunctionExpression(n) => ArrowFunctionExpression(self::ArrowFunctionExpression {
+                params: ml(f, &n.params),
+                body: m1(f, &n.body),
+                expression: n.expression,
+                is_async: n.is_async,
+            }),
+            ClassDeclaration(n) => ClassDeclaration(map_class(f, n)),
+            ClassExpression(n) => ClassExpression(map_class(f, n)),
+            ClassBody(n) => ClassBody(Body { body: ml(f, &n.body) }),
+            StaticBlock(n) => StaticBlock(Body { body: ml(f, &n.body) }),
+            BlockStatement(n) => BlockStatement(Body { body: ml(f, &n.body) }),
+            MethodDefinition(n) => MethodDefinition(self::MethodDefinition {
+                key: m1(f, &n.key),
+                value: m1(f, &n.value),
+                kind: n.kind,
+                computed: n.computed,
+                is_static: n.is_static,
+            }),
+            PropertyDefinition(n) => PropertyDefinition(self::PropertyDefinition {
+                key: m1(f, &n.key),
+                value: mo(f, &n.value),
+                computed: n.computed,
+                is_static: n.is_static,
+                is_abstract: n.is_abstract,
+            }),
+            UnaryExpression(n) => UnaryExpression(self::UnaryExpression { operator: n.operator, argument: m1(f, &n.argument) }),
+            UpdateExpression(n) => UpdateExpression(self::UpdateExpression {
+                operator: n.operator,
+                prefix: n.prefix,
+                argument: m1(f, &n.argument),
+            }),
+            BinaryExpression(n) => BinaryExpression(self::BinaryExpression {
+                operator: n.operator,
+                left: m1(f, &n.left),
+                right: m1(f, &n.right),
+            }),
+            LogicalExpression(n) => LogicalExpression(self::LogicalExpression {
+                operator: n.operator,
+                left: m1(f, &n.left),
+                right: m1(f, &n.right),
+            }),
+            AssignmentExpression(n) => AssignmentExpression(self::AssignmentExpression {
+                operator: n.operator,
+                left: m1(f, &n.left),
+                right: m1(f, &n.right),
+            }),
+            AssignmentPattern(n) => AssignmentPattern(self::AssignmentPattern { left: m1(f, &n.left), right: m1(f, &n.right) }),
+            RestElement(n) => RestElement(Argument { argument: m1(f, &n.argument) }),
+            SpreadElement(n) => SpreadElement(Argument { argument: m1(f, &n.argument) }),
+            AwaitExpression(n) => AwaitExpression(Argument { argument: m1(f, &n.argument) }),
+            MemberExpression(n) => MemberExpression(self::MemberExpression {
+                object: m1(f, &n.object),
+                property: m1(f, &n.property),
+                computed: n.computed,
+                optional: n.optional,
+            }),
+            ChainExpression(n) => ChainExpression(ExpressionWrapper { expression: m1(f, &n.expression) }),
+            ParenthesizedExpression(n) => ParenthesizedExpression(ExpressionWrapper { expression: m1(f, &n.expression) }),
+            TSExternalModuleReference(n) => TSExternalModuleReference(ExpressionWrapper { expression: m1(f, &n.expression) }),
+            TSExportAssignment(n) => TSExportAssignment(ExpressionWrapper { expression: m1(f, &n.expression) }),
+            CallExpression(n) => CallExpression(self::CallExpression {
+                callee: m1(f, &n.callee),
+                arguments: ml(f, &n.arguments),
+                optional: n.optional,
+            }),
+            NewExpression(n) => NewExpression(self::NewExpression { callee: m1(f, &n.callee), arguments: ml(f, &n.arguments) }),
+            ConditionalExpression(n) => ConditionalExpression(self::ConditionalExpression {
+                test: m1(f, &n.test),
+                consequent: m1(f, &n.consequent),
+                alternate: m1(f, &n.alternate),
+            }),
+            SequenceExpression(n) => SequenceExpression(self::SequenceExpression { expressions: ml(f, &n.expressions) }),
+            YieldExpression(n) => YieldExpression(self::YieldExpression { argument: mo(f, &n.argument), delegate: n.delegate }),
+            TemplateLiteral(n) => TemplateLiteral(self::TemplateLiteral {
+                quasis: ml(f, &n.quasis),
+                expressions: ml(f, &n.expressions),
+            }),
+            TaggedTemplateExpression(n) => TaggedTemplateExpression(self::TaggedTemplateExpression {
+                tag: m1(f, &n.tag),
+                quasi: m1(f, &n.quasi),
+            }),
+            MetaProperty(n) => MetaProperty(self::MetaProperty { meta: m1(f, &n.meta), property: m1(f, &n.property) }),
+            ImportExpression(n) => ImportExpression(self::ImportExpression { source: m1(f, &n.source), options: mo(f, &n.options) }),
+            ExpressionStatement(n) => ExpressionStatement(self::ExpressionStatement {
+                expression: m1(f, &n.expression),
+                directive: n.directive.clone(),
+            }),
+            ReturnStatement(n) => ReturnStatement(self::ReturnStatement { argument: mo(f, &n.argument) }),
+            LabeledStatement(n) => LabeledStatement(self::LabeledStatement { label: m1(f, &n.label), body: m1(f, &n.body) }),
+            BreakStatement(n) => BreakStatement(Jump { label: mo(f, &n.label) }),
+            ContinueStatement(n) => ContinueStatement(Jump { label: mo(f, &n.label) }),
+            IfStatement(n) => IfStatement(self::IfStatement {
+                test: m1(f, &n.test),
+                consequent: m1(f, &n.consequent),
+                alternate: mo(f, &n.alternate),
+            }),
+            SwitchStatement(n) => SwitchStatement(self::SwitchStatement {
+                discriminant: m1(f, &n.discriminant),
+                cases: ml(f, &n.cases),
+            }),
+            SwitchCase(n) => SwitchCase(self::SwitchCase { test: mo(f, &n.test), consequent: ml(f, &n.consequent) }),
+            ThrowStatement(n) => ThrowStatement(self::ThrowStatement { argument: m1(f, &n.argument) }),
+            TryStatement(n) => TryStatement(self::TryStatement {
+                block: m1(f, &n.block),
+                handler: mo(f, &n.handler),
+                finalizer: mo(f, &n.finalizer),
+            }),
+            CatchClause(n) => CatchClause(self::CatchClause { param: mo(f, &n.param), body: m1(f, &n.body) }),
+            WhileStatement(n) => WhileStatement(self::WhileStatement { test: m1(f, &n.test), body: m1(f, &n.body) }),
+            DoWhileStatement(n) => DoWhileStatement(self::WhileStatement { body: m1(f, &n.body), test: m1(f, &n.test) }),
+            ForStatement(n) => ForStatement(self::ForStatement {
+                init: mo(f, &n.init),
+                test: mo(f, &n.test),
+                update: mo(f, &n.update),
+                body: m1(f, &n.body),
+            }),
+            ForInStatement(n) => ForInStatement(map_for_in(f, n)),
+            ForOfStatement(n) => ForOfStatement(map_for_in(f, n)),
+            WithStatement(n) => WithStatement(self::WithStatement { object: m1(f, &n.object), body: m1(f, &n.body) }),
+            VariableDeclaration(n) => VariableDeclaration(self::VariableDeclaration {
+                kind: n.kind,
+                declarations: ml(f, &n.declarations),
+            }),
+            VariableDeclarator(n) => VariableDeclarator(self::VariableDeclarator { id: m1(f, &n.id), init: mo(f, &n.init) }),
+            ImportDeclaration(n) => ImportDeclaration(self::ImportDeclaration {
+                specifiers: ml(f, &n.specifiers),
+                source: m1(f, &n.source),
+                attributes: ml(f, &n.attributes),
+            }),
+            ImportSpecifier(n) => ImportSpecifier(self::ImportSpecifier { imported: m1(f, &n.imported), local: m1(f, &n.local) }),
+            ImportDefaultSpecifier(n) => ImportDefaultSpecifier(LocalSpecifier { local: m1(f, &n.local) }),
+            ImportNamespaceSpecifier(n) => ImportNamespaceSpecifier(LocalSpecifier { local: m1(f, &n.local) }),
+            ImportAttribute(n) => ImportAttribute(self::ImportAttribute { key: m1(f, &n.key), value: m1(f, &n.value) }),
+            ExportNamedDeclaration(n) => ExportNamedDeclaration(self::ExportNamedDeclaration {
+                declaration: mo(f, &n.declaration),
+                specifiers: ml(f, &n.specifiers),
+                source: mo(f, &n.source),
+                attributes: ml(f, &n.attributes),
+            }),
+            ExportSpecifier(n) => ExportSpecifier(self::ExportSpecifier { local: m1(f, &n.local), exported: m1(f, &n.exported) }),
+            ExportDefaultDeclaration(n) => ExportDefaultDeclaration(self::ExportDefaultDeclaration { declaration: m1(f, &n.declaration) }),
+            ExportAllDeclaration(n) => ExportAllDeclaration(self::ExportAllDeclaration {
+                exported: mo(f, &n.exported),
+                source: m1(f, &n.source),
+                attributes: ml(f, &n.attributes),
+            }),
+            TSImportEqualsDeclaration(n) => TSImportEqualsDeclaration(self::TSImportEqualsDeclaration {
+                id: m1(f, &n.id),
+                module_reference: m1(f, &n.module_reference),
+                is_type: n.is_type,
+            }),
+            TSQualifiedName(n) => TSQualifiedName(self::TSQualifiedName { left: m1(f, &n.left), right: m1(f, &n.right) }),
+            TSNamespaceExportDeclaration(n) => TSNamespaceExportDeclaration(self::TSNamespaceExportDeclaration { id: m1(f, &n.id) }),
+        };
+        Node { kind, span: self.span, loc: self.loc, origin: self.origin, comments: self.comments.clone() }
+    }
+}
+
+fn map_function(f: MapFn, n: &Function) -> Function {
+    Function {
+        id: mo(f, &n.id),
+        params: ml(f, &n.params),
+        body: m1(f, &n.body),
+        generator: n.generator,
+        is_async: n.is_async,
+    }
+}
+
+fn map_class(f: MapFn, n: &Class) -> Class {
+    Class { id: mo(f, &n.id), super_class: mo(f, &n.super_class), body: m1(f, &n.body) }
+}
+
+fn map_for_in(f: MapFn, n: &ForInStatement) -> ForInStatement {
+    ForInStatement { left: m1(f, &n.left), right: m1(f, &n.right), body: m1(f, &n.body), is_await: n.is_await }
+}

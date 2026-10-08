@@ -273,3 +273,23 @@ const EXPRESSIONS: &str = "(a || b) ?? c;\n(a + b) * (c - d);\na - (b - c);\n(-a
 
 const EXPORTS: &str = "export default function Component($$anchor) {\n\tvar x = 1;\n}\n\nexport default () => x;";
 
+
+#[test]
+fn map_children_order() {
+    // children are visited in for_each_child order, and an identity map reproduces the node
+    let node = b::r#for(
+        b::r#let("i", b::literal(0)),
+        b::binary("<", b::id("i"), b::id("n")),
+        b::update("++", b::id("i")),
+        b::block(vec![b::stmt(b::call("f", [Some(b::id("a")), None, Some(b::id("c"))]))]),
+    );
+    let mut seen = Vec::new();
+    node.for_each_child(&mut |c| seen.push(c.type_name()));
+    let mut mapped = Vec::new();
+    let copy = node.map_children(&mut |c| {
+        mapped.push(c.type_name());
+        c.clone()
+    });
+    assert_eq!(seen, mapped);
+    assert_eq!(program(vec![copy]), program(vec![node]));
+}
