@@ -8,6 +8,7 @@ mod a11y;
 mod a11y_data;
 mod comments;
 mod css;
+pub mod blockers;
 pub mod evaluate;
 mod acorn;
 mod nodes;
@@ -247,6 +248,8 @@ pub(crate) struct Analyzer<'s> {
     pub props_id: Option<Id<'s>>,
     pub has_props_rune: bool,
     pub metas: Vec<ExprMeta>,
+    /// `analysis.instance_body`
+    pub instance_body: blockers::InstanceBody<'s>,
     /// `analysis.needs_context`
     pub needs_context: bool,
     /// `analysis.pickled_awaits` (AwaitExpression keys)
@@ -477,6 +480,7 @@ fn analyze_component<'s>(
         has_props_rune: false,
         metas: Vec::new(),
         needs_context: false,
+        instance_body: blockers::InstanceBody::default(),
         pickled_awaits: FxHashSet::default(),
         async_deriveds: Vec::new(),
         meta_of: FxHashMap::default(),
@@ -633,6 +637,8 @@ fn analyze_component<'s>(
             }
         }
     }
+
+    blockers::calculate_blockers(&mut an);
 
     if runes {
         if let Some(&r) = an.sc.scope(module.scope).references.get("$$props").map(|r| &r[0]) {

@@ -76,6 +76,9 @@ pub struct Binding<'s> {
     /// declaration, an EachBlock or a SnippetBlock)
     pub initial: Option<P<'s>>,
     pub references: Vec<RefId>,
+    /// `assignments`: values assigned (the initial value, then each reassignment), with the
+    /// scope of the assignment
+    pub assignments: Vec<(P<'s>, ScopeId)>,
     pub legacy_dependencies: Vec<BindingId>,
     pub prop_alias: Option<&'s str>,
     pub inside_rest: bool,
@@ -83,6 +86,8 @@ pub struct Binding<'s> {
     pub is_template_declaration: bool,
     pub mutated: bool,
     pub reassigned: bool,
+    /// `blocker`: the `$$promises[i]` this binding waits on (top-level await)
+    pub blocker: Option<super::blockers::Blocker>,
 }
 
 impl Binding<'_> {
@@ -344,6 +349,7 @@ impl<'s> Scopes<'s> {
             kind,
             declaration_kind,
             initial,
+            assignments: initial.map(|i| vec![(i, scope)]).unwrap_or_default(),
             references: Vec::new(),
             legacy_dependencies: Vec::new(),
             prop_alias: None,
@@ -351,6 +357,7 @@ impl<'s> Scopes<'s> {
             is_template_declaration: false,
             mutated: false,
             reassigned: false,
+            blocker: None,
         };
         validate_identifier_name(&binding, Some(s.function_depth))?;
         self.bindings.push(binding);
@@ -701,7 +708,8 @@ pub struct ScopeBuilder<'s, 'x> {
     path_entries: Vec<u32>,
     materialized: usize,
     references: Vec<(ScopeId, Id<'s>, u32)>,
-    updates: Vec<(ScopeId, P<'s>)>,
+    /// (scope, target, assigned value)
+    updates: Vec<(ScopeId, P<'s>, P<'s>)>,
     possible_implicit_declarations: Vec<Id<'s>>,
     allow_reactive_declarations: bool,
     top: ScopeId,
@@ -761,7 +769,7 @@ pub fn create_scopes<'s>(
         b.scopes.add_reference(s, node.name, r);
     }
 
-    for (s, node) in std::mem::take(&mut b.updates) {
+    for (s, node, value) in std::mem::take(&mut b.updates) {
         let mut targets = Nodes::new();
         unwrap_pattern(node, &mut targets);
         for expression in targets {
@@ -771,6 +779,7 @@ pub fn create_scopes<'s>(
             if left.key != binding.node.key {
                 if ident(expression).is_some() {
                     binding.reassigned = true;
+                    binding.assignments.push((value, s));
                 } else {
                     binding.mutated = true;
                 }
@@ -901,11 +910,11 @@ impl<'s> ScopeBuilder<'s, '_> {
                     self.next(p, s)
                 }
                 K::AssignmentExpression(a) => {
-                    self.updates.push((scope, nodes::target(&a.left)));
+                    self.updates.push((scope, nodes::target(&a.left), nodes::expr(&a.right)));
                     self.next(p, scope)
                 }
                 K::UpdateExpression(u) => {
-                    self.updates.push((scope, nodes::simple_target(&u.argument)));
+                    self.updates.push((scope, nodes::simple_target(&u.argument), nodes::simple_target(&u.argument)));
                     self.next(p, scope)
                 }
                 K::ImportDeclaration(i) => {
@@ -1069,7 +1078,7 @@ impl<'s> ScopeBuilder<'s, '_> {
             Attr::Directive { kind: "BindDirective", expression: Some(e), .. } => {
                 let ep = nodes::template_expr(e);
                 if !matches!(ep, P::Js(AstKind::SequenceExpression(_))) {
-                    self.updates.push((scope, ep));
+                    self.updates.push((scope, ep, ep));
                 }
                 self.next(p, scope)
             }
