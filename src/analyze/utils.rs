@@ -592,3 +592,137 @@ pub static BINDING_PROPERTIES: &[BindingProperty] = &[
 pub fn binding_property(name: &str) -> Option<&'static BindingProperty> {
     BINDING_PROPERTIES.iter().find(|b| b.name == name)
 }
+
+// ---------------------------------------------------------------------------------------
+// `svelte/src/utils.js` helpers the transforms use
+
+/// `hash(str)`: djb2 over UTF-16 units, `\r` removed, base 36
+pub fn hash(s: &str) -> String {
+    let units: Vec<u16> = s.encode_utf16().filter(|&c| c != u16::from(b'\r')).collect();
+    let mut h: i32 = 5381;
+    for &c in units.iter().rev() {
+        h = (h.wrapping_shl(5).wrapping_sub(h)) ^ i32::from(c);
+    }
+    let mut n = h as u32;
+    if n == 0 {
+        return "0".into();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(n % 36) as usize]);
+        n /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap()
+}
+
+pub fn is_capture_event(name: &str) -> bool {
+    name.ends_with("capture") && name != "gotpointercapture" && name != "lostpointercapture"
+}
+
+const DELEGATED_EVENTS: &[&str] = &[
+    "beforeinput", "click", "change", "dblclick", "contextmenu", "focusin", "focusout", "input", "keydown", "keyup",
+    "mousedown", "mousemove", "mouseout", "mouseover", "mouseup", "pointerdown", "pointermove", "pointerout",
+    "pointerover", "pointerup", "touchend", "touchmove", "touchstart",
+];
+
+pub fn can_delegate_event(event_name: &str) -> bool {
+    DELEGATED_EVENTS.contains(&event_name)
+}
+
+const DOM_BOOLEAN_ATTRIBUTES: &[&str] = &[
+    "allowfullscreen", "async", "autofocus", "autoplay", "checked", "controls", "default", "disabled",
+    "formnovalidate", "indeterminate", "inert", "ismap", "loop", "multiple", "muted", "nomodule", "novalidate",
+    "open", "playsinline", "readonly", "required", "reversed", "seamless", "selected", "webkitdirectory", "defer",
+    "disablepictureinpicture", "disableremoteplayback",
+];
+
+pub fn is_boolean_attribute(name: &str) -> bool {
+    DOM_BOOLEAN_ATTRIBUTES.contains(&name)
+}
+
+/// `normalize_attribute`: lowercase, then the property name for aliased attributes
+pub fn normalize_attribute(name: &str) -> String {
+    let name = name.to_lowercase();
+    match name.as_str() {
+        "formnovalidate" => "formNoValidate",
+        "ismap" => "isMap",
+        "nomodule" => "noModule",
+        "playsinline" => "playsInline",
+        "readonly" => "readOnly",
+        "defaultvalue" => "defaultValue",
+        "defaultchecked" => "defaultChecked",
+        "srcobject" => "srcObject",
+        "novalidate" => "noValidate",
+        "allowfullscreen" => "allowFullscreen",
+        "disablepictureinpicture" => "disablePictureInPicture",
+        "disableremoteplayback" => "disableRemotePlayback",
+        _ => return name,
+    }
+    .to_string()
+}
+
+pub fn is_dom_property(name: &str) -> bool {
+    DOM_BOOLEAN_ATTRIBUTES.contains(&name)
+        || matches!(
+            name,
+            "formNoValidate"
+                | "isMap"
+                | "noModule"
+                | "playsInline"
+                | "readOnly"
+                | "value"
+                | "volume"
+                | "defaultValue"
+                | "defaultChecked"
+                | "srcObject"
+                | "noValidate"
+                | "allowFullscreen"
+                | "disablePictureInPicture"
+                | "disableRemotePlayback"
+        )
+}
+
+/// Attributes that can't be set through the template string
+pub fn cannot_be_set_statically(name: &str) -> bool {
+    matches!(name, "autofocus" | "muted" | "defaultValue" | "defaultChecked")
+}
+
+pub fn is_passive_event(name: &str) -> bool {
+    matches!(name, "touchstart" | "touchmove")
+}
+
+pub fn is_load_error_element(name: &str) -> bool {
+    matches!(name, "body" | "embed" | "iframe" | "img" | "link" | "object" | "script" | "style" | "track")
+}
+
+pub fn is_raw_text_element(name: &str) -> bool {
+    matches!(name, "textarea" | "script" | "style" | "title")
+}
+
+/// `REGEX_VALID_TAG_NAME`
+pub fn is_valid_tag_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let rest = chars.as_str();
+    let (head, custom) = match rest.find('-') {
+        Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+        None => (rest, None),
+    };
+    if !head.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    custom.is_none_or(|c| {
+        c.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '-' | '_' | '\u{B7}' | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{203F}'..='\u{2040}' | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+        })
+    })
+}
+
+/// `sanitize_location`: a zero-width space after each `/`
+pub fn sanitize_location(location: &str) -> String {
+    location.replace('/', "/\u{200b}")
+}

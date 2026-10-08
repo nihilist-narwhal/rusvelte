@@ -15,6 +15,7 @@ pub mod locator;
 pub mod magic_string;
 pub mod parser;
 pub mod svelte2tsx;
+pub mod transform;
 #[allow(clippy::all)]
 pub(crate) mod warning_codes;
 
@@ -22,6 +23,7 @@ use oxc_allocator::Allocator;
 use serde_json::Value;
 
 pub use error::CompileError;
+pub use transform::{compile_css, CssOptions, CssOutput};
 use locator::Locator;
 
 /// A parsed component. JS nodes are allocated in the `Allocator` passed to [`parse`].

@@ -200,7 +200,7 @@ impl<'s> Analyzer<'s> {
                 Ok(())
             }
             P::Chunk(Chunk::Expression { .. }) => {
-                let meta = self.new_meta();
+                let meta = self.new_meta(p);
                 self.next(p, &State { expression: Some(meta), ..*st })
             }
             P::TplExpr(Expr::Ident { .. }) | P::PatIdent(_) => self.identifier(p, st),
@@ -245,6 +245,9 @@ impl<'s> Analyzer<'s> {
             K::AssignmentExpression(a) => {
                 let left = nodes::target(&a.left);
                 self.validate_assignment(p, left, st)?;
+                if let Some(m) = self.meta(st.expression) {
+                    m.has_assignment = true;
+                }
                 if let Some(rs) = st.reactive_statement {
                     let id = if is_member(left) { object(left) } else { ident(left).or(Some(dummy_id())) };
                     if id.is_some() {
@@ -263,6 +266,9 @@ impl<'s> Analyzer<'s> {
             K::UpdateExpression(u) => {
                 let arg = nodes::simple_target(&u.argument);
                 self.validate_assignment(p, arg, st)?;
+                if let Some(m) = self.meta(st.expression) {
+                    m.has_assignment = true;
+                }
                 if let Some(rs) = st.reactive_statement {
                     let id = if is_member(arg) { object(arg) } else { ident(arg) };
                     if let Some(id) = id {
@@ -278,6 +284,14 @@ impl<'s> Analyzer<'s> {
             }
             K::AwaitExpression(_) => {
                 let tla = st.ast_type == AstType::Instance && st.function_depth == 1;
+                if self.is_reactive_expression(st.derived_function_depth == i64::from(st.function_depth)) {
+                    if let Some(m) = st.expression {
+                        if self.metas[m as usize].has_pickled_await || !self.is_last_evaluated_expression(p) {
+                            self.pickled_awaits.insert(p.key());
+                            self.metas[m as usize].has_pickled_await = true;
+                        }
+                    }
+                }
                 let mut suspend = tla;
                 if let Some(m) = self.meta(st.expression) {
                     m.has_await = true;
@@ -309,6 +323,15 @@ impl<'s> Analyzer<'s> {
                             }
                         }
                     }
+                }
+                if st.expression.is_some() {
+                    let pure = self.is_pure(p, st.scope);
+                    let m = self.meta(st.expression).unwrap();
+                    m.has_member_expression = true;
+                    m.has_state |= !pure;
+                }
+                if !self.is_safe_identifier(p, st.scope) {
+                    self.needs_context = true;
                 }
                 self.next(p, st)
             }
@@ -393,7 +416,21 @@ impl<'s> Analyzer<'s> {
             }
             K::LabeledStatement(l) => self.labeled_statement(p, l, st),
             K::VariableDeclarator(d) => self.variable_declarator(p, d, st),
-            K::SpreadElement(_) | K::TaggedTemplateExpression(_) => self.next(p, st),
+            K::SpreadElement(_) => {
+                if let Some(m) = self.meta(st.expression) {
+                    m.has_call = true;
+                    m.has_state = true;
+                }
+                self.next(p, st)
+            }
+            K::TaggedTemplateExpression(t) => {
+                if st.expression.is_some() && !self.is_pure(nodes::expr(&t.tag), st.scope) {
+                    let m = self.meta(st.expression).unwrap();
+                    m.has_call = true;
+                    m.has_state = true;
+                }
+                self.next(p, st)
+            }
             _ => self.next(p, st),
         }
     }
@@ -420,6 +457,7 @@ impl<'s> Analyzer<'s> {
         if !is_reference(p, first_parent) {
             return Ok(());
         }
+        self.mark_subtree_dynamic();
         i -= 1;
         let mut parent = first_parent;
 
@@ -479,8 +517,22 @@ impl<'s> Analyzer<'s> {
 
         if let Some(m) = st.expression {
             let meta = &mut self.metas[m as usize];
-            if meta.track_deps && !meta.dependencies.contains(&b) {
+            if !meta.dependencies.contains(&b) {
                 meta.dependencies.push(b);
+            }
+            if !meta.references.contains(&b) {
+                meta.references.push(b);
+            }
+            if !meta.has_state {
+                let binding = self.binding(b);
+                let is_function = !binding.updated()
+                    && matches!(binding.initial, Some(P::Js(AstKind::Function(_) | AstKind::ArrowFunctionExpression(_))));
+                if binding.kind != Kind::Static
+                    && (matches!(binding.kind, Kind::Prop | Kind::BindableProp | Kind::RestProp) || !is_function)
+                    && !self.sc.evaluate(self.ast, p, st.scope).is_known
+                {
+                    self.metas[m as usize].has_state = true;
+                }
             }
         }
 
@@ -780,16 +832,26 @@ impl<'s> Analyzer<'s> {
             Some(_) => {}
         }
 
+        if rune == Some("$effect.pending") {
+            if let Some(m) = self.meta(st.expression) {
+                m.has_state = true;
+            }
+        }
+
         if rune == Some("$derived") {
-            let meta = self.new_meta();
+            let meta = self.new_meta(p);
             let depth = st.function_depth + 1;
             self.next(
                 p,
-                &State { function_depth: depth, expression: Some(meta), ..*st },
+                &State { function_depth: depth, derived_function_depth: i64::from(depth), expression: Some(meta), ..*st },
             )?;
-            if st.in_declaration_tag && self.metas[meta as usize].has_await {
-                if let Some(m) = self.meta(st.expression) {
-                    m.has_await = true;
+            if self.metas[meta as usize].has_await {
+                self.async_deriveds.push((p.key(), meta));
+            }
+            if st.in_declaration_tag {
+                if let Some(m) = st.expression {
+                    let other = self.metas[meta as usize].clone();
+                    self.metas[m as usize].merge(&other);
                 }
             }
         } else if rune == Some("$inspect") {
@@ -797,7 +859,189 @@ impl<'s> Analyzer<'s> {
         } else {
             self.next(p, st)?;
         }
+
+        if let Some(m) = st.expression {
+            if !self.is_pure(nodes::expr(&c.callee), st.scope) || !self.metas[m as usize].dependencies.is_empty() {
+                let m = &mut self.metas[m as usize];
+                m.has_call = true;
+                m.has_state = true;
+            }
+        }
         Ok(())
+    }
+
+    /// `is_pure`: whether a callee/expression is known to have no reactive dependencies
+    pub(crate) fn is_pure(&self, node: P<'s>, scope: super::ScopeId) -> bool {
+        match node {
+            P::Js(
+                AstKind::StringLiteral(_)
+                | AstKind::NumericLiteral(_)
+                | AstKind::BooleanLiteral(_)
+                | AstKind::NullLiteral(_)
+                | AstKind::BigIntLiteral(_)
+                | AstKind::RegExpLiteral(_),
+            )
+            | P::TplExpr(Expr::Literal { .. }) => return true,
+            P::Js(AstKind::CallExpression(c)) => {
+                if !self.is_pure(nodes::expr(&c.callee), scope) {
+                    return false;
+                }
+                return c.arguments.iter().all(|a| match a {
+                    Argument::SpreadElement(s) => self.is_pure(nodes::expr(&s.argument), scope),
+                    a => self.is_pure(nodes::argument(a), scope),
+                });
+            }
+            _ => {}
+        }
+        if ident(node).is_none() && !is_member(node) {
+            return false;
+        }
+        if callee_rune(&self.sc, node, scope) == Some("$effect.tracking") {
+            return false;
+        }
+        let mut left = node;
+        while is_member(left) {
+            left = scope::member_object(left).unwrap();
+        }
+        if let Some(id) = ident(left) {
+            if self.get(scope, id.name).is_none() {
+                return true;
+            }
+        } else if self.is_pure(left, scope) {
+            return true;
+        }
+        false
+    }
+
+    /// `is_safe_identifier`
+    pub(crate) fn is_safe_identifier(&self, expression: P<'s>, scope: super::ScopeId) -> bool {
+        let mut node = expression;
+        while is_member(node) {
+            node = scope::member_object(node).unwrap();
+        }
+        let Some(id) = ident(node) else { return false };
+        self.is_safe_name(id.name, scope)
+    }
+
+    fn is_safe_name(&self, name: &str, scope: super::ScopeId) -> bool {
+        let Some(b) = self.get(scope, name) else { return true };
+        let binding = self.binding(b);
+        if binding.kind == Kind::StoreSub {
+            return self.is_safe_name(&name[1..], scope);
+        }
+        binding.declaration_kind != DeclKind::Import
+            && !matches!(binding.kind, Kind::Prop | Kind::BindableProp | Kind::RestProp)
+    }
+
+    /// `is_reactive_expression(path, in_derived)` (AwaitExpression.js)
+    fn is_reactive_expression(&self, in_derived: bool) -> bool {
+        if in_derived {
+            return true;
+        }
+        for parent in self.path.iter().rev() {
+            if matches!(parent, P::Js(AstKind::Function(_) | AstKind::ArrowFunctionExpression(_))) {
+                return false;
+            }
+            if has_metadata(*parent) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `is_last_evaluated_expression(path, node)` (AwaitExpression.js)
+    fn is_last_evaluated_expression(&self, node: P<'s>) -> bool {
+        let mut node = node;
+        for &parent in self.path.iter().rev() {
+            if let P::Node(n) = parent {
+                if matches!(self.ast.nodes[n], crate::ast::Node::ConstTag { .. }) {
+                    return false;
+                }
+            }
+            if has_metadata(parent) {
+                return true;
+            }
+            let last_is = |list: Option<P<'s>>| list.is_some_and(|l| l.is(node));
+            match parent {
+                P::Js(AstKind::ArrayExpression(a)) => {
+                    let last = a.elements.last().map(|e| match e {
+                        ArrayExpressionElement::SpreadElement(s) => P::Js(AstKind::SpreadElement(s)),
+                        ArrayExpressionElement::Elision(_) => P::Empty,
+                        e => nodes::expr(e.as_expression().unwrap()),
+                    });
+                    if !last_is(last) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::AssignmentExpression(a)) => {
+                    if nodes::target(&a.left).is(node) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::BinaryExpression(b)) => {
+                    if nodes::expr(&b.left).is(node) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::LogicalExpression(b)) => {
+                    if nodes::expr(&b.left).is(node) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::CallExpression(c)) => {
+                    if !last_is(c.arguments.last().map(nodes::argument)) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::NewExpression(c)) => {
+                    if !last_is(c.arguments.last().map(nodes::argument)) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::ConditionalExpression(c)) => {
+                    if nodes::expr(&c.test).is(node) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::StaticMemberExpression(_) | AstKind::ComputedMemberExpression(_) | AstKind::PrivateFieldExpression(_)) => {
+                    return false;
+                }
+                P::Js(AstKind::ObjectExpression(o)) => {
+                    let last = o.properties.last().map(|p| match p {
+                        ObjectPropertyKind::ObjectProperty(p) => P::Js(AstKind::ObjectProperty(p)),
+                        ObjectPropertyKind::SpreadProperty(s) => P::Js(AstKind::SpreadElement(s)),
+                    });
+                    if !last_is(last) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::ObjectProperty(p)) => {
+                    if nodes::property_key(&p.key).is(node) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::SequenceExpression(s)) => {
+                    if !last_is(s.expressions.last().map(nodes::expr)) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::TaggedTemplateExpression(t)) => {
+                    if !last_is(t.quasi.expressions.last().map(nodes::expr)) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::TemplateLiteral(t)) => {
+                    if !last_is(t.expressions.last().map(nodes::expr)) {
+                        return false;
+                    }
+                }
+                P::Js(AstKind::VariableDeclarator(_)) => return true,
+                _ => return false,
+            }
+            node = parent;
+        }
+        // the JS falls off the end, returning undefined
+        false
     }
 
     fn is_variable_declaration(&self, parent: P<'s>) -> bool {
@@ -1520,14 +1764,16 @@ impl<'s> Analyzer<'s> {
                         }
                     }
                 }
-                let meta = self.new_meta();
+                self.mark_subtree_dynamic();
+                let meta = self.new_meta(p);
                 self.next(p, &State { expression: Some(meta), ..*st })
             }
             Node::HtmlTag { .. } => {
                 if self.runes {
                     self.validate_opening_tag(n, '@')?;
                 }
-                let meta = self.new_meta();
+                self.mark_subtree_dynamic();
+                let meta = self.new_meta(p);
                 self.next(p, &State { expression: Some(meta), ..*st })
             }
             Node::DebugTag { .. } => {
@@ -1545,11 +1791,28 @@ impl<'s> Analyzer<'s> {
                 if self.runes {
                     self.validate_opening_tag(n, if *elseif { ':' } else { '#' })?;
                 }
-                let meta = self.new_meta();
+                self.mark_subtree_dynamic();
+                let meta = self.new_meta(p);
                 self.visit_child(p, nodes::template_expr(test), &State { expression: Some(meta), ..*st })?;
                 self.visit_child(p, P::Fragment(*consequent), st)?;
                 if let Some(a) = alternate {
                     self.visit_child(p, P::Fragment(*a), st)?;
+                    // fold an else-if chain into one block, unless an else-if awaits or has new blockers
+                    let alt_nodes = &self.ast.fragments[*a].nodes;
+                    if alt_nodes.len() == 1 {
+                        let e = alt_nodes[0];
+                        if let Node::IfBlock { elseif: true, .. } = &self.ast.nodes[e] {
+                            let em = self.meta_of[&P::Node(e).key()];
+                            let mine = self.meta_blockers(meta);
+                            let more = self.meta_blockers(em).iter().any(|b| !mine.contains(b));
+                            if !self.metas[em as usize].has_await && !more {
+                                let rest = self.node_meta_mut(e).flattened.take().unwrap_or_default();
+                                let mut flattened = vec![e];
+                                flattened.extend(rest);
+                                self.node_meta_mut(n).flattened = Some(flattened);
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1569,7 +1832,8 @@ impl<'s> Analyzer<'s> {
                         }
                     }
                 }
-                let meta = self.new_meta();
+                self.mark_subtree_dynamic();
+                let meta = self.new_meta(p);
                 self.visit_child(p, nodes::template_expr(expression), &State { expression: Some(meta), ..*st })?;
                 for f in [pending, then, catch].into_iter().flatten() {
                     self.visit_child(p, P::Fragment(*f), st)?;
@@ -1581,7 +1845,8 @@ impl<'s> Analyzer<'s> {
                 if self.runes {
                     self.validate_opening_tag(n, '#')?;
                 }
-                let meta = self.new_meta();
+                self.mark_subtree_dynamic();
+                let meta = self.new_meta(p);
                 self.visit_child(p, nodes::template_expr(expression), &State { expression: Some(meta), ..*st })?;
                 self.visit_child(p, P::Fragment(*fragment), st)
             }
@@ -1595,7 +1860,7 @@ impl<'s> Analyzer<'s> {
                         self.warn(Some(p), w::svelte_component_deprecated());
                     }
                     if let Some(e) = &el.expression {
-                        let meta = self.new_meta();
+                        let meta = self.new_meta(p);
                         self.visit_child(p, nodes::template_expr(e), &State { expression: Some(meta), ..*st })?;
                     }
                     self.visit_component(p, n, st)
@@ -1632,6 +1897,7 @@ impl<'s> Analyzer<'s> {
                     if let Some(a) = el.attributes.first() {
                         return Err(e::svelte_head_illegal_attribute(self.loc(P::Attr(a))));
                     }
+                    self.mark_subtree_dynamic();
                     self.next(p, st)
                 }
                 "SvelteBody" | "SvelteDocument" | "SvelteWindow" => {
@@ -1668,6 +1934,7 @@ impl<'s> Analyzer<'s> {
                             }
                         }
                     }
+                    self.mark_subtree_dynamic();
                     self.next(p, st)
                 }
                 "SlotElement" => {
@@ -1696,6 +1963,7 @@ impl<'s> Analyzer<'s> {
                         Some(entry) => entry.1 = n,
                         None => self.slot_names.push((name, n)),
                     }
+                    self.mark_subtree_dynamic();
                     self.next(p, st)
                 }
                 "TitleElement" => {
@@ -1822,12 +2090,12 @@ impl<'s> Analyzer<'s> {
             return Err(e::const_tag_invalid_placement(self.loc(p)));
         }
         self.visit_child(p, nodes::pattern_p(id), st)?;
-        let meta = self.new_meta();
+        let meta = self.new_meta(p);
         let depth = st.function_depth + 1;
         self.visit_child(
             p,
             nodes::template_expr(init),
-            &State { expression: Some(meta), function_depth: depth, ..*st },
+            &State { expression: Some(meta), function_depth: depth, derived_function_depth: i64::from(depth), ..*st },
         )
     }
 
@@ -1849,7 +2117,7 @@ impl<'s> Analyzer<'s> {
                 }
             }
         }
-        let meta = self.new_meta();
+        let meta = self.new_meta(p);
         let depth = self.sc.scope(st.scope).function_depth;
         self.visit_child(
             p,
@@ -1892,10 +2160,13 @@ impl<'s> Analyzer<'s> {
             }
         }
 
-        let meta = self.new_meta();
+        let dynamic = binding.is_none_or(|b| self.binding(b).kind != Kind::Normal);
+        self.node_meta_mut(n).dynamic = dynamic;
+        self.mark_subtree_dynamic();
+        let meta = self.new_meta(p);
         self.visit_child(p, callee, &State { expression: Some(meta), ..*st })?;
         for a in &c.arguments {
-            let meta = self.new_meta();
+            let meta = self.new_meta(nodes::argument(a));
             self.visit_child(p, nodes::argument(a), &State { expression: Some(meta), ..*st })?;
         }
         Ok(())
@@ -1930,9 +2201,9 @@ impl<'s> Analyzer<'s> {
         if keyed && context.is_none() {
             return Err(e::each_key_without_as(self.loc(nodes::template_expr(key.as_ref().unwrap()))));
         }
+        self.node_meta_mut(n).keyed = keyed;
 
-        let meta = self.new_meta();
-        self.metas[meta as usize].track_deps = !self.runes;
+        let meta = self.new_meta(p);
         let parent_scope = self.sc.scope(st.scope).parent.unwrap_or(st.scope);
         self.visit_child(
             p,
@@ -1960,14 +2231,16 @@ impl<'s> Analyzer<'s> {
                 }
             }
             if mutated {
-                for b in transitive {
+                for &b in &transitive {
                     let b = self.sc.binding_mut(b);
                     if b.kind == Kind::Normal && matches!(b.declaration_kind, DeclKind::Const | DeclKind::Let | DeclKind::Var) {
                         b.kind = Kind::State;
                     }
                 }
             }
+            self.node_meta_mut(n).transitive_deps = transitive;
         }
+        self.mark_subtree_dynamic();
         Ok(())
     }
 
@@ -2006,7 +2279,9 @@ impl<'s> Analyzer<'s> {
                 return Err(e::declaration_duplicate(self.loc(nodes::template_expr(expression)), name));
             }
             let mut visited = Vec::new();
-            if self.can_hoist_snippet(st.scope, &mut visited) {
+            let can_hoist = self.can_hoist_snippet(st.scope, &mut visited);
+            self.node_meta_mut(n).can_hoist = can_hoist;
+            if can_hoist {
                 if let Some(b) = self.get(st.scope, name) {
                     let module = self.module_scope;
                     let node_name = self.binding(b).node.name;
@@ -2095,11 +2370,49 @@ impl<'s> Analyzer<'s> {
             }
         }
 
+        // TODO: `<select bind:value>` in legacy mode records `legacy_indirect_bindings`
+
+        // `<option>{expr}</option>`: the expression tag becomes its value
+        if el.name == "option"
+            && !textarea_moved
+            && frag_nodes.len() == 1
+            && matches!(self.ast.nodes[frag_nodes[0]], Node::ExpressionTag { .. })
+            && !el.attributes.iter().any(|a| matches!(a, Attr::Attribute { name: "value", .. }))
+        {
+            self.node_meta_mut(n).synthetic_value_node = Some(frag_nodes[0]);
+        }
+
+        // rich content in <select>/<option>/<optgroup> needs special hydration handling
+        if is_customizable_select_element(self.ast, el) || el.name == "selectedcontent" {
+            self.fragment_dynamic.insert(el.fragment);
+            self.mark_subtree_dynamic();
+        }
+
         if let Some(b) = self.get(st.scope, el.name) {
             let b = self.binding(b);
             if b.declaration_kind == DeclKind::Import && b.references.is_empty() {
                 self.warn(Some(p), w::component_name_lowercase(el.name));
             }
+        }
+
+        let has_spread = el.attributes.iter().any(|a| matches!(a, Attr::Spread { .. }));
+        let svg = utils::is_svg(el.name)
+            || (matches!(el.name, "a" | "title")
+                && self.path.iter().rev().find_map(|q| {
+                    let qn = q.node()?;
+                    (self.ty(*q) == "RegularElement").then(|| self.node_meta.get(&qn).is_some_and(|m| m.svg))
+                }) == Some(true));
+        let mathml = utils::is_mathml(el.name);
+        let m = self.node_meta_mut(n);
+        m.has_spread = has_spread;
+        m.svg = svg;
+        m.mathml = mathml;
+
+        // attributes of custom elements are all set through properties
+        if (el.name.contains('-') || el.attributes.iter().any(|a| matches!(a, Attr::Attribute { name: "is", .. })))
+            && !el.attributes.is_empty()
+        {
+            self.mark_subtree_dynamic();
         }
 
         if let Some(parent_element) = st.parent_element {
@@ -2160,10 +2473,23 @@ impl<'s> Analyzer<'s> {
             self.visit(P::Fragment(el.fragment), &state)?;
             self.emptied_fragment = prev;
             self.path.pop();
-            Ok(())
         } else {
-            self.next(p, &state)
+            self.next(p, &state)?;
         }
+
+        // `<a>` is valid in both HTML and SVG: without a parent element, look at its children
+        if el.name == "a" && st.parent_element.is_none() {
+            let svg_child = self.ast.fragments[el.fragment].nodes.iter().find_map(|&c| match &self.ast.nodes[c] {
+                Node::Element(child) if child.kind == "RegularElement" => {
+                    Some(self.node_meta.get(&c).is_some_and(|m| m.svg) && child.name != "svg")
+                }
+                _ => None,
+            });
+            if svg_child == Some(true) {
+                self.node_meta_mut(n).svg = true;
+            }
+        }
+        Ok(())
     }
 
     fn svelte_element(&mut self, p: P<'s>, n: NodeId, st: &State<'s>) -> Res {
@@ -2173,8 +2499,45 @@ impl<'s> Analyzer<'s> {
         self.save_path(n);
         self.elements.push(n);
 
+        // namespace: an xmlns attribute, else the nearest element's, else the component's
+        let xmlns = el.attributes.iter().find_map(|a| match a {
+            Attr::Attribute { name: "xmlns", value, .. } => match value {
+                AttrValue::Sequence(c) if c.len() == 1 => match &c[0] {
+                    Chunk::Text { data, .. } => Some(data.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        });
+        let (svg, mathml) = match xmlns {
+            Some(ns) => (ns == "http://www.w3.org/2000/svg", ns == "http://www.w3.org/1998/Math/MathML"),
+            None => {
+                let mut result = (self.namespace == "svg", self.namespace == "mathml");
+                for i in (0..self.path.len()).rev() {
+                    let ancestor = self.path[i];
+                    let ty = self.ty(ancestor);
+                    if matches!(ty, "Component" | "SvelteComponent" | "SvelteFragment" | "SnippetBlock") || i == 0 {
+                        break;
+                    }
+                    if matches!(ty, "SvelteElement" | "RegularElement") {
+                        let an = ancestor.node().unwrap();
+                        let foreign = ty == "RegularElement" && self.element(an).is_some_and(|e| e.name == "foreignObject");
+                        let m = self.node_meta.get(&an).cloned().unwrap_or_default();
+                        result = if foreign { (false, false) } else { (m.svg, m.mathml) };
+                        break;
+                    }
+                }
+                result
+            }
+        };
+        let m = self.node_meta_mut(n);
+        m.svg = svg;
+        m.mathml = mathml;
+        self.mark_subtree_dynamic();
+
         if let Some(tag) = &el.tag {
-            let meta = self.new_meta();
+            let meta = self.new_meta(p);
             self.visit_child(p, nodes::template_expr(tag), &State { expression: Some(meta), ..*st })?;
         }
         for a in &el.attributes {
@@ -2497,6 +2860,7 @@ impl<'s> Analyzer<'s> {
         }
         self.renderer_snippets.insert(n, snippets);
         self.snippet_renderers.push((n, resolved));
+        self.mark_subtree_dynamic();
 
         for a in &el.attributes {
             let ap = P::Attr(a);
@@ -2590,22 +2954,54 @@ impl<'s> Analyzer<'s> {
         let parent = self.path.last().copied();
         let parent_ty = parent.map(|q| self.ty(q));
         match a {
-            Attr::Attribute { value, .. } => {
+            Attr::Attribute { value, name, .. } => {
                 self.next(p, st)?;
-                if !matches!(value, AttrValue::True)
-                    && is_event_attribute(a)
-                    && matches!(parent_ty, Some("RegularElement" | "SvelteElement"))
-                {
-                    self.uses_event_attributes = true;
+                if parent_ty == Some("RegularElement") && *name == "value" {
+                    if let Some(Node::Element(el)) = parent.and_then(|q| q.node()).map(|q| &self.ast.nodes[q]) {
+                        if el.name == "option" {
+                            self.mark_subtree_dynamic();
+                        }
+                    }
+                }
+                if is_event_attribute(a) {
+                    self.mark_subtree_dynamic();
+                }
+                if utils::cannot_be_set_statically(name) {
+                    self.mark_subtree_dynamic();
+                }
+                // class={[...]}, class={{...}} or class={x} need clsx
+                if *name == "class" {
+                    if let AttrValue::Expression(chunk) = value {
+                        if let Chunk::Expression { expression, .. } = chunk.as_ref() {
+                            let simple = matches!(
+                                nodes::template_expr(expression),
+                                P::Js(AstKind::StringLiteral(_) | AstKind::NumericLiteral(_) | AstKind::BooleanLiteral(_) | AstKind::NullLiteral(_) | AstKind::RegExpLiteral(_) | AstKind::BigIntLiteral(_) | AstKind::TemplateLiteral(_) | AstKind::BinaryExpression(_))
+                                    | P::TplExpr(Expr::Literal { .. })
+                            );
+                            if !simple {
+                                self.mark_subtree_dynamic();
+                                self.attr_meta.entry(p.key()).or_default().needs_clsx = true;
+                            }
+                        }
+                    }
+                }
+                if !matches!(value, AttrValue::True) && is_event_attribute(a) {
+                    if matches!(parent_ty, Some("RegularElement" | "SvelteElement")) {
+                        self.uses_event_attributes = true;
+                    }
+                    let delegated = parent_ty == Some("RegularElement") && utils::can_delegate_event(&name[2..]);
+                    self.attr_meta.entry(p.key()).or_default().delegated = delegated;
                 }
                 Ok(())
             }
             Attr::Spread { .. } => {
-                let meta = self.new_meta();
+                self.mark_subtree_dynamic();
+                let meta = self.new_meta(p);
                 self.next(p, &State { expression: Some(meta), ..*st })
             }
             Attr::Attach { .. } => {
-                let meta = self.new_meta();
+                self.mark_subtree_dynamic();
+                let meta = self.new_meta(p);
                 self.next(p, &State { expression: Some(meta), ..*st })?;
                 if self.metas[meta as usize].has_await {
                     return Err(e::illegal_await_expression(self.loc(p)));
@@ -2616,14 +3012,38 @@ impl<'s> Analyzer<'s> {
                 if modifiers.len() > 1 || (modifiers.len() == 1 && modifiers[0] != "important") {
                     return Err(e::style_directive_invalid_modifier(self.loc(p)));
                 }
-                if !matches!(value, AttrValue::True) {
+                self.mark_subtree_dynamic();
+                let meta = self.new_meta(p);
+                if matches!(value, AttrValue::True) {
+                    let name = super::attr_name(a);
+                    if let Some(b) = self.get(st.scope, name) {
+                        let binding = self.binding(b);
+                        let (has_state, blocked) = (binding.kind != Kind::Normal, binding.blocker.is_some());
+                        let m = &mut self.metas[meta as usize];
+                        m.has_state |= has_state;
+                        if blocked && !m.dependencies.contains(&b) {
+                            m.dependencies.push(b);
+                        }
+                    }
+                } else {
                     self.next(p, st)?;
+                    for c in utils::chunks(value) {
+                        if let Chunk::Expression { .. } = c {
+                            if let Some(&cm) = self.meta_of.get(&P::Chunk(c).key()) {
+                                let other = self.metas[cm as usize].clone();
+                                self.metas[meta as usize].merge(&other);
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
             Attr::Directive { kind, name, modifiers, expression, start, end, .. } => match *kind {
                 "AnimateDirective" | "TransitionDirective" | "UseDirective" => {
-                    let meta = self.new_meta();
+                    if *kind != "AnimateDirective" {
+                        self.mark_subtree_dynamic();
+                    }
+                    let meta = self.new_meta(p);
                     self.next(p, &State { expression: Some(meta), ..*st })?;
                     if self.metas[meta as usize].has_await {
                         return Err(e::illegal_await_expression(self.loc(p)));
@@ -2631,7 +3051,8 @@ impl<'s> Analyzer<'s> {
                     Ok(())
                 }
                 "ClassDirective" => {
-                    let meta = self.new_meta();
+                    self.mark_subtree_dynamic();
+                    let meta = self.new_meta(p);
                     self.next(p, &State { expression: Some(meta), ..*st })
                 }
                 "OnDirective" => {
@@ -2642,7 +3063,8 @@ impl<'s> Analyzer<'s> {
                         self.event_directive_node = Some((*start, *end, name));
                     }
                     let _ = modifiers;
-                    let meta = self.new_meta();
+                    self.mark_subtree_dynamic();
+                    let meta = self.new_meta(p);
                     self.next(p, &State { expression: Some(meta), ..*st })
                 }
                 "LetDirective" => {
@@ -2811,7 +3233,8 @@ impl<'s> Analyzer<'s> {
             if seq.expressions.len() != 2 {
                 return Err(e::bind_invalid_expression(loc));
             }
-            let meta = self.new_meta();
+            self.mark_subtree_dynamic();
+            let meta = self.new_meta(p);
             for x in &seq.expressions {
                 let target = match nodes::strip(x) {
                     Expression::ArrowFunctionExpression(arrow) => match &arrow.body {
@@ -2848,13 +3271,48 @@ impl<'s> Analyzer<'s> {
             }
         }
 
+        let mut bind_meta = super::BindMeta { binding, ..Default::default() };
         if name == "group" {
             if let Some(b) = binding {
                 if self.binding(b).kind == Kind::Snippet {
                     return Err(e::bind_group_invalid_snippet_parameter(loc));
                 }
             }
+            // the each blocks whose declarations the binding (indirectly) uses
+            let mut each_blocks = Vec::new();
+            let (keypath, expression_ids) = extract_all_identifiers_from_expression(self.ast, ep);
+            let mut ids = expression_ids.clone();
+            for i in (0..self.path.len()).rev() {
+                let Some(pn) = self.path[i].node() else { continue };
+                let Node::EachBlock { expression: each_expr, .. } = &self.ast.nodes[pn] else { continue };
+                let Some(&each_scope) = self.sc.each_scope.get(&pn) else { continue };
+                let declared = |name: &str| self.sc.scope(each_scope).declarations.contains_key(name);
+                let (refs, rest): (Vec<_>, Vec<_>) = ids.iter().copied().partition(|id: &Id| declared(id.name));
+                if !refs.is_empty() {
+                    self.node_meta_mut(pn).contains_group_binding = true;
+                    each_blocks.push(pn);
+                    ids = rest;
+                    ids.extend(extract_all_identifiers_from_expression(self.ast, nodes::template_expr(each_expr)).1);
+                }
+            }
+            let bindings: Vec<Option<BindingId>> = expression_ids.iter().map(|id| self.get(st.scope, id.name)).collect();
+            let existing = self
+                .binding_groups
+                .iter()
+                .rev()
+                .find(|(k, b, _)| *k == keypath && *b == bindings)
+                .map(|(_, _, g)| g.clone());
+            let group_name = match existing {
+                Some(g) => g,
+                None => {
+                    let g = self.sc.unique("binding_group");
+                    self.binding_groups.push((keypath, bindings, g.clone()));
+                    g
+                }
+            };
+            bind_meta = super::BindMeta { binding: None, binding_group_name: Some(group_name), parent_each_blocks: each_blocks };
         }
+        self.bind_meta.insert(p.key(), bind_meta);
 
         if let Some(b) = binding {
             let b = self.binding(b);
@@ -2864,7 +3322,7 @@ impl<'s> Analyzer<'s> {
             }
         }
 
-        let meta = self.new_meta();
+        let meta = self.new_meta(p);
         self.next(p, &State { expression: Some(meta), ..*st })?;
         if self.metas[meta as usize].has_await {
             return Err(e::illegal_await_expression(loc));
@@ -3253,4 +3711,129 @@ pub fn module_exports(an: &Analyzer) -> Res {
         }
     }
     Ok(())
+}
+
+/// Whether a node of the path has `metadata` (template nodes do, JS nodes don't)
+fn has_metadata(p: P) -> bool {
+    matches!(p, P::Fragment(_) | P::SlotFragment(_) | P::Node(_) | P::Attr(_) | P::Chunk(_) | P::TextareaValue(_))
+}
+
+/// `get_rune(b.call(node), scope)`: the rune a call of `node` would be
+fn callee_rune(scopes: &scope::Scopes, node: P, scope: super::ScopeId) -> Option<&'static str> {
+    let mut root = node;
+    while is_member(root) {
+        root = scope::member_object(root).unwrap();
+    }
+    if !ident(root).is_some_and(|i| i.name.starts_with('$')) {
+        return None;
+    }
+    let keypath = scope::get_global_keypath(scopes, node, scope)?;
+    super::utils::is_rune(&keypath)
+}
+
+/// `is_customizable_select_element`: `<select>`, `<optgroup>` or `<option>` with rich content
+fn is_customizable_select_element(ast: &crate::ast::Ast, el: &crate::ast::Element) -> bool {
+    if !matches!(el.name, "select" | "optgroup" | "option") {
+        return false;
+    }
+    let mut found = false;
+    find_descendants(ast, Some(el.fragment), &mut |child| {
+        if found {
+            return;
+        }
+        match &ast.nodes[child] {
+            Node::Element(c) if c.kind == "RegularElement" => {
+                if (el.name == "select" && c.name != "option" && c.name != "optgroup")
+                    || (el.name == "optgroup" && c.name != "option")
+                    || el.name == "option"
+                {
+                    found = true;
+                }
+            }
+            Node::Text { .. } => {
+                if el.name == "select" || el.name == "optgroup" {
+                    found = true;
+                }
+            }
+            _ => found = true,
+        }
+    });
+    found
+}
+
+/// `find_descendants`: the nodes of a fragment, looking through blocks
+fn find_descendants(ast: &crate::ast::Ast, fragment: Option<crate::ast::FragId>, f: &mut dyn FnMut(NodeId)) {
+    let Some(fragment) = fragment else { return };
+    for &n in &ast.fragments[fragment].nodes {
+        match &ast.nodes[n] {
+            Node::SnippetBlock { .. } | Node::DebugTag { .. } | Node::ConstTag { .. } | Node::DeclarationTag { .. } | Node::Comment { .. } | Node::ExpressionTag { .. } => {}
+            Node::Text { data, .. } => {
+                if !utils::js_trim(data).is_empty() {
+                    f(n);
+                }
+            }
+            Node::IfBlock { consequent, alternate, .. } => {
+                find_descendants(ast, Some(*consequent), f);
+                find_descendants(ast, *alternate, f);
+            }
+            Node::EachBlock { body, fallback, .. } => {
+                find_descendants(ast, Some(*body), f);
+                find_descendants(ast, *fallback, f);
+            }
+            Node::KeyBlock { fragment, .. } => find_descendants(ast, Some(*fragment), f),
+            Node::AwaitBlock { pending, then, catch, .. } => {
+                find_descendants(ast, *pending, f);
+                find_descendants(ast, *then, f);
+                find_descendants(ast, *catch, f);
+            }
+            Node::Element(e) if e.kind == "SvelteBoundary" => find_descendants(ast, Some(e.fragment), f),
+            _ => f(n),
+        }
+    }
+}
+
+/// `extract_all_identifiers_from_expression`: the keypath of an expression and its identifiers
+fn extract_all_identifiers_from_expression<'s>(ast: &'s crate::ast::Ast<'s>, expr: P<'s>) -> (String, Vec<Id<'s>>) {
+    fn walk<'s>(ast: &'s crate::ast::Ast<'s>, p: P<'s>, parent: Option<P<'s>>, nodes_out: &mut Vec<Id<'s>>, keypath: &mut Vec<String>) {
+        let computed_property_of = |parent: Option<P<'s>>| match parent {
+            Some(P::Js(AstKind::ComputedMemberExpression(m))) => nodes::expr(&m.expression).is(p),
+            _ => false,
+        };
+        if let Some(id) = ident(p) {
+            let is_property = match parent {
+                Some(P::Js(AstKind::StaticMemberExpression(m))) => P::Js(AstKind::IdentifierName(&m.property)).is(p),
+                _ => false,
+            };
+            if !is_property {
+                nodes_out.push(id);
+            }
+            if computed_property_of(parent) {
+                keypath.push(format!("[{}]", id.name));
+            } else {
+                keypath.push(id.name.to_string());
+            }
+            return;
+        }
+        let literal = match p {
+            P::Js(AstKind::StringLiteral(s)) => Some(format!("\"{}\"", s.value)),
+            P::Js(AstKind::NumericLiteral(n)) => Some(super::evaluate::number_to_string(n.value)),
+            P::Js(AstKind::BooleanLiteral(b)) => Some(b.value.to_string()),
+            P::Js(AstKind::NullLiteral(_)) => Some("null".into()),
+            _ => None,
+        };
+        if let Some(value) = literal {
+            keypath.push(if computed_property_of(parent) { format!("[{value}]") } else { value });
+            return;
+        }
+        if let P::Js(AstKind::ThisExpression(_)) = p {
+            keypath.push("this".into());
+        }
+        for c in nodes::children(p, ast) {
+            walk(ast, c, Some(p), nodes_out, keypath);
+        }
+    }
+    let mut ids = Vec::new();
+    let mut keypath = Vec::new();
+    walk(ast, expr, None, &mut ids, &mut keypath);
+    (keypath.join("."), ids)
 }

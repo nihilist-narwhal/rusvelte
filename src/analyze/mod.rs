@@ -7,8 +7,10 @@ mod a11y;
 #[allow(clippy::all)]
 mod a11y_data;
 mod comments;
-mod css;
-mod acorn;
+pub(crate) mod css;
+pub mod blockers;
+pub mod evaluate;
+pub(crate) mod acorn;
 mod nodes;
 mod scope;
 mod ts;
@@ -64,6 +66,8 @@ pub struct CompileOptions {
     pub custom_element: bool,
     /// `experimental.async`
     pub experimental_async: bool,
+    /// `namespace` (`html` when `None`); `<svelte:options namespace>` overrides it
+    pub namespace: Option<String>,
 }
 
 /// The warnings `svelte.compile(source, { dev: true, generate: false, filename })` reports,
@@ -90,7 +94,7 @@ pub fn compile_diagnostics_with(
             let parse_error = scripts.iter().find_map(|s| acorn::check(&s.content.program, source, component.root.ts));
             let result = match parse_error {
                 Some(err) => Err(err),
-                None => analyze_component(&alloc, &component, source, filename, options, &mut warnings),
+                None => analyze_component(&alloc, &component, source, filename, options, &mut warnings).map(|_| ()),
             };
             (result, component.locator.clone())
         }
@@ -119,13 +123,84 @@ pub fn compile_diagnostics_with(
     }
 }
 
-/// `ExpressionMetadata` (only what diagnostics depend on)
-#[derive(Default, Debug)]
-pub(crate) struct ExprMeta {
+/// `node.metadata` of template nodes (the fields code generation reads)
+#[derive(Default, Debug, Clone)]
+pub struct NodeMeta {
+    /// elements: in the SVG / MathML namespace
+    pub svg: bool,
+    pub mathml: bool,
+    pub has_spread: bool,
+    /// `<option>{expr}</option>`: the ExpressionTag used as its value
+    pub synthetic_value_node: Option<NodeId>,
+    /// IfBlock: the else-if blocks folded into this one
+    pub flattened: Option<Vec<NodeId>>,
+    /// EachBlock
+    pub keyed: bool,
+    pub contains_group_binding: bool,
+    pub transitive_deps: Vec<BindingId>,
+    /// SnippetBlock
+    pub can_hoist: bool,
+    /// RenderTag: the callee isn't a plain (normal) binding
+    pub dynamic: bool,
+}
+
+/// `attribute.metadata`
+#[derive(Default, Debug, Clone, Copy)]
+pub struct AttrMeta {
+    /// `class={...}` needs `clsx`
+    pub needs_clsx: bool,
+    /// an event attribute that can be delegated
+    pub delegated: bool,
+}
+
+/// `bind:` directive metadata
+#[derive(Default, Debug, Clone)]
+pub struct BindMeta {
+    /// `metadata.binding` (unset for `bind:group`, whose metadata Svelte replaces)
+    pub binding: Option<BindingId>,
+    /// `bind:group`: the group's name and the each blocks contributing to it (innermost first)
+    pub binding_group_name: Option<String>,
+    pub parent_each_blocks: Vec<NodeId>,
+}
+
+/// `ExpressionMetadata`
+#[derive(Default, Debug, Clone)]
+pub struct ExprMeta {
+    /// references state directly, or might (via member/call expressions)
+    pub has_state: bool,
+    /// involves a call expression
+    pub has_call: bool,
     pub has_await: bool,
-    /// whether `dependencies` are collected (only legacy each blocks need them)
-    pub track_deps: bool,
+    /// an `await` restores the reaction context afterwards
+    pub has_pickled_await: bool,
+    pub has_member_expression: bool,
+    /// includes an assignment or an update
+    pub has_assignment: bool,
+    /// bindings referenced eagerly (not inside functions), in insertion order
     pub dependencies: Vec<BindingId>,
+    pub references: Vec<BindingId>,
+}
+
+impl ExprMeta {
+    /// `merge(other)`
+    pub fn merge(&mut self, other: &ExprMeta) {
+        self.has_state |= other.has_state;
+        self.has_call |= other.has_call;
+        self.has_await |= other.has_await;
+        self.has_pickled_await |= other.has_pickled_await;
+        self.has_member_expression |= other.has_member_expression;
+        self.has_assignment |= other.has_assignment;
+        for d in &other.dependencies {
+            if !self.dependencies.contains(d) {
+                self.dependencies.push(*d);
+            }
+        }
+        for r in &other.references {
+            if !self.references.contains(r) {
+                self.references.push(*r);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -149,6 +224,8 @@ pub(crate) struct State<'s> {
     /// index into `Analyzer::state_fields`
     pub state_fields: u32,
     pub function_depth: u32,
+    /// `derived_function_depth` (-1 outside `$derived`/`{@const}`)
+    pub derived_function_depth: i64,
     /// index into `Analyzer::reactive_statements`
     pub reactive_statement: Option<u32>,
 }
@@ -188,6 +265,8 @@ pub(crate) struct Analyzer<'s> {
     pub maybe_runes: bool,
     pub custom_element: bool,
     pub experimental_async: bool,
+    /// the component's namespace (`options.namespace` or `<svelte:options namespace>`)
+    pub namespace: &'static str,
     pub custom_element_props: bool,
     pub name: String,
     pub module_scope: ScopeId,
@@ -213,6 +292,26 @@ pub(crate) struct Analyzer<'s> {
     pub props_id: Option<Id<'s>>,
     pub has_props_rune: bool,
     pub metas: Vec<ExprMeta>,
+    /// `bind:` directive metadata (by attribute address)
+    pub bind_meta: FxHashMap<usize, BindMeta>,
+    /// `analysis.binding_groups`: (keypath, bindings) → group name
+    pub binding_groups: Vec<(String, Vec<Option<BindingId>>, String)>,
+    /// `attribute.metadata` (by attribute address)
+    pub attr_meta: FxHashMap<usize, AttrMeta>,
+    /// `node.metadata` of template nodes
+    pub node_meta: FxHashMap<NodeId, NodeMeta>,
+    /// `fragment.metadata.dynamic` (by fragment id)
+    pub fragment_dynamic: FxHashSet<usize>,
+    /// `analysis.instance_body`
+    pub instance_body: blockers::InstanceBody<'s>,
+    /// `analysis.needs_context`
+    pub needs_context: bool,
+    /// `analysis.pickled_awaits` (AwaitExpression keys)
+    pub pickled_awaits: FxHashSet<usize>,
+    /// `analysis.async_deriveds`: `$derived(...)` call key → its metadata
+    pub async_deriveds: Vec<(usize, u32)>,
+    /// node key → its `metadata.expression` (index into `metas`)
+    pub meta_of: FxHashMap<usize, u32>,
     pub component_slots: Vec<FxHashSet<String>>,
     pub state_fields: Vec<Vec<StateField>>,
     pub reactive_statements: Vec<ReactiveStatement>,
@@ -289,9 +388,45 @@ impl<'s> Analyzer<'s> {
         self.sc.binding(b)
     }
 
-    pub fn new_meta(&mut self) -> u32 {
+    /// `node.metadata`, created on first use
+    pub fn node_meta_mut(&mut self, n: NodeId) -> &mut NodeMeta {
+        self.node_meta.entry(n).or_default()
+    }
+
+    /// `mark_subtree_dynamic(context.path)`
+    pub fn mark_subtree_dynamic(&mut self) {
+        for i in (0..self.path.len()).rev() {
+            let key = match self.path[i] {
+                P::Fragment(f) => f,
+                // the slot fragments share the component fragment's `metadata`
+                P::SlotFragment(s) => self.slot_fragments[s as usize].0,
+                _ => continue,
+            };
+            if !self.fragment_dynamic.insert(key) {
+                return;
+            }
+        }
+    }
+
+    /// The blockers of an expression's references (`#get_blockers`), deduplicated by identity
+    pub fn meta_blockers(&self, m: u32) -> Vec<blockers::Blocker> {
+        let mut out: Vec<blockers::Blocker> = Vec::new();
+        for &r in &self.metas[m as usize].references {
+            if let Some(b) = self.binding(r).blocker {
+                if !out.contains(&b) {
+                    out.push(b);
+                }
+            }
+        }
+        out
+    }
+
+    /// A new `ExpressionMetadata`, as `owner.metadata.expression`
+    pub fn new_meta(&mut self, owner: P<'s>) -> u32 {
         self.metas.push(ExprMeta::default());
-        (self.metas.len() - 1) as u32
+        let id = (self.metas.len() - 1) as u32;
+        self.meta_of.insert(owner.key(), id);
+        id
     }
 
     pub fn ty(&self, p: P) -> &'static str {
@@ -365,14 +500,27 @@ fn get_component_name(filename: &str) -> String {
 
 const RESERVED: &[&str] = &["$$props", "$$restProps", "$$slots"];
 
-fn analyze_component<'s>(
+/// What `analyze_component` returns (the parts of `ComponentAnalysis` ported so far)
+pub(crate) struct ComponentAnalysis<'s> {
+    /// `get_component_name(options.filename)`, which `cssHash` gets as `name`
+    pub component_name: String,
+    pub custom_element: bool,
+    /// The CSS analysis, when there's a `<style>`
+    pub css: Option<css::Meta<'s>>,
+    /// `analysis.css.has_global`
+    pub css_has_global: bool,
+    /// Everything else the analysis computed (scopes, bindings, metadata), for code generation
+    pub an: Analyzer<'s>,
+}
+
+pub(crate) fn analyze_component<'s>(
     alloc: &'s Allocator,
     component: &'s crate::Component<'s>,
     source: &'s str,
     filename: &'s str,
     compile_options: &CompileOptions,
     warnings: &'s mut Vec<Warning>,
-) -> Result<()> {
+) -> Result<ComponentAnalysis<'s>> {
     let ast = &component.ast;
     let root = &component.root;
 
@@ -410,6 +558,11 @@ fn analyze_component<'s>(
         maybe_runes: false,
         custom_element: custom_element_options.is_some() || compile_options.custom_element,
         experimental_async: compile_options.experimental_async,
+        namespace: match root.options.as_ref().and_then(|o| o.values.get("namespace")).and_then(|v| v.as_str()).or(compile_options.namespace.as_deref()) {
+            Some("svg") => "svg",
+            Some("mathml") => "mathml",
+            _ => "html",
+        },
         custom_element_props: custom_element_options.and_then(|c| c.get("props")).is_some_and(|p| !p.is_null()),
         name: String::new(),
         module_scope: module.scope,
@@ -431,6 +584,16 @@ fn analyze_component<'s>(
         props_id: None,
         has_props_rune: false,
         metas: Vec::new(),
+        needs_context: false,
+        instance_body: blockers::InstanceBody::default(),
+        node_meta: FxHashMap::default(),
+        attr_meta: FxHashMap::default(),
+        bind_meta: FxHashMap::default(),
+        binding_groups: Vec::new(),
+        fragment_dynamic: FxHashSet::default(),
+        pickled_awaits: FxHashSet::default(),
+        async_deriveds: Vec::new(),
+        meta_of: FxHashMap::default(),
         component_slots: Vec::new(),
         state_fields: vec![Vec::new()],
         reactive_statements: Vec::new(),
@@ -585,6 +748,8 @@ fn analyze_component<'s>(
         }
     }
 
+    blockers::calculate_blockers(&mut an);
+
     if runes {
         if let Some(&r) = an.sc.scope(module.scope).references.get("$$props").map(|r| &r[0]) {
             return Err(e::legacy_props_invalid(an.sc.refs[r as usize].node.err_loc()));
@@ -613,6 +778,7 @@ fn analyze_component<'s>(
             expression: None,
             state_fields: 0,
             function_depth: an.sc.scope(scope).function_depth,
+            derived_function_depth: -1,
             reactive_statement: None,
         };
         an.has_props_rune = false;
@@ -631,6 +797,7 @@ fn analyze_component<'s>(
     }
 
     visit::module_exports(&an)?;
+    let exports_snippet = exports_snippet(&an);
 
     if let (Some((start, end, name)), true) = (an.event_directive_node, an.uses_event_attributes) {
         return Err(e::mixed_event_handler_syntaxes((start, end), name));
@@ -664,11 +831,38 @@ fn analyze_component<'s>(
         return Err(e::slot_snippet_conflict(pos));
     }
 
-    if let Some(css) = &root.css {
-        css::analyze(&mut an, css)?;
-    }
+    let css = match &root.css {
+        Some(css) => Some(css::analyze(&mut an, css)?),
+        None => None,
+    };
 
-    Ok(())
+    Ok(ComponentAnalysis {
+        css_has_global: exports_snippet || css.as_ref().is_some_and(|c| c.has_global),
+        component_name,
+        custom_element: an.custom_element,
+        css,
+        an,
+    })
+}
+
+/// Whether the module script exports a snippet (which sets `analysis.css.has_global`, so that
+/// bundlers keep the CSS when only the snippet is imported)
+fn exports_snippet(an: &Analyzer) -> bool {
+    use oxc_ast::ast::ModuleExportName;
+    let Some(program) = an.module_program else { return false };
+    nodes::children(program, an.ast).into_iter().any(|s| {
+        let P::Js(AstKind::ExportNamedDeclaration(d)) = s else { return false };
+        d.specifiers.iter().any(|spec| {
+                let name = match &spec.local {
+                    ModuleExportName::IdentifierReference(r) => r.name.as_str(),
+                    ModuleExportName::IdentifierName(r) => r.name.as_str(),
+                    ModuleExportName::StringLiteral(_) => return false,
+                };
+                an.get(an.module_scope, name).is_some_and(|b| {
+                    matches!(an.binding(b).initial, Some(P::Node(n)) if matches!(an.ast.nodes[n], Node::SnippetBlock { .. }))
+                })
+            })
+    })
 }
 
 fn instance_body<'s>(an: &Analyzer<'s>) -> Vec<P<'s>> {

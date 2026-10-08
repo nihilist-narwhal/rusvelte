@@ -877,6 +877,7 @@ fn svelte_warnings_finish(h: WarningsHandle, threads: usize) -> Result<(Vec<(Pat
                 runes: c["runes"].as_bool(),
                 custom_element: c["customElement"] == Value::Bool(true),
                 experimental_async: c["experimentalAsync"] == Value::Bool(true),
+                ..Default::default()
             };
         }
         results.extend(m.into_iter().map(|(k, v)| (PathBuf::from(k), v)));
@@ -1424,6 +1425,7 @@ fn config_probe_finish(p: ConfigProbe) -> Option<ProbedConfig> {
             runes: v["runes"].as_bool(),
             custom_element: v["customElement"] == Value::Bool(true),
             experimental_async: v["experimentalAsync"] == Value::Bool(true),
+                ..Default::default()
         },
         kit_files,
     })
