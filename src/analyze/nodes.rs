@@ -43,10 +43,30 @@ pub enum P<'s> {
     Empty,
 }
 
+/// The address of the node a kind refers to (its identity). oxc's `Address` has no getter,
+/// but its derived `Hash` writes the inner `usize`, which [`AddressHasher`] captures.
 #[inline]
 pub fn addr(kind: &AstKind) -> usize {
-    // SAFETY: `Address` is `#[repr(transparent)]` over `usize`
-    unsafe { std::mem::transmute::<oxc_allocator::Address, usize>(kind.address()) }
+    use std::hash::Hash;
+    let mut h = AddressHasher(0);
+    kind.address().hash(&mut h);
+    h.0
+}
+
+/// A `Hasher` that keeps the last `usize` written to it
+struct AddressHasher(usize);
+
+impl std::hash::Hasher for AddressHasher {
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.0 = n;
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("`Address` hashes as a single usize")
+    }
+    fn finish(&self) -> u64 {
+        self.0 as u64
+    }
 }
 
 #[inline]
@@ -1153,4 +1173,53 @@ pub fn children<'s>(p: P<'s>, ast: &'s Ast<'s>) -> Vec<P<'s>> {
         Ok(())
     });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::addr;
+    use oxc_ast::AstKind;
+    use oxc_ast::ast::{Expression, Statement};
+
+    fn ptr<T>(r: &T) -> usize {
+        r as *const T as usize
+    }
+
+    /// `addr` must be the node's address (a change in oxc's `Address` would break identity)
+    #[test]
+    fn addr_is_the_node_address() {
+        let alloc = oxc_allocator::Allocator::default();
+        let source = "let a = 1; foo(a); x.y = 2;";
+        let parsed = oxc_parser::Parser::new(&alloc, source, oxc_span::SourceType::mjs()).parse();
+        let program = &parsed.program;
+        let mut seen = Vec::new();
+        let mut check = |kind: AstKind, ptr: usize| {
+            assert_eq!(addr(&kind), ptr);
+            assert!(!seen.contains(&ptr), "distinct nodes have distinct addresses");
+            seen.push(ptr);
+        };
+        check(AstKind::Program(program), ptr(program));
+        for stmt in &program.body {
+            match stmt {
+                Statement::VariableDeclaration(d) => {
+                    check(AstKind::VariableDeclaration(d), ptr(&**d));
+                    check(AstKind::VariableDeclarator(&d.declarations[0]), ptr(&d.declarations[0]));
+                }
+                Statement::ExpressionStatement(e) => {
+                    check(AstKind::ExpressionStatement(e), ptr(&**e));
+                    match &e.expression {
+                        Expression::CallExpression(c) => {
+                            check(AstKind::CallExpression(c), ptr(&**c));
+                            let Expression::Identifier(id) = &c.callee else { unreachable!() };
+                            check(AstKind::IdentifierReference(id), ptr(&**id));
+                        }
+                        Expression::AssignmentExpression(a) => check(AstKind::AssignmentExpression(a), ptr(&**a)),
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(seen.len(), 8);
+    }
 }
