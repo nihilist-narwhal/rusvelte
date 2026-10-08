@@ -147,6 +147,11 @@ impl<'s> Locator<'s> {
         json!({ "line": line, "column": column })
     }
 
+    /// acorn's position as numbers: (line, column in UTF-16 units) with acorn's line breaks
+    pub fn acorn_line_column(&self, byte: usize) -> (usize, usize) {
+        self.line_col(self.acorn_lines(), byte)
+    }
+
     /// acorn's position: `{ line, column }` with acorn's line breaks
     pub fn acorn_position(&self, byte: usize) -> Value {
         let (line, column) = self.line_col(self.acorn_lines(), byte);
