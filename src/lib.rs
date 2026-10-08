@@ -3,6 +3,7 @@
 pub mod ast;
 pub mod check;
 pub mod css;
+pub mod css_lint;
 pub mod error;
 #[allow(clippy::all)]
 pub mod errors;
