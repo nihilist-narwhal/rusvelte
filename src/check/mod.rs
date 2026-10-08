@@ -409,6 +409,11 @@ fn write_overlay(tsconfig_path: &Path, tsconfig_dir: &Path, workspace: &Path, ca
     compiler_options.insert("noEmit".into(), json!(true));
     compiler_options.insert("incremental".into(), json!(incremental));
     compiler_options.insert("tsBuildInfoFile".into(), json!(relative_posix(overlay_dir, &cache.join("tsbuildinfo.json"))));
+    // With `outDir` and no `rootDir`, TypeScript 6+ defaults `rootDir` to the config's directory,
+    // which would be ours: keep the project's own default
+    if parsed.has_out_dir && !parsed.has_root_dir {
+        compiler_options.insert("rootDir".into(), json!(relative_posix(overlay_dir, tsconfig_dir)));
+    }
     let mut paths = rebase_paths(&parsed, tsconfig_dir, overlay_dir);
     add_subpath_import_paths(&mut paths, workspace, overlay_dir, &cache.join("svelte"));
     if !paths.is_empty() {

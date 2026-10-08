@@ -15,6 +15,9 @@ pub struct ParsedConfig {
     pub paths: Option<(Map<String, Value>, PathBuf)>,
     /// `options.baseUrl`, absolute
     pub base_url: Option<PathBuf>,
+    /// whether `outDir` / `rootDir` are set anywhere in the chain
+    pub has_out_dir: bool,
+    pub has_root_dir: bool,
 }
 
 /// Strip comments and trailing commas so serde_json accepts the text
@@ -161,6 +164,8 @@ fn collect(path: &Path, root_dir: &Path, depth: usize, out: &mut ParsedConfig) -
         if let Some(Value::Array(dirs)) = opts.get("rootDirs") {
             out.root_dirs = Some(dirs.iter().filter_map(Value::as_str).map(resolve).collect());
         }
+        out.has_out_dir |= opts.get("outDir").is_some_and(|v| !v.is_null());
+        out.has_root_dir |= opts.get("rootDir").is_some_and(|v| !v.is_null());
         if let Some(Value::String(b)) = opts.get("baseUrl") {
             out.base_url = Some(resolve(b));
         }
@@ -183,7 +188,7 @@ fn collect(path: &Path, root_dir: &Path, depth: usize, out: &mut ParsedConfig) -
 
 pub fn parse_config(path: &Path) -> Result<ParsedConfig, String> {
     let root_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let mut out = ParsedConfig { raw: Map::new(), root_dirs: None, paths: None, base_url: None };
+    let mut out = ParsedConfig { raw: Map::new(), root_dirs: None, paths: None, base_url: None, has_out_dir: false, has_root_dir: false };
     out.raw = collect(path, &root_dir, 0, &mut out)?;
     Ok(out)
 }
