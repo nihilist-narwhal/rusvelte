@@ -376,6 +376,7 @@ impl<'s> Analyzer<'s> {
                 let local = module_export_name_str(&s.local);
                 if st.ast_type == AstType::Instance {
                     if self.runes {
+                        self.exports.push((local.to_string(), Some(module_export_name_str(&s.exported).to_string())));
                         if let Some(b) = self.get(st.scope, local) {
                             self.sc.binding_mut(b).reassigned = true;
                         }
@@ -1390,6 +1391,28 @@ impl<'s> Analyzer<'s> {
                 }
                 if self.runes && st.ast_type == AstType::Instance && v.kind == VariableDeclarationKind::Let {
                     return Err(e::legacy_export_invalid(self.loc(p)));
+                }
+            }
+            if self.runes && st.ast_type == AstType::Instance {
+                match &d.declaration {
+                    Declaration::FunctionDeclaration(f) => {
+                        if let Some(id) = &f.id {
+                            self.exports.push((id.name.to_string(), None));
+                        }
+                    }
+                    Declaration::ClassDeclaration(c) => {
+                        if let Some(id) = &c.id {
+                            self.exports.push((id.name.to_string(), None));
+                        }
+                    }
+                    Declaration::VariableDeclaration(v) if v.kind == VariableDeclarationKind::Const => {
+                        for declarator in &v.declarations {
+                            for id in scope::extract_identifiers(nodes::binding(&declarator.id)) {
+                                self.exports.push((id.name.to_string(), None));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

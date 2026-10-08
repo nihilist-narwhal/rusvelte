@@ -269,6 +269,9 @@ pub fn server_component(s: &mut Server) -> Node {
             props.push(b::init(binding.prop_alias.unwrap_or(name), b::id(*name)));
         }
     }
+    for (name, alias) in s.an.exports.clone() {
+        props.push(b::init(alias.as_deref().unwrap_or(&name), b::id(name.as_str())));
+    }
     let has_props = !props.is_empty();
     if has_props {
         template_body.push(b::stmt(b::call("$.bind_props", vec![b::id("$$props"), b::object(props)])));

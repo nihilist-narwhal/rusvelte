@@ -359,7 +359,7 @@ impl<'a, 's> Server<'a, 's> {
     /// The ESTree form of a template expression
     pub fn convert_expr(&self, e: &Expr<'s>) -> Node {
         match e {
-            Expr::Js(js) => self.conv.expression(js.inner()),
+            Expr::Js(js) => self.conv.expression(js.effective_root()),
             Expr::Ident { name, .. } => b::id(name.as_str()),
             Expr::Literal { value, .. } => b::literal(value.as_str()),
         }
