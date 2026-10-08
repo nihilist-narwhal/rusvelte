@@ -55,9 +55,29 @@ pub struct Warning {
     pub position: Option<(usize, usize)>,
 }
 
+/// The compiler options that change which warnings and errors `compile` reports
+#[derive(Debug, Clone, Default)]
+pub struct CompileOptions {
+    /// `runes`: `None` to infer it from the component
+    pub runes: Option<bool>,
+    /// `customElement`
+    pub custom_element: bool,
+    /// `experimental.async`
+    pub experimental_async: bool,
+}
+
 /// The warnings `svelte.compile(source, { dev: true, generate: false, filename })` reports,
 /// or the error it throws. `filename` should be the file's basename.
 pub fn compile_diagnostics(source: &str, filename: &str) -> std::result::Result<Vec<Diagnostic>, Diagnostic> {
+    compile_diagnostics_with(source, filename, &CompileOptions::default())
+}
+
+/// [`compile_diagnostics`] with compiler options (`compilerOptions` of svelte.config.js)
+pub fn compile_diagnostics_with(
+    source: &str,
+    filename: &str,
+    options: &CompileOptions,
+) -> std::result::Result<Vec<Diagnostic>, Diagnostic> {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let alloc = Allocator::default();
     let mut warnings = Vec::new();
@@ -70,7 +90,7 @@ pub fn compile_diagnostics(source: &str, filename: &str) -> std::result::Result<
             let parse_error = scripts.iter().find_map(|s| acorn::check(&s.content.program, source, component.root.ts));
             let result = match parse_error {
                 Some(err) => Err(err),
-                None => analyze_component(&alloc, &component, source, filename, &mut warnings),
+                None => analyze_component(&alloc, &component, source, filename, options, &mut warnings),
             };
             (result, component.locator.clone())
         }
@@ -167,6 +187,7 @@ pub(crate) struct Analyzer<'s> {
     pub runes: bool,
     pub maybe_runes: bool,
     pub custom_element: bool,
+    pub experimental_async: bool,
     pub custom_element_props: bool,
     pub name: String,
     pub module_scope: ScopeId,
@@ -349,6 +370,7 @@ fn analyze_component<'s>(
     component: &'s crate::Component<'s>,
     source: &'s str,
     filename: &'s str,
+    compile_options: &CompileOptions,
     warnings: &'s mut Vec<Warning>,
 ) -> Result<()> {
     let ast = &component.ast;
@@ -366,7 +388,11 @@ fn analyze_component<'s>(
     let template = scope::create_scopes(&mut sc, ast, alloc, Some(P::Fragment(root.fragment)), false, Some(instance.scope))?;
 
     let options = root.options.as_ref();
-    let runes_option: Option<bool> = options.and_then(|o| o.values.get("runes")).and_then(|v| v.as_bool());
+    // `'runes' in parsed_options ? parsed_options.runes : options.runes`
+    let runes_option: Option<bool> = match options.and_then(|o| o.values.get("runes")) {
+        Some(v) => v.as_bool(),
+        None => compile_options.runes,
+    };
     let custom_element_options = options.and_then(|o| o.values.get("customElement"));
 
     let mut an = Analyzer {
@@ -382,7 +408,8 @@ fn analyze_component<'s>(
         ignore_map: FxHashMap::default(),
         runes: false,
         maybe_runes: false,
-        custom_element: custom_element_options.is_some(),
+        custom_element: custom_element_options.is_some() || compile_options.custom_element,
+        experimental_async: compile_options.experimental_async,
         custom_element_props: custom_element_options.and_then(|c| c.get("props")).is_some_and(|p| !p.is_null()),
         name: String::new(),
         module_scope: module.scope,
@@ -549,7 +576,9 @@ fn analyze_component<'s>(
         for a in &o.attributes {
             match a.name() {
                 Some("accessors") if runes => an.warn(Some(P::Attr(a)), warnings::options_deprecated_accessors()),
-                Some("customElement") => an.warn(Some(P::Attr(a)), warnings::options_missing_custom_element()),
+                Some("customElement") if !compile_options.custom_element => {
+                    an.warn(Some(P::Attr(a)), warnings::options_missing_custom_element())
+                }
                 Some("immutable") if runes => an.warn(Some(P::Attr(a)), warnings::options_deprecated_immutable()),
                 _ => {}
             }

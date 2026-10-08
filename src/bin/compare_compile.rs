@@ -3,13 +3,15 @@
 //!
 //!   cargo run --release --bin compare_compile -- <corpus dir> <oracle out dir>
 //!
-//! VERBOSE=1 prints the first differences; FILTER=<substring> limits the files.
+//! VERBOSE=1 prints the first differences; FILTER=<substring> limits the files. The compile
+//! options the oracle used (`runes`, `customElement`, `experimental.async`) are read from
+//! `options.json` in the oracle's output.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{json, Value};
-use svelte_rs::analyze::{compile_diagnostics, Diagnostic, Position};
+use svelte_rs::analyze::{compile_diagnostics_with, CompileOptions, Diagnostic, Position};
 
 fn pos(p: &Option<Position>) -> Value {
     match p {
@@ -41,6 +43,17 @@ fn main() {
     let out = Path::new(&args[2]);
     let verbose = std::env::var("VERBOSE").is_ok();
     let filter = std::env::var("FILTER").ok();
+    let options = match std::fs::read_to_string(out.join("options.json")) {
+        Ok(json) => {
+            let v: Value = serde_json::from_str(&json).unwrap();
+            CompileOptions {
+                runes: v.get("runes").and_then(Value::as_bool),
+                custom_element: v.get("customElement").and_then(Value::as_bool).unwrap_or(false),
+                experimental_async: v.pointer("/experimental/async").and_then(Value::as_bool).unwrap_or(false),
+            }
+        }
+        Err(_) => CompileOptions::default(),
+    };
 
     let manifest: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
 
@@ -64,7 +77,7 @@ fn main() {
         let filename = Path::new(rel).file_name().unwrap().to_str().unwrap();
 
         let t = std::time::Instant::now();
-        let result = std::panic::catch_unwind(|| compile_diagnostics(&source, filename));
+        let result = std::panic::catch_unwind(|| compile_diagnostics_with(&source, filename, &options));
         total_time += t.elapsed();
 
         let category = if expected.get("error").is_some() {

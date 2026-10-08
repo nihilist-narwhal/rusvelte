@@ -284,8 +284,12 @@ impl<'s> Analyzer<'s> {
                     suspend = true;
                 }
                 if suspend {
-                    // `experimental.async` is off
-                    return Err(e::experimental_async(self.loc(p)));
+                    if !self.experimental_async {
+                        return Err(e::experimental_async(self.loc(p)));
+                    }
+                    if !self.runes {
+                        return Err(e::legacy_await_invalid(self.loc(p)));
+                    }
                 }
                 self.next(p, st)
             }
@@ -517,6 +521,46 @@ impl<'s> Analyzer<'s> {
         let binding = self.binding(b);
         if st.reactive_statement.is_some() && binding.scope == self.module_scope && binding.reassigned {
             self.warn(Some(p), w::reactive_declaration_module_script_dependency());
+        }
+
+        let binding = self.binding(b);
+        if binding.is_template_declaration && self.experimental_async {
+            let binding_scope = binding.scope;
+            let mut snippet_name: Option<&str> = None;
+            for i in (0..self.path.len()).rev() {
+                let parent = self.path[i];
+                let grand_parent = if i >= 1 { Some(self.path[i - 1]) } else { None };
+                if let P::Node(pn) = parent {
+                    if let Node::SnippetBlock { expression, .. } = &self.ast.nodes[pn] {
+                        snippet_name = ident(nodes::template_expr(expression)).map(|i| i.name);
+                        continue;
+                    }
+                }
+                let (Some(name), Some(gp)) = (snippet_name, grand_parent) else { continue };
+                if !matches!(parent, P::Fragment(_) | P::SlotFragment(_)) {
+                    continue;
+                }
+                let gp_el = gp.node().and_then(|g| self.element(g));
+                let is_component = gp_el.is_some_and(|el| matches!(el.kind, "Component" | "SvelteComponent" | "SvelteSelf"));
+                let is_boundary = gp_el.is_some_and(|el| el.kind == "SvelteBoundary") && (name == "failed" || name == "pending");
+                if !is_component && !is_boundary {
+                    continue;
+                }
+                let same = if is_component {
+                    let gn = gp.node().unwrap();
+                    self.sc
+                        .component_scopes
+                        .get(&gn)
+                        .and_then(|s| s.iter().find(|(k, _)| *k == "default"))
+                        .is_some_and(|(_, s)| *s == binding_scope)
+                } else {
+                    self.sc.map.get(&parent.key()) == Some(&binding_scope)
+                };
+                if same {
+                    return Err(e::const_tag_invalid_reference(node.err_loc(), node.name));
+                }
+                break;
+            }
         }
         Ok(())
     }

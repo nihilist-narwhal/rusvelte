@@ -79,6 +79,8 @@ pub struct Binding<'s> {
     pub legacy_dependencies: Vec<BindingId>,
     pub prop_alias: Option<&'s str>,
     pub inside_rest: bool,
+    /// declared by a VariableDeclaration (`metadata.is_template_declaration`)
+    pub is_template_declaration: bool,
     pub mutated: bool,
     pub reassigned: bool,
 }
@@ -346,6 +348,7 @@ impl<'s> Scopes<'s> {
             legacy_dependencies: Vec::new(),
             prop_alias: None,
             inside_rest: false,
+            is_template_declaration: false,
             mutated: false,
             reassigned: false,
         };
@@ -982,7 +985,8 @@ impl<'s> ScopeBuilder<'s, '_> {
                         let init = declarator.init.as_ref().map(nodes::expr);
                         for id in extract_identifiers(nodes::binding(&declarator.id)) {
                             let id = with_type_annotation(id, &declarator.id, &declarator.type_annotation);
-                            self.scopes.declare(scope, id, Kind::Normal, kind, init)?;
+                            let b = self.scopes.declare(scope, id, Kind::Normal, kind, init)?;
+                            self.scopes.binding_mut(b).is_template_declaration = true;
                         }
                     }
                     self.next(p, scope)
@@ -1016,7 +1020,8 @@ impl<'s> ScopeBuilder<'s, '_> {
                 if let Node::ConstTag { id, init, .. } = &self.ast.nodes[n] {
                     let init = Some(nodes::template_expr(init));
                     for ident in extract_identifiers(nodes::pattern_p(id)) {
-                        self.scopes.declare(scope, ident, Kind::Template, DeclKind::Const, init)?;
+                        let b = self.scopes.declare(scope, ident, Kind::Template, DeclKind::Const, init)?;
+                        self.scopes.binding_mut(b).is_template_declaration = true;
                     }
                 }
                 self.next(p, scope)
