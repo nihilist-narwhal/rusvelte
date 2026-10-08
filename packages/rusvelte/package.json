@@ -1,0 +1,20 @@
+{
+  "name": "rusvelte",
+  "version": "0.0.1",
+  "description": "The Svelte 5 compiler ported to Rust, as a drop-in for svelte/compiler in vite-plugin-svelte",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./native.js",
+    "./register": "./register.js",
+    "./vite": "./vite.js"
+  },
+  "files": ["*.js", "*.node", "README.md"],
+  "engines": { "node": ">=22.15" },
+  "scripts": {
+    "build": "cargo build --release -p rusvelte-node && node build.js"
+  },
+  "peerDependencies": {
+    "svelte": "5.57.2"
+  }
+}

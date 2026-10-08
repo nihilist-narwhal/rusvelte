@@ -1,0 +1,19 @@
+[package]
+name = "rusvelte-node"
+version = "0.1.0"
+edition = "2024"
+description = "Node binding of rusvelte (the npm package lives in packages/rusvelte)"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rusvelte = { path = "../.." }
+napi = { version = "3", default-features = false, features = ["napi4"] }
+napi-derive = "3"
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"
