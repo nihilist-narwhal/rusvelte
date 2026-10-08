@@ -115,6 +115,13 @@ for (const rel of files) {
 		const r = compile(source, options);
 		compile_ms += performance.now() - t;
 		result.css = r.css ? { code: r.css.code, hasGlobal: r.css.hasGlobal } : null;
+		// injected styles: the `$$css` object in the JS (without the dev-mode source map comment,
+		// which isn't ported)
+		const m = r.js.code.match(/const \$\$css = \{\s*hash: ('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"),\s*code: ('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\s*\};/);
+		if (m) {
+			const code = new Function('return ' + m[2])().replace(/\n\/\*# sourceMappingURL=[^]*\*\/$/, '');
+			result.injected = { hash: new Function('return ' + m[1])(), code };
+		}
 		if (r.css) with_css++;
 	} catch (e) {
 		errors++;
