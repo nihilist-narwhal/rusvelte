@@ -153,7 +153,7 @@ fn index_statement(s: &Node, out: &mut FxHashMap<usize, Node>) {
 }
 
 /// `server_component(analysis, options)`
-pub fn server_component(s: &mut Server) -> Node {
+pub fn server_component(s: &mut Server, inject_css: Option<(String, String)>) -> Node {
     let module_scope = s.an.module_scope;
 
     // the instance script, converted once; `instance_body` refers to its statements
@@ -162,6 +162,18 @@ pub fn server_component(s: &mut Server) -> Node {
         let mut index = FxHashMap::default();
         index_nodes(p, &mut index);
         s.instance_nodes = index;
+    }
+
+    // the assignments of legacy reactive statements (`$: x = ...`), by statement start
+    let mut reactive_assignments: Vec<(usize, Vec<Node>)> = Vec::new();
+    if let Some(NodeKind::Program(p)) = instance_program.as_ref().map(|p| &p.kind) {
+        for statement in &p.body {
+            let NodeKind::LabeledStatement(l) = &statement.kind else { continue };
+            let NodeKind::ExpressionStatement(e) = &l.body.kind else { continue };
+            let NodeKind::AssignmentExpression(a) = &e.expression.kind else { continue };
+            let start = statement.span.map_or(0, |s| s.start as usize);
+            reactive_assignments.push((start, super::js::extract_identifiers(&a.left).into_iter().cloned().collect()));
+        }
     }
 
     let mut hoisted = vec![b::import_all("$", "svelte/internal/server")];
@@ -238,11 +250,23 @@ pub fn server_component(s: &mut Server) -> Node {
     }
 
     // legacy reactive statements, in order
+    let mut legacy_reactive_declarations = Vec::new();
     let order: Vec<u32> = s.an.reactive_statements.iter().map(|rs| rs.node_start as u32).collect();
     for start in order {
+        if let Some((_, ids)) = reactive_assignments.iter().find(|(k, _)| *k == start as usize) {
+            for id in ids {
+                let name = super::js::ident(id).unwrap_or("");
+                if s.an.sc.get(s.an.instance_scope, name).is_some_and(|b| s.binding(b).kind == Kind::LegacyReactive) {
+                    legacy_reactive_declarations.push(b::declarator(id.clone(), None));
+                }
+            }
+        }
         if let Some((_, statement)) = s.legacy_reactive_statements.iter().find(|(k, _)| *k == start) {
             instance_body.push(statement.clone());
         }
+    }
+    if !legacy_reactive_declarations.is_empty() {
+        instance_body.insert(0, b::declaration("let", legacy_reactive_declarations));
     }
 
     // store subscriptions
@@ -307,20 +331,71 @@ pub fn server_component(s: &mut Server) -> Node {
         component_block = b::block(vec![b::stmt(b::call("$$renderer.component", args))]);
     }
 
-    if s.an.uses_slots {
-        if let NodeKind::BlockStatement(bl) = &mut component_block.kind {
-            bl.body.insert(0, b::r#const(b::id("$$slots"), b::call("$.sanitize_slots", vec![b::id("$$props")])));
+    let NodeKind::BlockStatement(block) = &mut component_block.kind else { unreachable!() };
+    if s.an.uses_rest_props {
+        let mut named_props: Vec<String> = s.an.exports.iter().map(|(name, alias)| alias.clone().unwrap_or_else(|| name.clone())).collect();
+        for (name, &bid) in s.an.sc.scope(s.an.instance_scope).declarations.iter() {
+            let binding = s.binding(bid);
+            if binding.kind == Kind::BindableProp {
+                named_props.push(binding.prop_alias.unwrap_or(name).to_string());
+            }
         }
+        block.body.insert(
+            0,
+            b::r#const(
+                b::id("$$restProps"),
+                b::call("$.rest_props", vec![b::id("$$sanitized_props"), b::array(named_props.iter().map(|n| b::literal(n.as_str())).collect::<Vec<_>>())]),
+            ),
+        );
+    }
+    if s.an.uses_props || s.an.uses_rest_props {
+        block.body.insert(0, b::r#const(b::id("$$sanitized_props"), b::call("$.sanitize_props", vec![b::id("$$props")])));
+    }
+    if s.an.uses_slots {
+        block.body.insert(0, b::r#const(b::id("$$slots"), b::call("$.sanitize_slots", vec![b::id("$$props")])));
     }
 
     let mut body = std::mem::take(&mut s.hoisted);
     body.extend(program_body(module));
 
-    let should_inject_props = should_inject_context || has_props || s.an.needs_props || s.an.uses_slots || !s.an.slot_names.is_empty();
+    if let Some((hash, code)) = inject_css {
+        body.push(b::r#const(b::id("$$css"), b::object(vec![b::init("hash", b::literal(hash.as_str())), b::init("code", b::literal(code.as_str()))])));
+        block.body.insert(0, b::stmt(b::call("$$renderer.global.css.add", vec![b::id("$$css")])));
+    }
+
+    let should_inject_props = should_inject_context
+        || has_props
+        || s.an.needs_props
+        || s.an.uses_props
+        || s.an.uses_rest_props
+        || s.an.uses_slots
+        || !s.an.slot_names.is_empty();
     let params = if should_inject_props { vec![b::id("$$renderer"), b::id("$$props")] } else { vec![b::id("$$renderer")] };
     let component_function = b::function_declaration(b::id(s.an.name.as_str()), params, component_block);
 
-    if s.dev {
+    if s.options.component_api_4 {
+        body.insert(0, b::imports(&[("render", "$$_render")], "svelte/server"));
+        body.push(component_function);
+        body.push(b::stmt(b::assignment(
+            "=",
+            b::member_id(&format!("{}.render", s.an.name)),
+            b::r#function(
+                None,
+                vec![b::id("$$props"), b::id("$$opts")],
+                b::block(vec![b::r#return(b::call(
+                    "$$_render",
+                    vec![
+                        b::id(s.an.name.as_str()),
+                        b::object(vec![
+                            b::init("props", b::id("$$props")),
+                            b::init("context", b::member_with(b::id("$$opts"), b::id("context"), false, true)),
+                        ]),
+                    ],
+                ))]),
+            ),
+        )));
+        body.push(b::export_default(b::id(s.an.name.as_str())));
+    } else if s.dev {
         body.push(component_function);
         body.push(b::stmt(b::assignment(
             "=",

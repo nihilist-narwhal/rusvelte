@@ -283,6 +283,31 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
         })
         .collect();
 
+        // styles injected into the JS (`css: 'injected'`, client custom elements)
+        let inject_css = match (&root.css, &analysis.css) {
+            (Some(sheet), Some(meta))
+            if (options.generate == options::Generate::Client && (combined.css_injected || analysis.custom_element))
+                || (options.generate == options::Generate::Server && combined.css_injected && !analysis.custom_element) => {
+                let (mut code, mappings) = css::render_stylesheet_with_mappings(source, &sheet.css, meta, &css::RenderOptions { hash: &css_hash, minify: !options.dev, dev: options.dev })
+                    .map_err(|e| CompileError { code: "magic_string", message: e.0, position: None })?;
+                // in dev, the injected styles carry their source map
+                if options.dev && !code.is_empty() {
+                    let basename = options.filename.rsplit(['/', '\\']).next().unwrap_or("").to_string();
+                    let map = serde_json::json!({
+                        "version": 3,
+                        "file": basename,
+                        "sources": [basename],
+                        "sourcesContent": [source],
+                        "names": [],
+                        "mappings": mappings,
+                    });
+                    code.push_str(&format!("\n/*# sourceMappingURL=data:application/json;charset=utf-8;base64,{} */", base64(map.to_string().as_bytes())));
+                }
+                Some((css_hash.clone(), code))
+            }
+            _ => None,
+        };
+
     let program = match options.generate {
         options::Generate::Server => {
             let conv = crate::estree::convert::Converter::new(&locator, root.ts);
@@ -303,31 +328,9 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
                 synthetic_class,
                 synthetic_style,
             };
-            server::server_component(&mut s)
+            server::server_component(&mut s, inject_css)
         }
         options::Generate::Client => {
-            // styles injected into the JS (`css: 'injected'`, custom elements)
-            let inject_css = match (&root.css, &analysis.css) {
-                (Some(sheet), Some(meta)) if combined.css_injected || analysis.custom_element => {
-                    let (mut code, mappings) = css::render_stylesheet_with_mappings(source, &sheet.css, meta, &css::RenderOptions { hash: &css_hash, minify: !options.dev, dev: options.dev })
-                        .map_err(|e| CompileError { code: "magic_string", message: e.0, position: None })?;
-                    // in dev, the injected styles carry their source map
-                    if options.dev && !code.is_empty() {
-                        let basename = options.filename.rsplit(['/', '\\']).next().unwrap_or("").to_string();
-                        let map = serde_json::json!({
-                            "version": 3,
-                            "file": basename,
-                            "sources": [basename],
-                            "sourcesContent": [source],
-                            "names": [],
-                            "mappings": mappings,
-                        });
-                        code.push_str(&format!("\n/*# sourceMappingURL=data:application/json;charset=utf-8;base64,{} */", base64(map.to_string().as_bytes())));
-                    }
-                    Some((css_hash.clone(), code))
-                }
-                _ => None,
-            };
             let conv = crate::estree::convert::Converter::new(&locator, root.ts);
             let mut c = client::Client {
                 an: &mut analysis.an,
