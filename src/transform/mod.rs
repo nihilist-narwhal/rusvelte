@@ -167,3 +167,33 @@ pub fn compile_styles(source: &str, filename: &str, options: &CssOptions) -> Res
         Ok(CssResult { css: Some(CssOutput { code, has_global: analysis.css_has_global }), injected: None })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_matches_js() {
+        assert_eq!(hash("main.svelte"), "70s021");
+        assert_eq!(hash(""), "45h");
+        assert_eq!(hash("a\r\nb"), "2nhu6q");
+        assert_eq!(hash("ünïcödé 😀 .foo { color: red }"), "yvms2h");
+        assert_eq!(hash(&"x".repeat(1000)), "615edh");
+    }
+
+    #[test]
+    fn compile_css_scopes_and_prunes() {
+        let source = "<div class=\"a\">x</div><style>.a { color: red; } .b { color: blue; } @keyframes k {} .a { animation: k 1s; }</style>";
+        let out = compile_css(source, "A.svelte", &CssOptions::default()).unwrap().unwrap();
+        let h = format!("svelte-{}", hash("A.svelte"));
+        assert_eq!(
+            out.code,
+            format!(".a.{h} {{ color: red; }} /* (unused) .b {{ color: blue; }}*/ @keyframes {h}-k {{}} .a.{h} {{ animation: {h}-k 1s; }}")
+        );
+        assert!(!out.has_global);
+        // (checked against svelte 5.57.2)
+        let injected = compile_styles(source, "A.svelte", &CssOptions { css: CssMode::Injected, ..Default::default() }).unwrap();
+        assert!(injected.css.is_none());
+        assert_eq!(injected.injected.unwrap().code, format!(".a.{h} {{color:red;}} @keyframes {h}-k {{}}.a.{h} {{ animation: {h}-k 1s;}}"));
+    }
+}

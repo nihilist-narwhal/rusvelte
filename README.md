@@ -24,6 +24,7 @@ original by diffing outputs over large corpora.
 | svelte-check-rs, TypeScript diagnostics | identical to `svelte-check --tsgo` 4.7.6 on the private app (2,477 diagnostics under strict options) and Windmill (7,922) |
 | svelte-check-rs, compiler warnings | identical to svelte-check on the private app and Windmill (89 warnings) |
 | svelte-check-rs, CSS diagnostics (`css`/`scss`/`less`) | identical to svelte-check on Windmill (96 warnings in all); the CSS linter matches svelte-check's on 4,567/4,567 Svelte tests, Windmill, the private app and 47,072 synthetic files |
+| CSS output (`css.code`, `css.hasGlobal`, injected styles) | byte-identical on every component of the code generation oracle (Svelte test suites 6,929 compilations, the private app 342, Windmill 3,964), plus `dev`/`css: 'injected'` variants and 36,000 synthetic files (1 differs: a JS parse difference) |
 
 The remaining svelte2tsx mismatches are 2 scripts that oxc can't parse but TypeScript
 recovers from, and 2 samples where npm 0.7.61 throws but the current language-tools source
@@ -83,6 +84,14 @@ Options follow svelte-check:
 [tsc-rs](https://github.com/pingdotgg/ts-rust), and `SVELTE_CHECK_TSGO_ARGS` passes it extra
 flags (`--singleThreaded` makes results independent of how files are split between checkers).
 
+## CSS output
+
+`svelte_rs::compile_css(source, filename, &CssOptions)` returns `result.css` of `compile`
+(`code` and `has_global`), and `transform::compile_styles` also the stylesheet injected into
+the JS with `css: 'injected'` or custom elements. It is a port of `render_stylesheet`
+(`src/transform/css.rs`), with the `cssHash`, `css`, `dev`, `customElement` and `rootDir`
+options. Source maps aren't produced yet.
+
 ## Analysis
 
 `svelte_rs::analyze::compile_diagnostics(source, filename)` reproduces the `warnings` of
@@ -116,6 +125,7 @@ first difference.
 | `oracle/gen_svelte2tsx.mjs <corpus> <out> [check\|samples\|svelte-check]` | `compare_s2t` (full svelte2tsx) |
 | `oracle/gen_kit.mjs` | `compare_kit` (SvelteKit files) |
 | `oracle/css_oracle.cjs` (and `gen_css_samples.mjs` for synthetic corpora) | `compare_css` (CSS diagnostics) |
+| `oracle/gen_css_output.mjs <corpus> <out> [base options]`, or `gen_codegen.mjs` | `compare_css_output` (CSS output) |
 
 `tools/check_sanity.py <language-tools> <node_modules>` runs svelte-check's own sanity
 fixtures against svelte-check-rs.
@@ -141,6 +151,8 @@ fixtures against svelte-check-rs.
   - `src/svelte2tsx/script/`: the script half, which walks oxc's AST the way svelte2tsx
     walks TypeScript's.
   - `src/svelte2tsx/kit.rs`, `rewrite_imports.rs`: SvelteKit files and external imports.
+- **Code generation**
+  - `src/transform/`: port of `phases/3-transform`; so far `css/index.js` (`render_stylesheet`).
 - **CSS diagnostics**
   - `src/css_lint/`: port of vscode-css-languageservice's CSS/SCSS/LESS parsers and lint
     rules, and of svelte-language-server's `<style>` extraction. `tools/gen_css_data.mjs`

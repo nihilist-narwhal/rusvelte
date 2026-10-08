@@ -8,6 +8,8 @@ mod a11y;
 mod a11y_data;
 mod comments;
 pub(crate) mod css;
+pub mod blockers;
+pub mod evaluate;
 pub(crate) mod acorn;
 mod nodes;
 mod scope;
@@ -119,13 +121,44 @@ pub fn compile_diagnostics_with(
     }
 }
 
-/// `ExpressionMetadata` (only what diagnostics depend on)
-#[derive(Default, Debug)]
-pub(crate) struct ExprMeta {
+/// `ExpressionMetadata`
+#[derive(Default, Debug, Clone)]
+pub struct ExprMeta {
+    /// references state directly, or might (via member/call expressions)
+    pub has_state: bool,
+    /// involves a call expression
+    pub has_call: bool,
     pub has_await: bool,
-    /// whether `dependencies` are collected (only legacy each blocks need them)
-    pub track_deps: bool,
+    /// an `await` restores the reaction context afterwards
+    pub has_pickled_await: bool,
+    pub has_member_expression: bool,
+    /// includes an assignment or an update
+    pub has_assignment: bool,
+    /// bindings referenced eagerly (not inside functions), in insertion order
     pub dependencies: Vec<BindingId>,
+    pub references: Vec<BindingId>,
+}
+
+impl ExprMeta {
+    /// `merge(other)`
+    pub fn merge(&mut self, other: &ExprMeta) {
+        self.has_state |= other.has_state;
+        self.has_call |= other.has_call;
+        self.has_await |= other.has_await;
+        self.has_pickled_await |= other.has_pickled_await;
+        self.has_member_expression |= other.has_member_expression;
+        self.has_assignment |= other.has_assignment;
+        for d in &other.dependencies {
+            if !self.dependencies.contains(d) {
+                self.dependencies.push(*d);
+            }
+        }
+        for r in &other.references {
+            if !self.references.contains(r) {
+                self.references.push(*r);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -149,6 +182,8 @@ pub(crate) struct State<'s> {
     /// index into `Analyzer::state_fields`
     pub state_fields: u32,
     pub function_depth: u32,
+    /// `derived_function_depth` (-1 outside `$derived`/`{@const}`)
+    pub derived_function_depth: i64,
     /// index into `Analyzer::reactive_statements`
     pub reactive_statement: Option<u32>,
 }
@@ -213,6 +248,16 @@ pub(crate) struct Analyzer<'s> {
     pub props_id: Option<Id<'s>>,
     pub has_props_rune: bool,
     pub metas: Vec<ExprMeta>,
+    /// `analysis.instance_body`
+    pub instance_body: blockers::InstanceBody<'s>,
+    /// `analysis.needs_context`
+    pub needs_context: bool,
+    /// `analysis.pickled_awaits` (AwaitExpression keys)
+    pub pickled_awaits: FxHashSet<usize>,
+    /// `analysis.async_deriveds`: `$derived(...)` call key → its metadata
+    pub async_deriveds: Vec<(usize, u32)>,
+    /// node key → its `metadata.expression` (index into `metas`)
+    pub meta_of: FxHashMap<usize, u32>,
     pub component_slots: Vec<FxHashSet<String>>,
     pub state_fields: Vec<Vec<StateField>>,
     pub reactive_statements: Vec<ReactiveStatement>,
@@ -289,9 +334,12 @@ impl<'s> Analyzer<'s> {
         self.sc.binding(b)
     }
 
-    pub fn new_meta(&mut self) -> u32 {
+    /// A new `ExpressionMetadata`, as `owner.metadata.expression`
+    pub fn new_meta(&mut self, owner: P<'s>) -> u32 {
         self.metas.push(ExprMeta::default());
-        (self.metas.len() - 1) as u32
+        let id = (self.metas.len() - 1) as u32;
+        self.meta_of.insert(owner.key(), id);
+        id
     }
 
     pub fn ty(&self, p: P) -> &'static str {
@@ -442,6 +490,11 @@ pub(crate) fn analyze_component<'s>(
         props_id: None,
         has_props_rune: false,
         metas: Vec::new(),
+        needs_context: false,
+        instance_body: blockers::InstanceBody::default(),
+        pickled_awaits: FxHashSet::default(),
+        async_deriveds: Vec::new(),
+        meta_of: FxHashMap::default(),
         component_slots: Vec::new(),
         state_fields: vec![Vec::new()],
         reactive_statements: Vec::new(),
@@ -596,6 +649,8 @@ pub(crate) fn analyze_component<'s>(
         }
     }
 
+    blockers::calculate_blockers(&mut an);
+
     if runes {
         if let Some(&r) = an.sc.scope(module.scope).references.get("$$props").map(|r| &r[0]) {
             return Err(e::legacy_props_invalid(an.sc.refs[r as usize].node.err_loc()));
@@ -624,6 +679,7 @@ pub(crate) fn analyze_component<'s>(
             expression: None,
             state_fields: 0,
             function_depth: an.sc.scope(scope).function_depth,
+            derived_function_depth: -1,
             reactive_statement: None,
         };
         an.has_props_rune = false;
