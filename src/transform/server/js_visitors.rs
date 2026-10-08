@@ -212,7 +212,7 @@ impl<'a, 's> Server<'a, 's> {
                     return b::call(if u.prefix { "$.update_store_pre" } else { "$.update_store" }, args);
                 }
                 if binding.kind == Kind::Derived {
-                    let mut args = vec![b::id(binding.node.name)];
+                    let mut args = vec![self.id_node(binding.node)];
                     if decrement {
                         args.push(b::literal(-1.0));
                     }

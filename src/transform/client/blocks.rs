@@ -905,7 +905,7 @@ impl<'a, 's> Client<'a, 's> {
         let params: Vec<Node> = match parameters {
             Some(arrow) => {
                 let mut conv = crate::estree::convert::Converter::new(self.locator, self.an.root.ts);
-                conv.preserve_parens = false;
+                conv.preserve_parens = true;
                 match conv.expression(&arrow.expr).kind {
                     NodeKind::ArrowFunctionExpression(a) => a.params,
                     _ => vec![],
