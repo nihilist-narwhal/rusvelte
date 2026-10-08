@@ -130,11 +130,13 @@ pub struct Scanner<'a> {
     /// texts of tokens that differ from their source
     texts: Vec<u16>,
     next_id: u32,
+    /// an escape was seen in the current token (only then can its text differ from the source)
+    escaped: bool,
 }
 
 impl<'a> Scanner<'a> {
     pub fn new(src: &'a [u16], dialect: Dialect) -> Self {
-        Scanner { src, pos: 0, in_url: false, dialect, buf: Vec::new(), texts: Vec::new(), next_id: 1 }
+        Scanner { src, pos: 0, in_url: false, dialect, buf: Vec::new(), texts: Vec::new(), next_id: 1, escaped: false }
     }
 
     /// The token's `text`
@@ -218,7 +220,11 @@ impl<'a> Scanner<'a> {
     fn finish_token(&mut self, offset: usize, ty: TT, with_text: bool) -> Token {
         let id = self.next_id;
         self.next_id += 1;
-        let text = if with_text && !self.buf.is_empty() && self.buf.as_slice() != self.substring(offset, self.pos) {
+        let text = if with_text
+            && self.escaped
+            && !self.buf.is_empty()
+            && self.buf.as_slice() != self.substring(offset, self.pos)
+        {
             let start = self.texts.len() as u32;
             self.texts.extend_from_slice(&self.buf);
             TextRef::Buf(start, self.buf.len() as u32)
@@ -231,6 +237,7 @@ impl<'a> Scanner<'a> {
     pub fn scan_unquoted_string(&mut self) -> Option<Token> {
         let offset = self.pos;
         self.buf.clear();
+        self.escaped = false;
         if self.unquoted_string() {
             return Some(self.finish_token(offset, TT::UnquotedString, true));
         }
@@ -247,6 +254,7 @@ impl<'a> Scanner<'a> {
         }
         let offset = self.pos;
         self.buf.clear();
+        self.escaped = false;
         if self.eos() {
             return self.finish_token(offset, TT::EOF, false);
         }
@@ -470,6 +478,7 @@ impl<'a> Scanner<'a> {
     fn escape(&mut self, include_newlines: bool) -> bool {
         let mut ch = self.peek(0);
         if ch == BSL {
+            self.escaped = true;
             self.advance(1);
             ch = self.peek(0);
             let mut hex_count = 0;

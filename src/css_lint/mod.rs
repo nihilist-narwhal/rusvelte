@@ -79,7 +79,11 @@ pub fn style_diagnostics(svelte_source: &str) -> Vec<CssDiagnostic> {
     if !svelte_source.contains("<style") {
         return Vec::new();
     }
-    let text: Vec<u16> = svelte_source.encode_utf16().collect();
+    let text: Vec<u16> = if svelte_source.is_ascii() {
+        svelte_source.bytes().map(u16::from).collect()
+    } else {
+        svelte_source.encode_utf16().collect()
+    };
     style_diagnostics_utf16(&text)
 }
 
@@ -108,24 +112,20 @@ pub fn style_diagnostics_utf16(text: &[u16]) -> Vec<CssDiagnostic> {
     if markers.is_empty() {
         return Vec::new();
     }
-    let parent_lines = LineOffsets::new(text);
-    let fragment_lines = LineOffsets::new(fragment);
+    // positions never go past the style content, so the line starts up to there suffice (the
+    // content ends before `</style` or at the end of the file, never inside a `\r\n`)
+    let parent_lines = LineOffsets::new(&text[..end]);
     markers
         .into_iter()
         .map(|m| {
+            // `positionAt` clamps to the fragment
             let s = m.offset.clamp(0, fragment.len() as i32) as usize;
             let e = (m.offset + m.length).clamp(0, fragment.len() as i32) as usize;
-            let frag_range = Range { start: fragment_lines.position_at(s), end: fragment_lines.position_at(e) };
-            // `getOriginalPosition`: parent offset = style start + fragment offset
-            let mut range = Range { start: parent_lines.position_at(start + s), end: parent_lines.position_at(start + e) };
-            // `checkRangeLength`
-            if range.start.line == range.end.line
-                && frag_range.start.line == frag_range.end.line
-                && range.end.character as i64 - range.start.character as i64
-                    == frag_range.end.character as i64 - frag_range.start.character as i64 - 1
-            {
-                range.end.character += 1;
-            }
+            // `getOriginalPosition`: parent offset = style start + fragment offset.
+            // (`mapRangeToOriginal`'s `checkRangeLength` never applies: the fragment is a slice
+            // of the parent that doesn't start or end inside a `\r\n`, so a single-line range has
+            // the same length in both.)
+            let range = Range { start: parent_lines.position_at(start + s), end: parent_lines.position_at(start + e) };
             CssDiagnostic {
                 range,
                 severity: match m.level {
@@ -146,27 +146,35 @@ fn validate(css: &[u16], dialect: Dialect) -> Option<Vec<lint::Marker>> {
     let mut p = parser::Parser::new(css, dialect);
     let root = p.parse_stylesheet();
     let ast = p.ast;
-    let mut markers = Vec::new();
-    collect_parse_errors(&ast, root, &mut markers);
-    let lint = lint::lint(&ast, css, root).ok()?;
-    markers.extend(lint);
+    let mut markers = collect_parse_errors(&ast, root);
+    let lint = lint::lint(&ast, css, root);
+    ast.recycle();
+    markers.extend(lint.ok()?);
     Some(markers)
 }
 
-/// `ParseErrorCollector`
-fn collect_parse_errors(ast: &nodes::Ast, node: nodes::NodeId, out: &mut Vec<lint::Marker>) {
-    for issue in &ast.get(node).issues {
-        out.push(lint::Marker {
+/// `ParseErrorCollector`: the issues of the nodes in the tree, in tree order (pre-order, and
+/// insertion order within a node). Issues of nodes that were dropped (failed attempts) don't
+/// count.
+fn collect_parse_errors(ast: &nodes::Ast, root: nodes::NodeId) -> Vec<lint::Marker> {
+    let mut keyed: Vec<(Vec<u32>, &nodes::Issue)> = Vec::new();
+    for (node, issue) in ast.all_issues() {
+        if let Some(path) = ast.tree_path(root, *node) {
+            keyed.push((path, issue));
+        }
+    }
+    // stable, so the issues of one node keep their order
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed
+        .into_iter()
+        .map(|(_, issue)| lint::Marker {
             code: issue.error.id(),
             message: issue.error.message().to_string(),
             level: lint::Level::Error,
             offset: issue.offset,
             length: issue.length,
-        });
-    }
-    for &child in &ast.get(node).children {
-        collect_parse_errors(ast, child, out);
-    }
+        })
+        .collect()
 }
 
 /// svelte-language-server's `getLineOffsets` / `positionAt`

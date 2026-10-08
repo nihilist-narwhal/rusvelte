@@ -32,6 +32,8 @@ fn run() {
         serde_json::from_str(&fs::read_to_string(&args[2]).unwrap()).unwrap();
     let filter = args.get(3).cloned();
     let verbose = std::env::var("VERBOSE").is_ok();
+    // `REPEAT=n` runs style_diagnostics n times per file (for profiling; the reported time is the total)
+    let repeat: u32 = std::env::var("REPEAT").ok().and_then(|r| r.parse().ok()).unwrap_or(1);
 
     let (mut total, mut pass, mut with_diags, mut with_diags_pass, mut n_diags) = (0, 0, 0, 0, 0);
     let mut time = Duration::ZERO;
@@ -44,6 +46,9 @@ fn run() {
         let source = fs::read_to_string(&path).unwrap();
         let t = Instant::now();
         let actual = std::panic::catch_unwind(|| style_diagnostics(&source));
+        for _ in 1..repeat {
+            std::hint::black_box(style_diagnostics(&source));
+        }
         time += t.elapsed();
         let actual = match actual {
             Ok(a) => Value::Array(a.iter().map(to_json).collect()),

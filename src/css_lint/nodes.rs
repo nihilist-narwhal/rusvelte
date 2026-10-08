@@ -302,6 +302,7 @@ pub enum Field {
     Guard,
 }
 
+
 /// A parse error marker (`Marker` with `Level.Error`)
 #[derive(Clone, Copy, Debug)]
 pub struct Issue {
@@ -310,34 +311,86 @@ pub struct Issue {
     pub length: i32,
 }
 
+const NONE: NodeId = NodeId::MAX;
+const MAX_FIELDS: usize = 4;
+
+fn opt(id: NodeId) -> Option<NodeId> {
+    if id == NONE { None } else { Some(id) }
+}
+
+/// A node. Children are an intrusive doubly linked list (no allocation per node).
 pub struct NodeData {
     pub class: Class,
     pub ty: NodeType,
-    pub offset: i32,
-    pub length: i32,
-    pub parent: Option<NodeId>,
-    pub children: Vec<NodeId>,
-    pub fields: Vec<(Field, NodeId)>,
-    pub issues: Vec<Issue>,
-    /// `Declaration.colonPosition`
-    pub colon_position: Option<i32>,
+    n_fields: u8,
+    has_issues: bool,
     /// `VariableDeclaration.needsSemicolon`
     pub needs_semicolon: bool,
+    pub offset: i32,
+    pub length: i32,
+    parent: NodeId,
+    first_child: NodeId,
+    last_child: NodeId,
+    next: NodeId,
+    prev: NodeId,
+    field_names: [Field; MAX_FIELDS],
+    field_values: [NodeId; MAX_FIELDS],
+    /// `Declaration.colonPosition`
+    pub colon_position: Option<i32>,
 }
 
 impl NodeData {
     pub fn end(&self) -> i32 {
         self.offset + self.length
     }
+
+    pub fn parent(&self) -> Option<NodeId> {
+        opt(self.parent)
+    }
 }
 
 pub struct Ast {
-    pub nodes: Vec<NodeData>,
+    nodes: Vec<NodeData>,
+    /// issues in the order they were added (`node.issues` of all nodes)
+    issues: Vec<(NodeId, Issue)>,
+}
+
+pub struct Children<'a> {
+    ast: &'a Ast,
+    next: NodeId,
+}
+
+impl Iterator for Children<'_> {
+    type Item = NodeId;
+    fn next(&mut self) -> Option<NodeId> {
+        let cur = opt(self.next)?;
+        self.next = self.ast.get(cur).next;
+        Some(cur)
+    }
+}
+
+thread_local! {
+    /// the arena of the previous parse on this thread, reused to avoid reallocating
+    static CACHE: std::cell::RefCell<(Vec<NodeData>, Vec<(NodeId, Issue)>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
 impl Ast {
+    /// An empty AST, reusing this thread's cached arena
     pub fn new() -> Self {
-        Ast { nodes: Vec::with_capacity(256) }
+        let (mut nodes, mut issues) = CACHE.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        nodes.clear();
+        issues.clear();
+        Ast { nodes, issues }
+    }
+
+    /// Give the arena back for the next parse on this thread
+    pub fn recycle(mut self) {
+        if self.nodes.capacity() > 1 << 20 {
+            return;
+        }
+        self.nodes.clear();
+        self.issues.clear();
+        CACHE.with(|c| *c.borrow_mut() = (self.nodes, self.issues));
     }
 
     pub fn alloc(&mut self, class: Class, ty: NodeType, offset: i32, length: i32) -> NodeId {
@@ -345,14 +398,19 @@ impl Ast {
         self.nodes.push(NodeData {
             class,
             ty: class.fixed_type().unwrap_or(ty),
+            n_fields: 0,
+            has_issues: false,
+            needs_semicolon: true,
             offset,
             length,
-            parent: None,
-            children: Vec::new(),
-            fields: Vec::new(),
-            issues: Vec::new(),
+            parent: NONE,
+            first_child: NONE,
+            last_child: NONE,
+            next: NONE,
+            prev: NONE,
+            field_names: [Field::Selectors; MAX_FIELDS],
+            field_values: [NONE; MAX_FIELDS],
             colon_position: None,
-            needs_semicolon: true,
         });
         id
     }
@@ -375,6 +433,46 @@ impl Ast {
         self.get(id).class
     }
 
+    pub fn children(&self, node: NodeId) -> Children<'_> {
+        Children { ast: self, next: self.get(node).first_child }
+    }
+
+    pub fn child_count(&self, node: NodeId) -> usize {
+        self.children(node).count()
+    }
+
+    pub fn add_issue(&mut self, node: NodeId, issue: Issue) {
+        self.get_mut(node).has_issues = true;
+        self.issues.push((node, issue));
+    }
+
+    /// every `node.issues` entry, in the order they were added
+    pub fn all_issues(&self) -> &[(NodeId, Issue)] {
+        &self.issues
+    }
+
+    /// The child indices from `root` down to `node`, or `None` if `node` isn't in that tree
+    pub fn tree_path(&self, root: NodeId, node: NodeId) -> Option<Vec<u32>> {
+        let mut path = Vec::new();
+        let mut cur = node;
+        while cur != root {
+            let n = self.get(cur);
+            if n.parent == NONE {
+                return None;
+            }
+            let mut index = 0;
+            let mut prev = n.prev;
+            while prev != NONE {
+                index += 1;
+                prev = self.get(prev).prev;
+            }
+            path.push(index);
+            cur = n.parent;
+        }
+        path.reverse();
+        Some(path)
+    }
+
     /// `new Nodelist(parent)`
     pub fn new_nodelist(&mut self, parent: NodeId) -> NodeId {
         let id = self.alloc(Class::Nodelist, NodeType::Undefined, -1, -1);
@@ -385,22 +483,70 @@ impl Ast {
         id
     }
 
+    fn unlink(&mut self, node: NodeId) {
+        let (parent, prev, next) = {
+            let n = self.get(node);
+            (n.parent, n.prev, n.next)
+        };
+        if parent == NONE {
+            return;
+        }
+        if prev == NONE {
+            self.get_mut(parent).first_child = next;
+        } else {
+            self.get_mut(prev).next = next;
+        }
+        if next == NONE {
+            self.get_mut(parent).last_child = prev;
+        } else {
+            self.get_mut(next).prev = prev;
+        }
+        let n = self.get_mut(node);
+        n.prev = NONE;
+        n.next = NONE;
+    }
+
     /// `parent.adoptChild(node, index)`
     pub fn adopt_child(&mut self, parent: NodeId, node: NodeId, index: i32) {
-        if let Some(old) = self.get(node).parent {
-            let siblings = &mut self.get_mut(old).children;
-            if let Some(i) = siblings.iter().position(|&c| c == node) {
-                siblings.remove(i);
+        self.unlink(node);
+        self.get_mut(node).parent = parent;
+        // `splice(index, 0, node)` for index >= 0 (clamped to the length), `push` for -1
+        let mut before = NONE;
+        if index >= 0 {
+            before = self.get(parent).first_child;
+            for _ in 0..index {
+                if before == NONE {
+                    break;
+                }
+                before = self.get(before).next;
             }
         }
-        self.get_mut(node).parent = Some(parent);
-        let children = &mut self.get_mut(parent).children;
-        if index != -1 {
-            // `splice(index, 0, node)` (index is always 0 or 1 here)
-            let i = (index.max(0) as usize).min(children.len());
-            children.insert(i, node);
+        if before == NONE {
+            let last = self.get(parent).last_child;
+            {
+                let n = self.get_mut(node);
+                n.prev = last;
+                n.next = NONE;
+            }
+            if last == NONE {
+                self.get_mut(parent).first_child = node;
+            } else {
+                self.get_mut(last).next = node;
+            }
+            self.get_mut(parent).last_child = node;
         } else {
-            children.push(node);
+            let prev = self.get(before).prev;
+            {
+                let n = self.get_mut(node);
+                n.prev = prev;
+                n.next = before;
+            }
+            self.get_mut(before).prev = node;
+            if prev == NONE {
+                self.get_mut(parent).first_child = node;
+            } else {
+                self.get_mut(prev).next = node;
+            }
         }
     }
 
@@ -414,16 +560,20 @@ impl Ast {
 
     /// Assign `node[field] = child` without attaching
     pub fn set_field(&mut self, node: NodeId, field: Field, child: NodeId) {
-        let fields = &mut self.get_mut(node).fields;
-        if let Some(slot) = fields.iter_mut().find(|(f, _)| *f == field) {
-            slot.1 = child;
+        let n = self.get_mut(node);
+        let len = n.n_fields as usize;
+        if let Some(i) = n.field_names[..len].iter().position(|&f| f == field) {
+            n.field_values[i] = child;
         } else {
-            fields.push((field, child));
+            n.field_names[len] = field;
+            n.field_values[len] = child;
+            n.n_fields += 1;
         }
     }
 
     pub fn field(&self, node: NodeId, field: Field) -> Option<NodeId> {
-        self.get(node).fields.iter().find(|(f, _)| *f == field).map(|&(_, c)| c)
+        let n = self.get(node);
+        n.field_names[..n.n_fields as usize].iter().position(|&f| f == field).map(|i| n.field_values[i])
     }
 
     /// `node.addChild(child)`
@@ -449,31 +599,30 @@ impl Ast {
     }
 
     /// `node.getChild(0)`
-    pub fn child(&self, node: NodeId, index: usize) -> Option<NodeId> {
-        self.get(node).children.get(index).copied()
+    pub fn first_child(&self, node: NodeId) -> Option<NodeId> {
+        opt(self.get(node).first_child)
     }
 
     pub fn has_children(&self, node: NodeId) -> bool {
-        !self.get(node).children.is_empty()
+        self.get(node).first_child != NONE
     }
 
     /// `node.isErroneous(recursive)`
     pub fn is_erroneous(&self, node: NodeId, recursive: bool) -> bool {
-        let n = self.get(node);
-        if !n.issues.is_empty() {
+        if self.get(node).has_issues {
             return true;
         }
-        recursive && n.children.iter().any(|&c| self.is_erroneous(c, true))
+        recursive && self.children(node).any(|c| self.is_erroneous(c, true))
     }
 
     /// `node.getParent()`: the parent, skipping `Nodelist`s
     pub fn get_parent(&self, node: NodeId) -> Option<NodeId> {
-        let mut result = self.get(node).parent;
+        let mut result = self.get(node).parent();
         while let Some(r) = result {
             if self.class(r) != Class::Nodelist {
                 break;
             }
-            result = self.get(r).parent;
+            result = self.get(r).parent();
         }
         result
     }

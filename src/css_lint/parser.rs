@@ -398,7 +398,7 @@ impl<'a> Parser<'a> {
     pub fn mark_error(&mut self, node: NodeId, error: ParseError, resync: Option<&[TT]>, stop: Option<&[TT]>) {
         if self.last_error_token != Some(self.token.id) {
             let (offset, length) = (self.token.offset, self.token.len);
-            self.ast.get_mut(node).issues.push(Issue { error, offset, length });
+            self.ast.add_issue(node, Issue { error, offset, length });
             self.last_error_token = Some(self.token.id);
         }
         if resync.is_some() || stop.is_some() {
@@ -1164,7 +1164,7 @@ impl<'a> Parser<'a> {
         if let Some(names) = names {
             self.set_node(node, Field::Names, Some(names));
         }
-        if (names.is_none() || self.ast.get(names.unwrap()).children.len() == 1) && self.peek(TT::CurlyL) {
+        if (names.is_none() || self.ast.child_count(names.unwrap()) == 1) && self.peek(TT::CurlyL) {
             return Some(self.parse_body(node, DeclFn::LayerDeclaration(is_nested)));
         }
         if !self.accept(TT::SemiColon) {

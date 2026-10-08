@@ -885,6 +885,6 @@ impl<'a> Parser<'a> {
             }
             self.accept(TT::Comma);
         }
-        if self.ast.get(node).children.len() > 1 { Some(node) } else { None }
+        if self.ast.child_count(node) > 1 { Some(node) } else { None }
     }
 }

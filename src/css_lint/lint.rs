@@ -140,7 +140,7 @@ impl<'a> LintVisitor<'a> {
 
     fn accept(&mut self, node: NodeId) -> Result<(), Crash> {
         if self.visit_node(node)? {
-            for &child in &self.ast.get(node).children {
+            for child in self.ast.children(node) {
                 self.accept(child)?;
             }
         }
@@ -162,7 +162,7 @@ impl<'a> LintVisitor<'a> {
     }
 
     fn visit_unknown_at_rule(&mut self, node: NodeId) -> bool {
-        let Some(name) = self.ast.child(node, 0) else { return false };
+        let Some(name) = self.ast.first_child(node) else { return false };
         let text = self.text(name);
         if AT_DIRECTIVES.binary_search(&text.as_str()).is_ok() {
             return false;
@@ -231,7 +231,7 @@ impl<'a> LintVisitor<'a> {
             Some(p) => self.property_name(p),
             None => "unknown".to_string(),
         };
-        if let Some(parent) = self.ast.get(decl).parent
+        if let Some(parent) = self.ast.get(decl).parent()
             && self.ast.class(parent) == Class::Declarations
             && let Some(np) = self.ast.get_parent(parent)
             && self.ast.class(np) == Class::NestedProperties
@@ -256,7 +256,7 @@ impl<'a> LintVisitor<'a> {
     fn visit_font_face(&mut self, node: NodeId) -> bool {
         let Some(declarations) = self.ast.field(node, Field::Declarations) else { return false };
         let (mut defines_src, mut defines_font_family, mut contains_unknowns) = (false, false, false);
-        for &decl in &self.ast.get(declarations).children {
+        for decl in self.ast.children(declarations) {
             if self.is_css_declaration(decl) {
                 let property = self.ast.field(decl, Field::Property).unwrap();
                 let name = self.property_name(property).to_lowercase();
@@ -301,7 +301,7 @@ impl<'a> LintVisitor<'a> {
                 *found = true;
             }
             if !*found {
-                for &c in &this.ast.get(node).children {
+                for c in this.ast.children(node) {
                     walk(this, c, v, found);
                 }
             }
@@ -321,11 +321,9 @@ impl<'a> LintVisitor<'a> {
         // (fullPropertyName, node)
         let property_table: Vec<(String, NodeId)> = self
             .ast
-            .get(declarations)
-            .children
-            .iter()
-            .filter(|&&c| self.ast.class(c).is_declaration())
-            .map(|&c| (self.full_property_name(c).to_lowercase(), c))
+            .children(declarations)
+            .filter(|&c| self.ast.class(c).is_declaration())
+            .map(|c| (self.full_property_name(c).to_lowercase(), c))
             .collect();
 
         let has_display = |v: &str| {
@@ -420,9 +418,9 @@ impl<'a> LintVisitor<'a> {
     /// `getContextualVendorSpecificPseudoElements` (as UTF-16, for `startsWith`)
     fn contextual_vendor_specific_pseudo_elements(&self, node: NodeId) -> Vec<Vec<u16>> {
         fn walk_down(this: &LintVisitor, s: &mut Vec<Vec<u16>>, n: NodeId) {
-            for &child in &this.ast.get(n).children {
+            for child in this.ast.children(n) {
                 if this.ast.ty(child) == NodeType::PseudoSelector
-                    && let Some(&first) = this.ast.get(child).children.first()
+                    && let Some(first) = this.ast.first_child(child)
                 {
                     let c = this.ast.get(first);
                     let text = node_text(this.src, c.offset, c.length).to_vec();
@@ -439,11 +437,11 @@ impl<'a> LintVisitor<'a> {
             if self.ast.ty(n) == NodeType::Ruleset
                 && let Some(selectors) = self.ast.field(n, Field::Selectors)
             {
-                for &selector in &self.ast.get(selectors).children {
+                for selector in self.ast.children(selectors) {
                     walk_down(self, &mut result, selector);
                 }
             }
-            cur = self.ast.get(n).parent;
+            cur = self.ast.get(n).parent();
         }
         result
     }
