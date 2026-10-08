@@ -207,12 +207,12 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
       <div class="legend"><span><i style="background:var(--bar-js)"></i>Official (Node)</span><span><i style="background:var(--accent)"></i>rusvelte</span></div>
       <div class="bars">
         <div class="bar-row">
-          <div class="label"><span>Production <code>vite build</code>, Windmill</span><span>81.8 s → 57.9 s</span></div>
-          <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:70.8%"></div>
+          <div class="label"><span>Production <code>vite build</code>, Windmill</span><span>69.9 s → 54.8 s</span></div>
+          <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:78.4%"></div>
         </div>
         <div class="bar-row">
-          <div class="label"><span>Production <code>vite build</code>, a 171-component SvelteKit app</span><span>8.0 s → 4.7 s</span></div>
-          <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:59%"></div>
+          <div class="label"><span>Production <code>vite build</code>, a 171-component SvelteKit app</span><span>7.5 s → 4.5 s</span></div>
+          <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:60%"></div>
         </div>
         <div class="bar-row">
           <div class="label"><span>Compile Windmill, client (1,982 components)</span><span>6.0 s → 1.6 s</span></div>
@@ -231,7 +231,7 @@ footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--m
           <div class="bar js" style="width:100%"></div><div class="bar rs" style="width:14%"></div>
         </div>
       </div>
-      <p class="note">On Windmill, most of svelte-check-rs's 9.3 s is the TypeScript 7 type-check itself. In a full <code>vite build</code>, bundling, CSS tooling and preprocessors take most of the time, so whole builds speed up less than the compiler alone; both builds above came out identical to the official ones (apart from SvelteKit's build timestamp). Build times are single runs for Windmill and the median of three for the other app.</p>
+      <p class="note">On Windmill, most of svelte-check-rs's 9.3 s is the TypeScript 7 type-check itself. In a full <code>vite build</code>, bundling, CSS tooling and preprocessors take most of the time, so whole builds speed up less than the compiler alone; both builds above came out identical to the official ones (apart from SvelteKit's build timestamp). Build times are the median of three alternating runs.</p>
     </section>
 
     <section id="how">
