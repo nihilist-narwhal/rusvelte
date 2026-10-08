@@ -52,6 +52,17 @@ impl<'a, 's> Server<'a, 's> {
         out
     }
 
+    /// An identifier of the instance AST, with its location (comments are placed by it)
+    pub fn id_node(&self, id: crate::analyze::scope::Id) -> Node {
+        let mut n = b::id(id.name);
+        if let Some((start, end)) = id.span {
+            n.span = Some(crate::estree::Span::new(start, end));
+            n.loc = Some(self.conv.location(oxc_span::Span::new(start, end)));
+        }
+        n.origin = Some(id.key);
+        n
+    }
+
     fn parent_js(&self) -> Option<&Node> {
         self.path.last().and_then(|p| p.js())
     }
@@ -266,7 +277,7 @@ impl<'a, 's> Server<'a, 's> {
             }
         }
         if !body.declarations.is_empty() {
-            statements.push(b::declaration("var", body.declarations.iter().map(|id| b::declarator(b::id(id.name), None)).collect()));
+            statements.push(b::declaration("var", body.declarations.iter().map(|id| b::declarator(self.id_node(*id), None)).collect()));
         }
         if !body.r#async.is_empty() {
             let mut thunks = Vec::new();
