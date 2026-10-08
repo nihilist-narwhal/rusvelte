@@ -5,7 +5,7 @@
 use std::rc::Rc;
 
 use crate::analyze::nodes::P;
-use crate::ast::{Attr, AttrValue, Chunk, Node as TNode};
+use crate::ast::{Attr, AttrValue, Node as TNode};
 use crate::estree::builders as b;
 use crate::estree::{Node, NodeKind};
 
@@ -359,7 +359,6 @@ impl<'a, 's> Client<'a, 's> {
         } else {
             st.after_update.borrow_mut().push(statement);
         }
-        let _ = Chunk::Text { start: 0, end: 0, raw: "", data: "".into() };
     }
 }
 

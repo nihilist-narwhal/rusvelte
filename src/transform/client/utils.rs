@@ -8,7 +8,7 @@ use crate::ast::Expr;
 use crate::estree::builders as b;
 use crate::estree::{LiteralValue, Node, NodeKind};
 
-use super::super::js::{self, PathNode};
+use super::super::js;
 use super::{Client, State};
 
 /// An entry of the memoizer
@@ -130,8 +130,9 @@ pub enum Memoize {
     Local,
     /// `memoizer.add(value, metadata)`, wrapped with `$.clsx(...)` when the attribute needs it
     StateClsx,
-    /// the component prop rules (`$.get(memoized)`), see `build_component`
-    ComponentProp { wrap_in_derived: bool },
+    /// the component prop rules (`$.get(memoized)`), see `build_component`; `complex` is
+    /// whether a chunk of the attribute is neither an identifier nor a member expression
+    ComponentProp { complex: bool },
     /// SlotElement: `$.get(memoizer.add(...))` for calls and awaits
     SlotProp,
     /// custom css props: `$.get(memoized)` when memoized
@@ -159,7 +160,8 @@ impl<'a, 's> Client<'a, 's> {
                 let m = local.as_mut().expect("local memoizer");
                 m.add(self, value, meta, false).0
             }
-            Memoize::ComponentProp { wrap_in_derived } => {
+            Memoize::ComponentProp { complex } => {
+                let wrap_in_derived = self.an.metas[meta as usize].has_await || complex;
                 let m = local.as_mut().expect("local memoizer");
                 let (memoized, did) = m.add(self, value.clone(), meta, wrap_in_derived);
                 if did { b::call("$.get", vec![memoized]) } else { value }

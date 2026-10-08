@@ -114,9 +114,7 @@ impl<'a, 's> Client<'a, 's> {
                         }
                         _ => false,
                     });
-                    // `metadata.has_await ||` is evaluated per value in the JS; the same for all chunks of one attribute
-                    let any_await = chunks.iter().any(|c| matches!(c, Chunk::Expression { .. }) && self.an.metas[self.meta_of_key(P::Chunk(c).key()) as usize].has_await);
-                    let (v, has_state) = self.build_attribute_value(value, st, Memoize::ComponentProp { wrap_in_derived: any_await || has_complex }, &mut memoizer);
+                    let (v, has_state) = self.build_attribute_value(value, st, Memoize::ComponentProp { complex: has_complex }, &mut memoizer);
                     if has_state {
                         push_prop(&mut props_and_spreads, b::get(name, vec![b::r#return(v)]));
                     } else {

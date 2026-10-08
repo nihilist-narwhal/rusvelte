@@ -136,7 +136,7 @@ impl State {
 }
 
 pub struct Client<'a, 's> {
-    pub an: &'a mut Analyzer<'s>,
+    pub(crate) an: &'a mut Analyzer<'s>,
     pub options: &'a CompileOptions,
     pub conv: Converter<'a>,
     pub locator: &'a crate::locator::Locator<'a>,

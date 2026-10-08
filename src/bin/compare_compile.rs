@@ -51,6 +51,7 @@ fn main() {
                 custom_element: v.get("customElement").and_then(Value::as_bool).unwrap_or(false),
                 experimental_async: v.pointer("/experimental/async").and_then(Value::as_bool).unwrap_or(false),
                 namespace: v.get("namespace").and_then(Value::as_str).map(str::to_string),
+                ..Default::default()
             }
         }
         Err(_) => CompileOptions::default(),

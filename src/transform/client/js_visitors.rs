@@ -7,7 +7,7 @@ use crate::estree::builders as b;
 use crate::estree::{Node, NodeKind};
 
 use super::super::js::{self, PathNode};
-use super::{call_fn, copy_transform, get_value, get_value_fn, Client, State, Transform};
+use super::{call_fn, get_value_fn, Client, State, Transform};
 
 impl<'a, 's> Client<'a, 's> {
     /// `context.visit(node, state)` on a JS node: the universal `set_scope` visitor, then the
@@ -323,20 +323,13 @@ impl<'a, 's> Client<'a, 's> {
             let len = self.path.len();
             if let (PathNode::Tpl(crate::analyze::nodes::P::Node(el)), Some(arrow)) = (self.path[len - 2], self.path[len - 1].js()) {
                 if let crate::ast::Node::Element(e) = &self.ast().nodes[el] {
-                    let arrow_origin = arrow.origin;
-                    let found = e.attributes.iter().any(|a| {
-                        crate::analyze::utils::is_event_attribute(a)
-                            && crate::analyze::utils::value_expression(match a {
-                                crate::ast::Attr::Attribute { value, .. } => value,
-                                _ => return false,
-                            })
-                            .is_some_and(|ex| match ex {
-                                crate::ast::Expr::Js(j) => arrow_origin == Some(crate::analyze::nodes::template_expr(ex).key()) || {
-                                    let _ = j;
-                                    false
-                                },
-                                _ => false,
-                            })
+                    // `get_attribute_expression(attribute) === context.path.at(-1)`
+                    let found = e.attributes.iter().any(|a| match a {
+                        crate::ast::Attr::Attribute { value, .. } if crate::analyze::utils::is_event_attribute(a) => {
+                            crate::analyze::utils::value_expression(value)
+                                .is_some_and(|ex| arrow.origin == Some(crate::analyze::nodes::template_expr(ex).key()))
+                        }
+                        _ => false,
                     });
                     if found {
                         should_transform = false;
