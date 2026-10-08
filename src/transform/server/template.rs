@@ -676,6 +676,9 @@ impl<'a, 's> Server<'a, 's> {
         }
         let body_scope = self.scope_of_key(P::Fragment(*body).key()).unwrap_or(st.scope);
         let body_block = self.fragment(*body, Parent::Node(n), &State { scope: body_scope, ..st.clone() });
+        if let Some(n) = super::super::js::ident(&name) {
+            self.snippet_fns.push(n.to_string());
+        }
         let mut f = b::function_declaration(name.clone(), params, body_block);
         let can_hoist = self.an.node_meta.get(&n).is_some_and(|m| m.can_hoist);
         let mut out = Vec::new();

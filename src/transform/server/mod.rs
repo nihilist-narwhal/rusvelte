@@ -81,6 +81,8 @@ pub struct Server<'a, 's> {
     /// `state.filename` (relative to `rootDir`)
     pub filename: String,
     pub dev: bool,
+    /// Names of the functions snippets became (the JS marks them `___snippet`)
+    pub snippet_fns: Vec<String>,
     /// The converted instance script's statements and declarators, by origin
     pub instance_nodes: FxHashMap<usize, Node>,
 }
@@ -194,6 +196,7 @@ pub fn server_component(s: &mut Server) -> Node {
     let instance_state = State { scope: s.an.instance_scope, is_instance: true, ..base.clone() };
     let instance_program = instance_program.unwrap_or_else(|| program_node(vec![]));
     let instance = s.visit_js(&instance_program, &instance_state);
+    let instance_loc = instance.loc;
 
     // template
     let template_scope = s.scope_of_key(P::Fragment(s.an.root.fragment).key()).unwrap_or(s.an.instance_scope);
@@ -205,6 +208,29 @@ pub fn server_component(s: &mut Server) -> Node {
         NodeKind::BlockStatement(b) => b.body,
         _ => vec![],
     };
+
+    // bindings to child components: re-render until they're stable (legacy)
+    if s.an.uses_component_bindings {
+        let is_snippet = |n: &Node| match &n.kind {
+            NodeKind::FunctionDeclaration(f) => f.id.as_deref().and_then(super::js::ident).is_some_and(|name| s.snippet_fns.iter().any(|x| x == name)),
+            _ => false,
+        };
+        let (snippets, rest): (Vec<Node>, Vec<Node>) = template_body.into_iter().partition(|n| is_snippet(n));
+        let mut body = snippets;
+        body.push(b::r#let(b::id("$$settled"), b::r#true()));
+        body.push(b::r#let(b::id("$$inner_renderer"), None));
+        body.push(b::function_declaration(b::id("$$render_inner"), vec![b::id("$$renderer")], b::block(rest)));
+        body.push(b::do_while(
+            b::unary("!", b::id("$$settled")),
+            b::block(vec![
+                b::stmt(b::assignment("=", b::id("$$settled"), b::r#true())),
+                b::stmt(b::assignment("=", b::id("$$inner_renderer"), b::call("$$renderer.copy", ()))),
+                b::stmt(b::call("$$render_inner", vec![b::id("$$inner_renderer")])),
+            ]),
+        ));
+        body.push(b::stmt(b::call("$$renderer.subsume", vec![b::id("$$inner_renderer")])));
+        template_body = body;
+    }
 
     // legacy reactive statements, in order
     let order: Vec<u32> = s.an.reactive_statements.iter().map(|rs| rs.node_start as u32).collect();
@@ -254,6 +280,8 @@ pub fn server_component(s: &mut Server) -> Node {
         component_block.insert(0, b::r#const(b::id(props_id.name), b::call("$.props_id", vec![b::id("$$renderer")])));
     }
     let mut component_block = b::block(component_block);
+    // trick esrap into including comments
+    component_block.loc = instance_loc;
 
     let should_inject_context = s.dev || s.an.needs_context || defer_store_teardown;
     if should_inject_context {

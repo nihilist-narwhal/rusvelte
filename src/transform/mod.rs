@@ -296,6 +296,7 @@ pub fn compile(source: &str, options: &options::CompileOptions) -> Result<Compil
                 filename: state_filename,
                 dev: options.dev,
                 instance_nodes: Default::default(),
+                snippet_fns: Vec::new(),
             };
             server::server_component(&mut s)
         }
