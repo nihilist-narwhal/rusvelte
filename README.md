@@ -23,7 +23,7 @@ original by diffing outputs over large corpora.
 | SvelteKit route/hook/param files (`upsertKitFile`) | all real-world files; 118/121 synthetic samples |
 | svelte-check-rs, TypeScript diagnostics | identical to `svelte-check --tsgo` 4.7.6 on the private app (2,477 diagnostics under strict options) and Windmill (7,922) |
 | svelte-check-rs, compiler warnings | identical to svelte-check on the private app and Windmill (89 warnings) |
-| svelte-check-rs, CSS diagnostics | not yet |
+| svelte-check-rs, CSS diagnostics (`css`/`scss`/`less`) | identical to svelte-check on Windmill (96 warnings in all); the CSS linter matches svelte-check's on 4,567/4,567 Svelte tests, Windmill, the private app and 47,072 synthetic files |
 
 The remaining svelte2tsx mismatches are 2 scripts that oxc can't parse but TypeScript
 recovers from, and 2 samples where npm 0.7.61 throws but the current language-tools source
@@ -74,7 +74,7 @@ Options follow svelte-check:
 - `--workspace`, `--tsconfig`
 - `--output human|human-verbose|machine|machine-verbose`
 - `--threshold`, `--ignore`, `--fail-on-warnings`
-- `--diagnostic-sources js,svelte`, `--compiler-warnings code:ignore|error,...`
+- `--diagnostic-sources js,svelte,css`, `--compiler-warnings code:ignore|error,...`
 - `--incremental`, `--watch`, `--preserveWatchOutput`
 
 `--timings` prints where the time went.
@@ -115,6 +115,7 @@ first difference.
 | `oracle/gen_htmlx2jsx.mjs` | `compare_s2t` (template half) |
 | `oracle/gen_svelte2tsx.mjs <corpus> <out> [check\|samples\|svelte-check]` | `compare_s2t` (full svelte2tsx) |
 | `oracle/gen_kit.mjs` | `compare_kit` (SvelteKit files) |
+| `oracle/css_oracle.cjs` (and `gen_css_samples.mjs` for synthetic corpora) | `compare_css` (CSS diagnostics) |
 
 `tools/check_sanity.py <language-tools> <node_modules>` runs svelte-check's own sanity
 fixtures against svelte-check-rs.
@@ -140,6 +141,10 @@ fixtures against svelte-check-rs.
   - `src/svelte2tsx/script/`: the script half, which walks oxc's AST the way svelte2tsx
     walks TypeScript's.
   - `src/svelte2tsx/kit.rs`, `rewrite_imports.rs`: SvelteKit files and external imports.
+- **CSS diagnostics**
+  - `src/css_lint/`: port of vscode-css-languageservice's CSS/SCSS/LESS parsers and lint
+    rules, and of svelte-language-server's `<style>` extraction. `tools/gen_css_data.mjs`
+    generates its property and at-rule data.
 - **The checker**
   - `src/check/`: the overlay, tsconfig handling, tsgo, diagnostic mapping and filtering,
     output writers, watch mode.

@@ -1,7 +1,7 @@
 //! `svelte-check --tsgo`, natively. Usage mirrors svelte-check:
 //!   svelte-check-rs [--workspace <dir>] [--tsconfig <path>] [--output human|human-verbose|machine|machine-verbose]
 //!                   [--threshold error|warning] [--ignore <patterns>] [--fail-on-warnings]
-//!                   [--diagnostic-sources js,svelte] [--compiler-warnings code:ignore,...] [--timings]
+//!                   [--diagnostic-sources js,svelte,css] [--compiler-warnings code:ignore,...] [--timings]
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ fn main() {
     let mut threshold = None;
     let mut ignore = Vec::new();
     let mut fail_on_warnings = false;
-    let mut sources = vec!["js".to_string(), "svelte".to_string()];
+    let mut sources = vec!["js".to_string(), "svelte".to_string(), "css".to_string()];
     let mut compiler_warnings = HashMap::new();
     let mut timings = false;
     let mut incremental = false;

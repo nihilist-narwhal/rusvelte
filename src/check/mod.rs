@@ -381,6 +381,21 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
         }
     }
 
+    // then the CSS language service's diagnostics for each component's <style>
+    if opts.sources.iter().any(|s| s == "css") {
+        let css = timed(opts.timings, "css diagnostics", || css_diagnostics(&files, &by_file, &index));
+        for (path, diags) in css {
+            match index.get(&path) {
+                Some(&i) => by_file[i].diagnostics.extend(diags),
+                None => {
+                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    index.insert(path.clone(), by_file.len());
+                    by_file.push(FileDiagnostics { path, text, diagnostics: diags });
+                }
+            }
+        }
+    }
+
     if let Some((started, child)) = tsgo {
         let diags = tsc::finish(child, &workspace)?;
         if opts.timings {
@@ -1140,6 +1155,42 @@ fn map_compiler_diagnostics(path: &Path, result: CompilerResult, settings: &Hash
             }]
         }
     }
+}
+
+/// svelte-check's `css`/`scss`/`less` diagnostics for every component that has some
+fn css_diagnostics(files: &[PathBuf], by_file: &[FileDiagnostics], index: &HashMap<PathBuf, usize>) -> Vec<(PathBuf, Vec<Diagnostic>)> {
+    use crate::css_lint;
+    files
+        .iter()
+        .filter_map(|path| {
+            let read;
+            let text = match index.get(path) {
+                Some(&i) => &by_file[i].text,
+                None => {
+                    read = std::fs::read_to_string(path).ok()?;
+                    &read
+                }
+            };
+            let pos = |p: css_lint::Position| Position { line: p.line as i64, character: p.character as i64 };
+            let diags: Vec<Diagnostic> = css_lint::style_diagnostics(text)
+                .into_iter()
+                .map(|d| Diagnostic {
+                    range: Range { start: pos(d.range.start), end: pos(d.range.end) },
+                    severity: if d.severity == css_lint::Severity::Error { Severity::Error } else { Severity::Warning },
+                    source: match d.source.as_str() {
+                        "scss" => "scss",
+                        "less" => "less",
+                        _ => "css",
+                    },
+                    message: d.message,
+                    code: Some(Code::Str(d.code)),
+                    code_description: None,
+                    position_unknown: false,
+                })
+                .collect();
+            (!diags.is_empty()).then(|| (path.clone(), diags))
+        })
+        .collect()
 }
 
 // --- watch mode -----------------------------------------------------------------------------
