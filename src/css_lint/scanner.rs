@@ -50,6 +50,9 @@ pub enum TT {
     SingleLineComment,
     EOF,
     ContainerQueryLength,
+    /// `staticUnitTable['constructor']` / `staticUnitTable['__proto__']`: an `Object.prototype`
+    /// member ends up as the token type, which equals no `TokenType`
+    ObjectPrototypeUnit,
     // SCSS
     VariableName,
     InterpolationFunction,
@@ -639,13 +642,13 @@ impl<'a> Scanner<'a> {
 
 /// `staticUnitTable[dim.toLowerCase()]`
 fn unit_token(dim: &[u16]) -> Option<TT> {
-    if dim.len() > 5 || dim.iter().any(|&ch| ch >= 0x80) {
+    if dim.len() > 11 || dim.iter().any(|&ch| ch >= 0x80) {
         // non-ASCII units can't lowercase to an ASCII unit except via a few special
         // characters (the Kelvin sign lowercases to `k`)
         let s = String::from_utf16_lossy(dim).to_lowercase();
         return unit_str(&s);
     }
-    let mut lower = [0u8; 5];
+    let mut lower = [0u8; 11];
     for (i, &ch) in dim.iter().enumerate() {
         lower[i] = (ch as u8).to_ascii_lowercase();
     }
@@ -663,6 +666,7 @@ fn unit_str(s: &str) -> Option<TT> {
         "%" | "fr" => TT::Percentage,
         "dpi" | "dpcm" => TT::Resolution,
         "cqw" | "cqh" | "cqi" | "cqb" | "cqmin" | "cqmax" => TT::ContainerQueryLength,
+        "constructor" | "__proto__" => TT::ObjectPrototypeUnit,
         _ => return None,
     })
 }

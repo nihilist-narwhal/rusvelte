@@ -1018,20 +1018,14 @@ impl<'a> Parser<'a> {
         self.consume_token();
         let at_node = self.finish(at_node);
         self.set_node_at(node, Field::Keyword, Some(at_node), 0);
-        if self.node_matches(at_node, "@-ms-keyframes") {
-            self.mark_error(at_node, ParseError::UnknownKeyword, None, None);
-        }
+        // `if (atNode.matches('@-ms-keyframes')) this.markError(atNode, ParseError.UnknownKeyword)`
+        // never fires: the text provider is only attached to the stylesheet after parsing, so
+        // `matches` compares against 'unknown'
         let id = self.parse_keyframe_ident();
         if !self.set_node_at(node, Field::Identifier, id, 0) {
             return Some(self.finish_resync(node, ParseError::IdentifierExpected, Some(&[TT::CurlyR]), None));
         }
         Some(self.parse_body(node, DeclFn::KeyframeSelector))
-    }
-
-    /// `node.matches(str)`
-    pub fn node_matches(&self, node: NodeId, s: &str) -> bool {
-        let n = self.ast.get(node);
-        n.length == s.len() as i32 && eq_str(node_text(self.scanner.source(), n.offset, n.length), s)
     }
 
     pub fn parse_keyframe_ident(&mut self) -> Option<NodeId> {
