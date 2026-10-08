@@ -117,7 +117,8 @@ fn resolve_extends(spec: &str, dir: &Path) -> Option<PathBuf> {
     while let Some(cur) = d {
         let candidate = cur.join("node_modules").join(spec);
         if let Some(p) = with_json(candidate.clone()) {
-            return Some(p);
+            // module resolution returns real paths
+            return Some(std::fs::canonicalize(&p).unwrap_or(p));
         }
         // package.json "tsconfig" field
         let pkg = candidate.join("package.json");
@@ -125,7 +126,7 @@ fn resolve_extends(spec: &str, dir: &Path) -> Option<PathBuf> {
             if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&text) {
                 if let Some(t) = m.get("tsconfig").and_then(Value::as_str) {
                     if let Some(p) = with_json(candidate.join(t)) {
-                        return Some(p);
+                        return Some(std::fs::canonicalize(&p).unwrap_or(p));
                     }
                 }
             }
