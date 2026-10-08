@@ -2,10 +2,15 @@
 //! parallel), write them next to an overlay tsconfig the way svelte-check does, run
 //! TypeScript 7 on it, and map the diagnostics back.
 //!
-//! Two deliberate differences from svelte-check 4.7: excludes that cover the cache directory
-//! are dropped (svelte-check excludes its own output when the tsconfig excludes `.svelte-kit`),
-//! and `package.json` subpath imports (`#lib/*`) get `paths` that try the generated files
-//! first (svelte-check only redirects relative imports and `paths`).
+//! Deliberate differences from svelte-check 4.7: excludes that cover the cache directory are
+//! dropped (svelte-check excludes its own output when the tsconfig excludes `.svelte-kit`);
+//! `package.json` subpath imports (`#lib/*`) get `paths` that try the generated files first
+//! (svelte-check only redirects relative imports and `paths`); a tsconfig without `include`
+//! or `files` anywhere in its chain gets TypeScript's default `**/*` (svelte-check's overlay
+//! `files` turn that default off, so nothing but the shims is checked), and one without
+//! `exclude` keeps excluding `outDir`; components starting with a byte order mark are
+//! checked (positions don't count the mark, as in TypeScript); files that can't be read,
+//! converted (with no compiler error to show instead) or written are reported as errors.
 
 pub mod map;
 pub mod tsc;
@@ -211,61 +216,53 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
     }
 
     let previous_outputs: Vec<PathBuf> = if opts.incremental {
-        std::fs::read_to_string(cache.join("emitted.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+        // (a symlink in place of the output directory is replaced, never followed)
+        if std::fs::symlink_metadata(&emit_dir).is_ok_and(|m| !m.is_dir()) {
+            let _ = std::fs::remove_file(&emit_dir);
+        }
+        load_previous_outputs(&cache, &emit_dir)
     } else {
         let _ = std::fs::remove_dir_all(&emit_dir);
         Vec::new()
     };
     std::fs::create_dir_all(&emit_dir).map_err(|e| e.to_string())?;
-    let entries: Vec<Option<Entry>> = timed(opts.timings, "svelte2tsx + write", || {
+    let emitted: Vec<Option<Result<Entry, Failure>>> = timed(opts.timings, "svelte2tsx + write", || {
         let next = AtomicUsize::new(0);
-        let results: Vec<std::sync::Mutex<Option<Entry>>> = files.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        let results: Vec<std::sync::Mutex<Option<Result<Entry, Failure>>>> = files.iter().map(|_| std::sync::Mutex::new(None)).collect();
         std::thread::scope(|s| {
             for _ in 0..opts.threads.max(1) {
                 s.spawn(|| loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(path) = files.get(i) else { break };
-                    let Ok(source) = std::fs::read_to_string(path) else { continue };
-                    let is_ts = is_ts_svelte(&source);
-                    let (out_path, dts_path) = output_paths(&workspace, &emit_dir, path, is_ts);
-                    let o = Svelte2TsxOptions {
-                        filename: Some(path.to_string_lossy().to_string()),
-                        is_ts_file: is_ts,
-                        emit_jsdoc: true,
-                        rewrite_external_imports: Some(RewriteExternalImports {
-                            source_path: path.clone(),
-                            generated_path: out_path.clone(),
-                            workspace_path: workspace.clone(),
-                        }),
-                        ..Default::default()
-                    };
-                    // svelte2tsx errors are left to the compiler diagnostics
-                    let Ok(r) = svelte2tsx_full(&source, &o, false) else { continue };
-                    let _ = std::fs::create_dir_all(out_path.parent().unwrap());
-                    let import = format!("./{}", out_path.file_name().unwrap().to_string_lossy());
-                    let dts = format!("export {{ default }} from \"{import}\";\nexport * from \"{import}\";\n");
-                    if write_if_changed(&out_path, &r.code).is_err() || write_if_changed(&dts_path, &dts).is_err() {
-                        continue;
-                    }
-                    *results[i].lock().unwrap() = Some(Entry { source_path: path.clone(), out_path, dts_path, is_ts_file: is_ts, source, code: r.code, kit: None });
+                    *results[i].lock().unwrap() = Some(emit_component(path, &workspace, &emit_dir));
                 });
             }
         });
         results.into_iter().map(|m| m.into_inner().unwrap()).collect()
     });
-    let mut entries: Vec<Entry> = entries.into_iter().flatten().collect();
+    let (mut entries, mut failures): (Vec<Entry>, Vec<Failure>) = (Vec::new(), Vec::new());
+    for r in emitted.into_iter().flatten() {
+        match r {
+            Ok(e) => entries.push(e),
+            Err(f) => failures.push(f),
+        }
+    }
     let svelte_entry_count = entries.len();
+    let svelte_failure_count = failures.len();
     let mut kit_settings = KitFilesSettings::default();
-    entries.extend(emit_kit_files(&scripts, &kit_settings, &workspace, &emit_dir));
+    let (kit_entries, kit_failures) = emit_kit_files(&scripts, &kit_settings, &workspace, &emit_dir);
+    entries.extend(kit_entries);
+    failures.extend(kit_failures);
     if opts.incremental {
         // remove what earlier runs generated for files that are gone or failed now
         let current: std::collections::HashSet<&Path> = entries.iter().flat_map(|e| [e.out_path.as_path(), e.dts_path.as_path()]).collect();
         for p in &previous_outputs {
             if !current.contains(p.as_path()) {
-                let _ = std::fs::remove_file(p);
+                remove_output(&emit_dir, p);
             }
         }
-        let list: Vec<&Path> = current.into_iter().collect();
+        let mut list: Vec<String> = current.into_iter().map(|p| relative_posix(&emit_dir, p)).collect();
+        list.sort();
         let _ = std::fs::write(cache.join("emitted.json"), serde_json::to_string(&list).unwrap());
     }
 
@@ -279,10 +276,11 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
 
     // type-check while the compiler warnings finish
     let build_info = opts.incremental.then(|| cache.join("tsbuildinfo.json"));
-    let start_tsgo = |entries: &[Entry]| -> Result<(std::time::Instant, std::process::Child), String> {
+    // (killed and reaped if the run ends early)
+    let start_tsgo = |entries: &[Entry]| -> Result<(std::time::Instant, ChildGuard), String> {
         timed(opts.timings, "overlay tsconfig", || write_overlay(&tsconfig_path, &tsconfig_dir, &workspace, &cache, &overlay_path, entries, opts.incremental))?;
         let exe = tsc::find_tsgo(&tsconfig_dir)?;
-        Ok((std::time::Instant::now(), tsc::start(&exe, &overlay_path, &workspace, build_info.as_deref())?))
+        Ok((std::time::Instant::now(), ChildGuard(Some(tsc::start(&exe, &overlay_path, &workspace, build_info.as_deref())?))))
     };
     let mut tsgo = if use_ts { Some(start_tsgo(&entries)?) } else { None };
 
@@ -295,7 +293,7 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
         if settings != kit_settings {
             // other SvelteKit file settings (often just the defaults as absolute paths): only
             // when that changes the kit files, redo them and the type-check
-            let new_kit = emit_kit_files(&scripts, &settings, &workspace, &emit_dir);
+            let (new_kit, new_kit_failures) = emit_kit_files(&scripts, &settings, &workspace, &emit_dir);
             let same = new_kit.len() == entries.len() - svelte_entry_count
                 && new_kit.iter().zip(&entries[svelte_entry_count..]).all(|(a, b)| a.source_path == b.source_path && a.code == b.code);
             kit_settings = settings;
@@ -308,9 +306,11 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
                 }
                 entries.truncate(svelte_entry_count);
                 entries.extend(new_kit);
-                if let Some((_, mut child)) = tsgo.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                failures.truncate(svelte_failure_count);
+                failures.extend(new_kit_failures);
+                if let Some((_, child)) = tsgo.take() {
+                    // (the guard kills and reaps it)
+                    drop(child);
                     tsgo = Some(start_tsgo(&entries)?);
                 }
             }
@@ -340,6 +340,7 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
     }
 
     // compiler warnings come first in each file
+    let mut compile_failed: std::collections::HashSet<PathBuf> = Default::default();
     if use_svelte {
         let fresh = match svelte_warnings {
             Some(handle) => timed(opts.timings, "svelte compiler warnings (wait)", || svelte_warnings_finish(handle, opts.threads))?,
@@ -366,13 +367,14 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
             warnings_cache.save(&cache);
         }
         let results: Vec<(PathBuf, CompilerResult)> = files.iter().filter_map(|f| warnings_cache.get(f).map(|raw| (f.clone(), to_compiler_result(raw)))).collect();
+        compile_failed.extend(results.iter().filter(|(_, r)| r.is_err()).map(|(p, _)| p.clone()));
         for (path, diags) in results {
             let mapped = map_compiler_diagnostics(&path, diags, &opts.compiler_warnings, has_preprocess);
             match index.get(&path) {
                 Some(&i) => by_file[i].diagnostics.extend(mapped),
                 None => {
                     if !mapped.is_empty() {
-                        let text = std::fs::read_to_string(&path).unwrap_or_default();
+                        let text = read_source(&path).unwrap_or_default();
                         index.insert(path.clone(), by_file.len());
                         by_file.push(FileDiagnostics { path, text, diagnostics: mapped });
                     }
@@ -388,7 +390,7 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
             match index.get(&path) {
                 Some(&i) => by_file[i].diagnostics.extend(diags),
                 None => {
-                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    let text = read_source(&path).unwrap_or_default();
                     index.insert(path.clone(), by_file.len());
                     by_file.push(FileDiagnostics { path, text, diagnostics: diags });
                 }
@@ -397,7 +399,7 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
     }
 
     if let Some((started, child)) = tsgo {
-        let diags = tsc::finish(child, &workspace)?;
+        let diags = tsc::finish(child.take(), &workspace)?;
         if opts.timings {
             eprintln!("[timing] tsgo (from start): {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
         }
@@ -413,8 +415,151 @@ pub fn run(opts: &CheckOptions, out: &mut impl std::io::Write) -> Result<writer:
         }
     }
 
+    // Files that couldn't be read, converted or written weren't checked: say so. A component
+    // svelte2tsx can't convert is left to the compiler's error when there is one (svelte-check
+    // relies on that), and conversions only matter for the type-check.
+    for f in failures {
+        if f.kind != FailureKind::Read && (!use_ts || (f.kind == FailureKind::Convert && compile_failed.contains(&f.path))) {
+            continue;
+        }
+        let d = Diagnostic {
+            range: Range { start: Position { line: 0, character: 0 }, end: Position { line: 0, character: 0 } },
+            severity: Severity::Error,
+            source: "svelte-check",
+            message: f.message,
+            code: None,
+            code_description: None,
+            position_unknown: true,
+        };
+        match index.get(&f.path) {
+            Some(&i) => by_file[i].diagnostics.push(d),
+            None => {
+                let text = read_source(&f.path).unwrap_or_default();
+                index.insert(f.path.clone(), by_file.len());
+                by_file.push(FileDiagnostics { path: f.path, text, diagnostics: vec![d] });
+            }
+        }
+    }
+
     let summary = writer::write(out, opts.format, opts.threshold, &workspace, &by_file, opts.colors, opts.watch).map_err(|e| e.to_string())?;
     Ok(summary)
+}
+
+/// A file that couldn't be emitted for the type-check
+struct Failure {
+    path: PathBuf,
+    kind: FailureKind,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    Read,
+    Convert,
+    Write,
+}
+
+/// A source file's text without a byte order mark: TypeScript and the Svelte compiler drop it,
+/// so their positions don't count it (and svelte2tsx doesn't take it)
+fn read_source(path: &Path) -> std::io::Result<String> {
+    let mut text = std::fs::read_to_string(path)?;
+    if text.starts_with('\u{feff}') {
+        text.drain(..'\u{feff}'.len_utf8());
+    }
+    Ok(text)
+}
+
+/// Convert one component and write its generated files (`emitSvelteFiles`' loop body)
+fn emit_component(path: &Path, workspace: &Path, emit_dir: &Path) -> Result<Entry, Failure> {
+    let fail = |kind, message: String| Failure { path: path.to_path_buf(), kind, message };
+    let source = read_source(path).map_err(|e| fail(FailureKind::Read, format!("Failed to read the file: {e}")))?;
+    let is_ts = is_ts_svelte(&source);
+    let (out_path, dts_path) = output_paths(workspace, emit_dir, path, is_ts);
+    let o = Svelte2TsxOptions {
+        filename: Some(path.to_string_lossy().to_string()),
+        is_ts_file: is_ts,
+        emit_jsdoc: true,
+        rewrite_external_imports: Some(RewriteExternalImports {
+            source_path: path.to_path_buf(),
+            generated_path: out_path.clone(),
+            workspace_path: workspace.to_path_buf(),
+        }),
+        ..Default::default()
+    };
+    let r = svelte2tsx_full(&source, &o, false)
+        .map_err(|e| fail(FailureKind::Convert, format!("The component couldn't be converted for type-checking, so it wasn't type-checked: {e}")))?;
+    let import = format!("./{}", out_path.file_name().unwrap().to_string_lossy());
+    let dts = format!("export {{ default }} from \"{import}\";\nexport * from \"{import}\";\n");
+    let write = |p: &Path, text: &str| -> Result<(), Failure> {
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        write_if_changed(p, text).map_err(|e| fail(FailureKind::Write, format!("Failed to write '{}', so the file wasn't type-checked: {e}", p.display())))
+    };
+    write(&out_path, &r.code)?;
+    write(&dts_path, &dts)?;
+    Ok(Entry { source_path: path.to_path_buf(), out_path, dts_path, is_ts_file: is_ts, source, code: r.code, kit: None })
+}
+
+/// `emitted.json`: the files earlier runs generated, relative to the output directory. Only
+/// plain relative paths of generated files are taken (anything else in a modified cache is
+/// ignored); absolute paths inside the output directory are what older versions wrote.
+fn load_previous_outputs(cache: &Path, emit_dir: &Path) -> Vec<PathBuf> {
+    let listed: Vec<String> = std::fs::read_to_string(cache.join("emitted.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    listed.iter().filter_map(|p| validated_output_path(emit_dir, p)).collect()
+}
+
+fn validated_output_path(emit_dir: &Path, listed: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let p = Path::new(listed);
+    let rel = if p.is_absolute() { p.strip_prefix(emit_dir).ok()? } else { p };
+    let mut out = emit_dir.to_path_buf();
+    let mut depth = 0;
+    for c in rel.components() {
+        match c {
+            Component::Normal(n) => out.push(n),
+            // `..`, `.`, roots and drive prefixes
+            _ => return None,
+        }
+        depth += 1;
+    }
+    let generated = out.extension().is_some_and(|e| e == "ts" || e == "js");
+    (depth > 0 && generated).then_some(out)
+}
+
+/// Remove a generated file without following symlinks out of the output directory: every
+/// directory from `emit_dir` down must be a real one (a symlinked file is removed itself)
+fn remove_output(emit_dir: &Path, path: &Path) {
+    let Ok(rel) = path.strip_prefix(emit_dir) else { return };
+    let real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    let mut dir = emit_dir.to_path_buf();
+    if !real_dir(&dir) {
+        return;
+    }
+    let components: Vec<_> = rel.components().collect();
+    for c in &components[..components.len().saturating_sub(1)] {
+        dir.push(c);
+        if !real_dir(&dir) {
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// A child process that is killed and reaped when dropped, unless taken to finish normally
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn take(mut self) -> std::process::Child {
+        self.0.take().expect("a guarded child")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(c) = &mut self.0 {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 /// `writeOverlayTsconfig`
@@ -454,9 +599,17 @@ fn write_overlay(tsconfig_path: &Path, tsconfig_dir: &Path, workspace: &Path, ca
         let n = n.strip_suffix(".svelte").map(|b| format!("{b}.d.svelte.ts")).unwrap_or_else(|| n.to_string());
         format!("svelte/{n}")
     };
-    let raw_include = specs("include");
-    let raw_exclude = specs("exclude");
-    let raw_files = specs("files").unwrap_or_default();
+    // `raw` has what the config inherits through `extends`, as TypeScript merges it. The
+    // overlay sets `files` (and usually `exclude`), which turns off TypeScript's defaults for
+    // the others, so those are spelled out: everything under the config's directory without
+    // `files` or `include`, and `outDir`/`declarationDir` without `exclude`.
+    let raw_files = specs("files");
+    let raw_include = specs("include").or_else(|| raw_files.is_none().then(|| vec!["**/*".to_string()]));
+    let raw_exclude = specs("exclude").or_else(|| {
+        let defaults: Vec<String> = [&parsed.out_dir, &parsed.declaration_dir].into_iter().flatten().map(|d| relative_posix(tsconfig_dir, d)).collect();
+        (!defaults.is_empty()).then_some(defaults)
+    });
+    let raw_files = raw_files.unwrap_or_default();
 
     let mut files: Vec<String> = raw_files.iter().filter(|f| !f.ends_with(".svelte")).map(|f| rebase(f)).collect();
     // (svelte-check maps every `files` entry to a virtual one; only `.svelte` ones exist)
@@ -603,7 +756,7 @@ fn map_ts_diagnostics(diags: &[tsc::CliDiagnostic], entries: &[Entry], workspace
                     Some(entry) if entry.kit.is_some() => (entry.source_path.clone(), entry.source.clone(), map_kit_entry(entry, &owned)),
                     Some(entry) => (entry.source_path.clone(), entry.source.clone(), map_entry(entry, workspace, &owned)),
                     None => {
-                        let text = std::fs::read_to_string(path).unwrap_or_default();
+                        let text = read_source(path).unwrap_or_default();
                         let source = if is_typescript_file(path) { "ts" } else { "js" };
                         (path.clone(), text, owned.iter().map(|d| map::map_plain_diagnostic(d, source)).collect())
                     }
@@ -834,7 +987,8 @@ const KNOWN_OPTIONS = ['runes', 'customElement', 'experimental', 'dev', 'generat
 })();
 "#;
 
-struct WarningsHandle(Vec<std::process::Child>);
+/// (the children are killed and reaped if they aren't finished)
+struct WarningsHandle(Vec<ChildGuard>);
 
 /// Spread the files over a few Node processes (preprocessors like PostCSS are slow)
 fn svelte_warnings_start(workspace: &Path, cache: &Path, files: &[PathBuf], processes: usize) -> Result<WarningsHandle, String> {
@@ -843,6 +997,7 @@ fn svelte_warnings_start(workspace: &Path, cache: &Path, files: &[PathBuf], proc
     std::fs::write(&script, WARNINGS_SCRIPT).map_err(|e| e.to_string())?;
     // about 50 files per process at least, so small projects don't pay for many Node startups
     let processes = processes.clamp(1, files.len().div_ceil(50).max(1));
+    // (on an error, the guards stop what already started)
     let mut children = Vec::new();
     for (i, chunk) in files.chunks(files.len().div_ceil(processes).max(1)).enumerate() {
         let list = cache.join(format!("compiler-warnings-files-{i}.json"));
@@ -855,7 +1010,7 @@ fn svelte_warnings_start(workspace: &Path, cache: &Path, files: &[PathBuf], proc
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .map_err(|e| format!("Failed to run node for the compiler warnings: {e}"))?;
-        children.push(child);
+        children.push(ChildGuard(Some(child)));
     }
     Ok(WarningsHandle(children))
 }
@@ -867,8 +1022,9 @@ fn svelte_warnings_finish(h: WarningsHandle, threads: usize) -> Result<(Vec<(Pat
     let mut results = Vec::new();
     let mut has_preprocess = false;
     let mut options = crate::analyze::CompileOptions::default();
+    // (an error drops the remaining guards, which stops those children)
     for child in h.0 {
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let out = child.take().wait_with_output().map_err(|e| e.to_string())?;
         let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("compiler warnings: {e}"))?;
         let Value::Object(mut m) = v else { continue };
         if let Some(c) = m.remove("\0config") {
@@ -913,7 +1069,7 @@ fn compile_preprocessed(path: &Path, raw: &Value, options: &crate::analyze::Comp
     let code = match raw["code"].as_str() {
         Some(c) => c,
         None => {
-            original = std::fs::read_to_string(path).unwrap_or_default();
+            original = read_source(path).unwrap_or_default();
             &original
         }
     };
@@ -1008,22 +1164,19 @@ struct WarningsCache {
 }
 
 impl WarningsCache {
+    /// Everything the results depend on besides the files: the config files the probe and the
+    /// Node helper look at, the Svelte version, and this build (the native compiler)
     fn config_key(workspace: &Path) -> String {
         let mut parts = Vec::new();
-        for name in [
-            "svelte.config.js",
-            "svelte.config.mjs",
-            "svelte.config.cjs",
-            "svelte.config.ts",
-            "vite.config.js",
-            "vite.config.mjs",
-            "vite.config.ts",
-            "vite.config.mts",
-            "package.json",
-            "node_modules/svelte/package.json",
-        ] {
+        for name in CONFIG_FILES.iter().chain(&["package.json", "node_modules/svelte/package.json"]) {
             parts.extend(std::fs::read(workspace.join(name)).unwrap_or_default());
             parts.push(0);
+        }
+        parts.extend(env!("CARGO_PKG_VERSION").as_bytes());
+        // (a rebuilt binary of the same version may compute other warnings)
+        if let Some(meta) = std::env::current_exe().ok().and_then(|e| std::fs::metadata(e).ok()) {
+            let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+            parts.extend(format!("\0{}\0{modified}", meta.len()).as_bytes());
         }
         hash_bytes(&parts)
     }
@@ -1073,7 +1226,7 @@ impl WarningsCache {
 
 /// The Svelte plugin's `getDiagnostics` for compiler output (no preprocessors)
 fn map_compiler_diagnostics(path: &Path, result: CompilerResult, settings: &HashMap<String, String>, has_preprocess: bool) -> Vec<Diagnostic> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = read_source(path).unwrap_or_default();
     let verbatim = crate::svelte2tsx::htmlx::find_verbatim_elements(&text);
     let lang_of = |style: bool| -> String {
         let tag = verbatim.iter().find(|v| v.is_style == style);
@@ -1168,7 +1321,7 @@ fn css_diagnostics(files: &[PathBuf], by_file: &[FileDiagnostics], index: &HashM
             let text = match index.get(path) {
                 Some(&i) => &by_file[i].text,
                 None => {
-                    read = std::fs::read_to_string(path).ok()?;
+                    read = read_source(path).ok()?;
                     &read
                 }
             };
@@ -1263,15 +1416,24 @@ enum Engine {
 }
 
 /// Emit the SvelteKit files among `scripts` (`emitSvelteFiles`' kit part)
-fn emit_kit_files(scripts: &[PathBuf], settings: &KitFilesSettings, workspace: &Path, emit_dir: &Path) -> Vec<Entry> {
+fn emit_kit_files(scripts: &[PathBuf], settings: &KitFilesSettings, workspace: &Path, emit_dir: &Path) -> (Vec<Entry>, Vec<Failure>) {
     let mut entries = Vec::new();
+    let mut failures = Vec::new();
     for path in scripts.iter().filter(|p| is_kit_file(&p.to_string_lossy(), settings)) {
-        let Ok(source) = std::fs::read_to_string(path) else { continue };
+        let source = match read_source(path) {
+            Ok(s) => s,
+            Err(e) => {
+                failures.push(Failure { path: path.clone(), kind: FailureKind::Read, message: format!("Failed to read the file: {e}") });
+                continue;
+            }
+        };
         let out_path = emit_dir.join(path.strip_prefix(workspace).unwrap_or(path));
         let rewrite = RewriteExternalImports { source_path: path.clone(), generated_path: out_path.clone(), workspace_path: workspace.to_path_buf() };
         let Some(r) = upsert_kit_file(&path.to_string_lossy(), &source, settings, Some(&rewrite), None) else { continue };
         let _ = std::fs::create_dir_all(out_path.parent().unwrap());
-        if write_if_changed(&out_path, &r.text).is_err() {
+        if let Err(e) = write_if_changed(&out_path, &r.text) {
+            let message = format!("Failed to write '{}', so the file wasn't type-checked: {e}", out_path.display());
+            failures.push(Failure { path: path.clone(), kind: FailureKind::Write, message });
             continue;
         }
         entries.push(Entry {
@@ -1284,7 +1446,7 @@ fn emit_kit_files(scripts: &[PathBuf], settings: &KitFilesSettings, workspace: &
             kit: Some(r.added_code),
         });
     }
-    entries
+    (entries, failures)
 }
 
 const CONFIG_FILES: [&str; 11] = [
@@ -1357,7 +1519,7 @@ if (result && 'config' in result) {
 process.stdout.write(JSON.stringify(out));
 "#;
 
-struct ConfigProbe(std::process::Child);
+struct ConfigProbe(ChildGuard);
 
 /// Start the probe, if the workspace has a config file (and Node)
 fn config_probe_start(workspace: &Path, cache: &Path) -> Option<ConfigProbe> {
@@ -1373,7 +1535,7 @@ fn config_probe_start(workspace: &Path, cache: &Path) -> Option<ConfigProbe> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    Some(ConfigProbe(child))
+    Some(ConfigProbe(ChildGuard(Some(child))))
 }
 
 pub struct ProbedConfig {
@@ -1393,7 +1555,7 @@ const KNOWN_COMPILER_OPTIONS: [&str; 12] =
 
 fn config_probe_finish(p: ConfigProbe) -> Option<ProbedConfig> {
     let fallback = ProbedConfig { native_ok: false, has_preprocess: false, compile_options: Default::default(), kit_files: None };
-    let Ok(out) = p.0.wait_with_output() else { return Some(fallback) };
+    let Ok(out) = p.0.take().wait_with_output() else { return Some(fallback) };
     let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) else { return Some(fallback) };
     if v.get("error").is_some() {
         return Some(fallback);
@@ -1446,7 +1608,7 @@ fn native_compiler_results(files: &[PathBuf], options: &crate::analyze::CompileO
             s.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(path) = files.get(i) else { break };
-                let Ok(source) = std::fs::read_to_string(path) else { continue };
+                let Ok(source) = read_source(path) else { continue };
                 let v = match crate::analyze::compile_diagnostics_with(&source, &path.to_string_lossy(), options) {
                     Ok(ws) => json!({ "warnings": ws.iter().map(|w| json!({ "code": w.code, "message": w.message, "range": range(&w.start, &w.end) })).collect::<Vec<_>>() }),
                     Err(e) => json!({ "error": { "code": e.code, "message": e.message, "range": range(&e.start, &e.end) } }),
@@ -1480,4 +1642,154 @@ fn static_config_guess(workspace: &Path) -> Option<ProbedConfig> {
         return None;
     }
     Some(ProbedConfig { native_ok: true, has_preprocess: true, compile_options: Default::default(), kit_files: None })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rusvelte-check-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        normalize(&std::fs::canonicalize(&d).unwrap())
+    }
+
+    #[test]
+    fn cache_paths_stay_in_the_output_directory() {
+        let emit = Path::new("/w/.svelte-check/svelte");
+        assert_eq!(validated_output_path(emit, "src/++A.svelte.ts"), Some(emit.join("src/++A.svelte.ts")));
+        assert_eq!(validated_output_path(emit, "src/A.d.svelte.ts"), Some(emit.join("src/A.d.svelte.ts")));
+        // what older versions wrote
+        assert_eq!(validated_output_path(emit, "/w/.svelte-check/svelte/src/+page.ts"), Some(emit.join("src/+page.ts")));
+        for bad in ["/w/src/routes/+page.svelte", "/w/src/lib/a.ts", "../../src/lib/a.ts", "src/../../../a.ts", "./src/a.ts", "", "src", "src/A.svelte", "/w/.svelte-check/svelte/../../src/a.ts"] {
+            assert_eq!(validated_output_path(emit, bad), None, "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_outputs_does_not_follow_symlinks() {
+        let d = temp_dir("symlinks");
+        let emit = d.join("cache/svelte");
+        let outside = d.join("src");
+        std::fs::create_dir_all(emit.join("real")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for f in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(outside.join(f), "keep").unwrap();
+        }
+        std::fs::write(emit.join("real/x.ts"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, emit.join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.join("b.ts"), emit.join("b.ts")).unwrap();
+        std::fs::write(
+            d.join("cache/emitted.json"),
+            serde_json::to_string(&[outside.join("a.ts").to_string_lossy().as_ref(), "../../src/c.ts", "linked/a.ts", "b.ts", "real/x.ts"]).unwrap(),
+        )
+        .unwrap();
+        let previous = load_previous_outputs(&d.join("cache"), &emit);
+        assert_eq!(previous, vec![emit.join("linked/a.ts"), emit.join("b.ts"), emit.join("real/x.ts")]);
+        for p in &previous {
+            remove_output(&emit, p);
+        }
+        // the symlinked file goes, its target and everything behind the symlinked directory stay
+        assert!(std::fs::symlink_metadata(emit.join("b.ts")).is_err());
+        assert!(!emit.join("real/x.ts").exists());
+        for f in ["a.ts", "b.ts", "c.ts"] {
+            assert_eq!(std::fs::read_to_string(outside.join(f)).unwrap(), "keep", "{f}");
+        }
+        // a symlinked output directory isn't entered either
+        let emit2 = d.join("cache/svelte2");
+        std::os::unix::fs::symlink(&outside, &emit2).unwrap();
+        remove_output(&emit2, &emit2.join("a.ts"));
+        assert!(outside.join("a.ts").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn bom_components_are_converted() {
+        let d = temp_dir("bom");
+        let emit = d.join(".svelte-check/svelte");
+        let text = "<script lang=\"ts\">\n\tlet x: number = 1;\n</script>\n\n{x}\n";
+        std::fs::write(d.join("Plain.svelte"), text).unwrap();
+        std::fs::write(d.join("Bom.svelte"), format!("\u{feff}{text}")).unwrap();
+        let plain = emit_component(&d.join("Plain.svelte"), &d, &emit).ok().unwrap();
+        let bom = emit_component(&d.join("Bom.svelte"), &d, &emit).ok().unwrap();
+        // the same text (positions don't count the mark, as in TypeScript and the compiler)
+        assert_eq!(bom.source, text);
+        assert_eq!(bom.code.replace("Bom", "Plain"), plain.code);
+        assert!(bom.out_path.is_file() && bom.dts_path.is_file());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unreadable_and_unwritable_files_are_failures() {
+        let d = temp_dir("failures");
+        let emit = d.join(".svelte-check/svelte");
+        let r = emit_component(&d.join("Missing.svelte"), &d, &emit);
+        assert!(matches!(r, Err(Failure { kind: FailureKind::Read, .. })));
+        std::fs::write(d.join("A.svelte"), "<p>hi</p>\n").unwrap();
+        // a directory where the generated file goes
+        std::fs::create_dir_all(emit.join("++A.svelte.js")).unwrap();
+        let r = emit_component(&d.join("A.svelte"), &d, &emit);
+        assert!(matches!(r, Err(Failure { kind: FailureKind::Write, .. })));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn overlay_for(d: &Path) -> Value {
+        let cache = d.join(".svelte-check");
+        std::fs::create_dir_all(&cache).unwrap();
+        let overlay = cache.join("tsconfig.json");
+        write_overlay(&d.join("tsconfig.json"), d, d, &cache, &overlay, &[], false).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(&overlay).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn overlay_keeps_effective_include_and_exclude() {
+        let d = temp_dir("overlay");
+        // TypeScript's defaults: everything, minus outDir
+        std::fs::write(d.join("tsconfig.json"), r#"{ "compilerOptions": { "outDir": "build" } }"#).unwrap();
+        let o = overlay_for(&d);
+        assert_eq!(o["include"], json!(["../**/*", "svelte/**/*"]));
+        assert_eq!(o["exclude"], json!(["../build", "svelte/build"]));
+        // inherited ones, relative to the config they come from
+        std::fs::create_dir_all(d.join(".svelte-kit")).unwrap();
+        std::fs::write(d.join(".svelte-kit/tsconfig.json"), r#"{ "include": ["ambient.d.ts", "../src/**/*.ts", "../src/**/*.svelte"], "exclude": ["../src/sw.ts"] }"#).unwrap();
+        std::fs::write(d.join("tsconfig.json"), r#"{ "extends": "./.svelte-kit/tsconfig.json" }"#).unwrap();
+        let o = overlay_for(&d);
+        assert_eq!(
+            o["include"],
+            json!(["../.svelte-kit/ambient.d.ts", "../src/**/*.ts", "../src/**/*.svelte", "svelte/.svelte-kit/ambient.d.ts", "svelte/src/**/*.ts", "svelte/src/**/*.d.svelte.ts"])
+        );
+        assert_eq!(o["exclude"], json!(["../src/sw.ts", "svelte/src/sw.ts"]));
+        // `files` alone: no default include
+        std::fs::write(d.join("tsconfig.json"), r#"{ "files": ["src/a.ts"] }"#).unwrap();
+        let o = overlay_for(&d);
+        assert!(o.get("include").is_none());
+        assert_eq!(o["files"][0], json!("../src/a.ts"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn warnings_cache_key_covers_every_config_file() {
+        let d = temp_dir("warnings-key");
+        let mut keys = vec![WarningsCache::config_key(&d)];
+        for name in CONFIG_FILES {
+            std::fs::write(d.join(name), "export default {}").unwrap();
+            let key = WarningsCache::config_key(&d);
+            assert!(!keys.contains(&key), "{name}");
+            keys.push(key);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_guard_kills_and_reaps() {
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        drop(ChildGuard(Some(child)));
+        // reaped: the pid no longer names our child
+        let alive = std::process::Command::new("kill").args(["-0", &pid.to_string()]).stderr(std::process::Stdio::null()).status().unwrap().success();
+        assert!(!alive);
+    }
 }
