@@ -98,8 +98,22 @@ impl Default for Svelte2TsxOptions {
     }
 }
 
+/// What `svelte2tsx` returns besides the code
+pub struct Svelte2TsxOutput {
+    pub code: String,
+    /// `generateMap({ hires: true })`'s decoded mappings (UTF-16 columns), if asked for
+    pub mappings: Option<Vec<Vec<[u32; 4]>>>,
+    /// `exportedNames`' keys
+    pub exported_names: Vec<String>,
+}
+
 /// `svelte2tsx(svelte, options).code`
 pub fn svelte2tsx(source: &str, o: &Svelte2TsxOptions) -> Result<String, Error> {
+    svelte2tsx_full(source, o, false).map(|r| r.code)
+}
+
+/// `svelte2tsx(svelte, options)`, with the source map if `with_map`
+pub fn svelte2tsx_full(source: &str, o: &Svelte2TsxOptions, with_map: bool) -> Result<Svelte2TsxOutput, Error> {
     use script::events::ComponentEvents;
     use script::exported::ExportedNames;
     use script::generics::Generics;
@@ -297,7 +311,11 @@ pub fn svelte2tsx(source: &str, o: &Svelte2TsxOptions) -> Result<String, Error> 
     )?;
 
     out.ms.prepend("///<reference types=\"svelte\" />\n");
-    Ok(out.ms.to_string())
+    Ok(Svelte2TsxOutput {
+        code: out.ms.to_string(),
+        mappings: with_map.then(|| out.ms.decoded_map_hires()),
+        exported_names: exported.exports.keys().cloned().collect(),
+    })
 }
 
 /// `ComponentDocumentation.getFormatted()`
@@ -329,3 +347,4 @@ fn dedent(s: &str) -> String {
         s
     }
 }
+pub use template::{lnode_end, lnode_start};

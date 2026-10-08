@@ -1,6 +1,7 @@
 //! A Rust port of the Svelte 5 compiler. So far: the parser (`parse(source, { modern: true })`).
 
 pub mod ast;
+pub mod check;
 pub mod css;
 pub mod error;
 #[allow(clippy::all)]
