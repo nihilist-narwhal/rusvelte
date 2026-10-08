@@ -1,11 +1,11 @@
 // Oracle for code generation: the `js.code` and `css.code` of `compile()` (and
 // `compileModule()` for `.svelte.js` files), client and server.
-//   node gen_codegen.mjs <suite|dir> <out dir>
+//   node gen_codegen.mjs <suite|dir> <out dir> [base options JSON]
 // <suite> is one of Svelte's test suites (runtime-runes, runtime-legacy, hydration,
 // server-side-rendering, css, snapshot), compiled with the options that suite's harness uses
 // (tests/helpers.js `compile_directory` and each suite's setup) and each sample's
 // `_config.js` `compileOptions`. Anything else is a directory of components compiled with
-// default options.
+// default options, or the given base options (e.g. `'{"dev":true}'`).
 // Each record holds the options used, so the Rust side can compile with the same ones.
 // A `cssHash` function in the options is recorded as `{ "fn": <source> }`.
 import { compile, compileModule } from 'svelte/compiler';
@@ -13,8 +13,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { codegen_jobs } from './codegen_jobs.mjs';
 
-const [target, out] = process.argv.slice(2);
-const jobs = codegen_jobs(target);
+const [target, out, base] = process.argv.slice(2);
+const jobs = codegen_jobs(target, base ? JSON.parse(base) : {});
 
 fs.mkdirSync(out, { recursive: true });
 const manifest = [];

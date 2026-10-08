@@ -76,7 +76,7 @@ function serialisable(options) {
  * @param {string} target a suite name or a directory
  * @returns {{ id: string, filename: string, text: string, module: boolean, options: any, record: any }[]}
  */
-export function codegen_jobs(target) {
+export function codegen_jobs(target, base = {}) {
 const jobs = [];
 if (suites.includes(target)) {
 	const root = path.join(tests, target, 'samples');
@@ -124,12 +124,12 @@ for (const job of jobs) {
 	}
 	let options;
 	if (job.module) {
-		const o = suites.includes(target) ? suite_options(target, job.config, job.generate) : {};
+		const o = suites.includes(target) ? suite_options(target, job.config, job.generate) : base;
 		options = { filename, generate: job.generate, dev: o.dev, experimental: o.experimental };
 	} else {
 		options = {
 			filename,
-			...(suites.includes(target) ? suite_options(target, job.config, job.generate) : {}),
+			...(suites.includes(target) ? suite_options(target, job.config, job.generate) : base),
 			generate: job.generate
 		};
 		if (target === 'runtime-runes' || target === 'runtime-legacy') options.rootDir = job.cwd;
