@@ -13,8 +13,9 @@ the official compiler does the work.
 npm install -D rusvelte
 ```
 
-Prebuilt native modules cover macOS (arm64, x64), Linux (x64 and arm64 with glibc 2.17 or newer,
-x64 with musl) and Windows (x64). From a checkout of the repository instead:
+Prebuilt native modules cover macOS (arm64, x64) and Linux (x64 and arm64 with glibc 2.17 or
+newer, x64 with musl). Windows is coming in the next release; until then, and on any other
+platform, the package warns and uses the official compiler. From a checkout of the repository instead:
 `cargo build --release -p rusvelte-node && node packages/rusvelte/build.js`.
 
 Then either load it for the whole process:

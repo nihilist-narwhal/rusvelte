@@ -93,8 +93,10 @@ jobs:
         run: |
           # a tag publishes; a manual run is a dry run
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then DRY_RUN=""; else DRY_RUN="--dry-run"; fi
-          # the platform packages first, so the main package's optional dependencies exist
-          for dir in npm-out/rusvelte-*; do
+          # the platform packages first, so the main package's optional dependencies exist;
+          # versions already on npm (from an earlier, partly failed run) are skipped
+          for dir in npm-out/rusvelte-* npm-out/rusvelte; do
+            spec=$(node -p "const p = require('./$dir/package.json'); p.name + '@' + p.version")
+            if npm view "$spec" version > /dev/null 2>&1; then echo "$spec is published already"; continue; fi
             (cd "$dir" && npm publish --access public --provenance $DRY_RUN)
           done
-          (cd npm-out/rusvelte && npm publish --access public --provenance $DRY_RUN)

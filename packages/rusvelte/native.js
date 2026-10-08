@@ -23,21 +23,21 @@ function load() {
 	if (process.env.RUSVELTE_NATIVE) return require(process.env.RUSVELTE_NATIVE);
 	const local = fileURLToPath(new URL('./rusvelte.node', import.meta.url));
 	if (fs.existsSync(local)) return require(local);
-	const name = platform_package();
-	try {
-		return require(name);
-	} catch (e) {
-		throw new Error(
-			`rusvelte: no native module for ${process.platform}-${process.arch} (looked for the package ${name}). ` +
-				`Install it, or build one from the repository (cargo build --release -p rusvelte-node).`,
-			{ cause: e }
-		);
-	}
+	return require(platform_package());
 }
 
-const native = load();
+/** The native module, or null where there's none (compiler.js then uses svelte/compiler) */
+export let native = null;
+/** Why the native module couldn't be loaded */
+export let load_error = null;
+try {
+	native = load();
+} catch (e) {
+	const where = process.env.RUSVELTE_NATIVE ?? platform_package();
+	load_error = `no native module for ${process.platform}-${process.arch} (${where}): ${e.message.split('\n')[0]}`;
+}
 
-export const compile = native.compile;
-export const compileModule = native.compileModule;
+export const compile = native?.compile;
+export const compileModule = native?.compileModule;
 /** The Svelte version whose output this build reproduces */
-export const svelteVersion = native.svelteVersion();
+export const svelteVersion = native?.svelteVersion() ?? null;

@@ -29,12 +29,14 @@ const licenses = ['LICENSE', 'THIRD_PARTY_NOTICES.md'];
 fs.rmSync(out, { recursive: true, force: true });
 
 for (const [target, t] of Object.entries(TARGETS)) {
-	const binary = path.join(artifacts, `rusvelte.${target}.node`);
-	if (!fs.existsSync(binary)) throw new Error(`missing ${binary}`);
 	const name = `rusvelte-${t.name}`;
+	// only the platforms the main package lists are published
+	if (!(name in main.optionalDependencies)) continue;
 	if (main.optionalDependencies[name] !== main.version) {
 		throw new Error(`optionalDependencies.${name} must be ${main.version}`);
 	}
+	const binary = path.join(artifacts, `rusvelte.${target}.node`);
+	if (!fs.existsSync(binary)) throw new Error(`missing ${binary}`);
 	const dir = path.join(out, name);
 	fs.mkdirSync(dir, { recursive: true });
 	fs.copyFileSync(binary, path.join(dir, 'rusvelte.node'));
@@ -64,4 +66,4 @@ for (const f of main.files) {
 }
 const { scripts, ...published } = main;
 fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(published, null, 2) + '\n');
-console.log(`prepared rusvelte ${main.version} and ${Object.keys(TARGETS).length} platform packages in ${out}`);
+console.log(`prepared rusvelte ${main.version} and ${Object.keys(main.optionalDependencies).length} platform packages in ${out}`);

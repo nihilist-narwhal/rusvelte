@@ -151,6 +151,11 @@ export function create(svelte) {
 		name = 'CompileWarning';
 	}
 
+	if (!native.native) {
+		console.warn(`[rusvelte] ${native.load_error}; using svelte/compiler`);
+		return { compile: real.compile, compileModule: real.compileModule };
+	}
+
 	const version_ok = real.VERSION === native.svelteVersion || !!process.env.RUSVELTE_ALLOW_VERSION_MISMATCH;
 	if (!version_ok) {
 		console.warn(

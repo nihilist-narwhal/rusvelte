@@ -2,9 +2,20 @@
   "name": "rusvelte",
   "version": "0.1.0",
   "description": "The Svelte 5 compiler ported to Rust, as a drop-in for svelte/compiler in Vite builds",
-  "keywords": ["svelte", "compiler", "rust", "vite", "sveltekit", "oxc"],
+  "keywords": [
+    "svelte",
+    "compiler",
+    "rust",
+    "vite",
+    "sveltekit",
+    "oxc"
+  ],
   "homepage": "https://nihilist-narwhal.github.io/rusvelte/",
-  "repository": { "type": "git", "url": "git+https://github.com/nihilist-narwhal/rusvelte.git", "directory": "packages/rusvelte" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nihilist-narwhal/rusvelte.git",
+    "directory": "packages/rusvelte"
+  },
   "license": "MIT",
   "type": "module",
   "exports": {
@@ -12,8 +23,18 @@
     "./register": "./register.js",
     "./vite": "./vite.js"
   },
-  "files": ["native.js", "compiler.js", "register.js", "vite.js", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
-  "engines": { "node": ">=22.15" },
+  "files": [
+    "native.js",
+    "compiler.js",
+    "register.js",
+    "vite.js",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  },
   "scripts": {
     "build": "cargo build --release -p rusvelte-node && node build.js"
   },
@@ -25,7 +46,6 @@
     "rusvelte-darwin-x64": "0.1.0",
     "rusvelte-linux-x64-gnu": "0.1.0",
     "rusvelte-linux-arm64-gnu": "0.1.0",
-    "rusvelte-linux-x64-musl": "0.1.0",
-    "rusvelte-win32-x64-msvc": "0.1.0"
+    "rusvelte-linux-x64-musl": "0.1.0"
   }
 }
