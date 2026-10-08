@@ -1,5 +1,6 @@
 //! Compare the kit-file port (svelte2tsx::kit) against oracle/gen_kit.mjs output.
 //! Usage: compare_kit <oracle.json> [filter]   (VERBOSE=1 prints the differences)
+//! Works for the stress runs too (the entries then carry upsertKitFile's arguments).
 use std::fs;
 use std::path::PathBuf;
 
@@ -40,8 +41,10 @@ fn main() {
         }
         files += 1;
         let path = format!("{workspace}/{rel}");
+        // the arguments upsertKitFile got (stress runs use a made-up kit file name)
+        let file_name = entry["fileName"].as_str().map_or_else(|| path.clone(), str::to_string);
         let expected_kit = entry["isKit"].as_bool().unwrap();
-        if is_kit_file(&path, &settings) == expected_kit {
+        if entry.get("fileName").is_some() || is_kit_file(&path, &settings) == expected_kit {
             is_kit_ok += 1;
         } else {
             failures.push(format!("{rel}: isKitFile differs (expected {expected_kit})"));
@@ -52,11 +55,11 @@ fn main() {
         kit += 1;
         let text = fs::read_to_string(&path).unwrap();
         let rewrite = RewriteExternalImports {
-            source_path: PathBuf::from(&path),
-            generated_path: PathBuf::from(format!("{emit_dir}/{rel}")),
-            workspace_path: PathBuf::from(workspace),
+            source_path: PathBuf::from(&file_name),
+            generated_path: PathBuf::from(entry["generatedPath"].as_str().map_or_else(|| format!("{emit_dir}/{rel}"), str::to_string)),
+            workspace_path: PathBuf::from(entry["workspacePath"].as_str().unwrap_or(workspace)),
         };
-        let actual = std::panic::catch_unwind(|| upsert_kit_file(&path, &text, &settings, Some(&rewrite), None));
+        let actual = std::panic::catch_unwind(|| upsert_kit_file(&file_name, &text, &settings, Some(&rewrite), None));
         let expected = &entry["result"];
         let (t_ok, a_ok) = match (&actual, expected) {
             (Err(_), _) => {

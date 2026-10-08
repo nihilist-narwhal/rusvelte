@@ -2,10 +2,16 @@
 // internalHelpers.upsertKitFile over every .ts/.js file of a workspace the way
 // svelte-check --incremental/--tsgo does (emitSvelteFiles in svelte-check/src/incremental.ts).
 //
-// Usage: node gen_kit.mjs <workspace> <out.json> [settings.json]
+// Usage: node gen_kit.mjs <workspace> <out.json> [settings.json|-] [stress mode]
 //
 // Files are found like svelte-check's findFiles (skipping node_modules and dot directories);
 // every one gets `isKit` (internalHelpers.isKitFile), kit files also the upsert result.
+//
+// Stress modes upsert every file's text under a made-up kit file name next to it
+// (`route`: +page.server.<ext>, `hooks`: src/hooks.server.<ext>, `params`: src/params/x.<ext>),
+// with the file's own directory as the workspace, so that every `../` import leaves it and
+// gets rewritten. Each entry records the arguments used (fileName, workspacePath,
+// generatedPath).
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,7 +22,8 @@ const { internalHelpers } = require('svelte2tsx');
 
 const [workspaceArg, out, settingsArg] = process.argv.slice(2);
 const workspacePath = path.resolve(workspaceArg);
-const settings = settingsArg
+const stress = process.argv[5];
+const settings = settingsArg && settingsArg !== '-'
 	? JSON.parse(fs.readFileSync(settingsArg, 'utf-8'))
 	: {
 			paramsPath: 'src/params',
@@ -38,22 +45,30 @@ function walk(dir, files) {
 	return files;
 }
 
-const emitDir = path.join(workspacePath, '.svelte-kit', '.svelte-check', 'svelte');
+const stressNames = { route: '+page.server', hooks: 'src/hooks.server', params: 'src/params/x' };
+if (stress && !stressNames[stress]) throw new Error(`unknown stress mode ${stress}`);
 const files = walk(workspacePath, []).sort();
 const entries = [];
 let kit = 0;
 let errors = 0;
-for (const sourcePath of files) {
-	const rel = path.relative(workspacePath, sourcePath);
+for (const filePath of files) {
+	const rel = path.relative(workspacePath, filePath);
+	let sourcePath = filePath;
+	let workspace = workspacePath;
+	if (stress) {
+		workspace = path.dirname(filePath);
+		sourcePath = workspace + '/' + stressNames[stress] + path.extname(filePath);
+	}
 	const isKit = internalHelpers.isKitFile(sourcePath, settings);
 	if (!isKit) {
 		entries.push({ rel, isKit });
 		continue;
 	}
 	kit++;
-	const text = fs.readFileSync(sourcePath, 'utf-8');
+	const text = fs.readFileSync(filePath, 'utf-8');
 	const isTsFile = sourcePath.endsWith('.ts');
-	const outPath = path.join(emitDir, rel).replace(/\\/g, '/');
+	const emitDir = path.join(workspace, '.svelte-kit', '.svelte-check', 'svelte');
+	const outPath = path.join(emitDir, path.relative(workspace, sourcePath)).replace(/\\/g, '/');
 	let result;
 	try {
 		result =
@@ -70,13 +85,13 @@ for (const sourcePath of files) {
 						isTsFile ? ts.ScriptKind.TS : ts.ScriptKind.JS
 					),
 				undefined,
-				{ workspacePath, generatedPath: outPath }
+				{ workspacePath: workspace, generatedPath: outPath }
 			) ?? null;
 	} catch (e) {
 		errors++;
 		result = { error: String(e.message).split('\n')[0] };
 	}
-	entries.push({ rel, isKit, result });
+	entries.push({ rel, isKit, fileName: sourcePath, workspacePath: workspace, generatedPath: outPath, result });
 }
 fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });
 fs.writeFileSync(out, JSON.stringify({ workspacePath, settings, entries }, null, 1));
