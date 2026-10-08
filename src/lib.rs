@@ -1,5 +1,6 @@
 //! A Rust port of the Svelte 5 compiler. So far: the parser (`parse(source, { modern: true })`).
 
+pub mod analyze;
 pub mod ast;
 pub mod css;
 pub mod error;
@@ -12,7 +13,7 @@ pub mod magic_string;
 pub mod parser;
 pub mod svelte2tsx;
 #[allow(clippy::all)]
-mod warning_codes;
+pub(crate) mod warning_codes;
 
 use oxc_allocator::Allocator;
 use serde_json::Value;
@@ -32,6 +33,17 @@ pub struct Component<'a> {
 pub fn parse<'a>(alloc: &'a Allocator, source: &'a str, loose: bool) -> Result<Component<'a>, CompileError> {
     let locator = std::rc::Rc::new(Locator::new(source));
     let (ast, root) = parser::parse(alloc, source, locator.clone(), loose)?;
+    Ok(Component { ast, root, locator })
+}
+
+/// Like [`parse`], also collecting the warnings the parser emits
+pub fn parse_with_warnings<'a>(
+    alloc: &'a Allocator,
+    source: &'a str,
+    warnings: &mut Vec<analyze::Warning>,
+) -> Result<Component<'a>, CompileError> {
+    let locator = std::rc::Rc::new(Locator::new(source));
+    let (ast, root) = parser::parse_collecting(alloc, source, locator.clone(), false, Some(warnings))?;
     Ok(Component { ast, root, locator })
 }
 

@@ -130,6 +130,18 @@ pub fn element(parser: &mut Parser) -> Result<()> {
                 Open::Root => "Root",
                 Open::Node(id) => parser.ast.nodes[id].type_name(),
             };
+            if parent_type == "RegularElement" {
+                if !parser.last_auto_closed_tag.as_ref().is_some_and(|last| last.tag == name) {
+                    if let Open::Node(id) = parent {
+                        if let Node::Element(el) = &parser.ast.nodes[id] {
+                            let end = parser.ast.fragments[el.fragment].nodes.first().map_or(start, |&n| parser.ast.nodes[n].start());
+                            let w = crate::analyze::warnings::element_implicitly_closed(&format!("</{name}>"), &format!("</{}>", el.name));
+                            let el_start = el.start;
+                            parser.warn(el_start, end, w);
+                        }
+                    }
+                }
+            }
             if parent_type != "RegularElement" && !parser.loose {
                 if let Some(last) = &parser.last_auto_closed_tag {
                     if last.tag == name {
@@ -225,6 +237,12 @@ pub fn element(parser: &mut Parser) -> Result<()> {
         };
         if let Some(parent_name) = parent_info {
             if closing_tag_omitted(&parent_name, &tag_name) {
+                if let Node::Element(el) = &parser.ast.nodes[parent_id] {
+                    let end = parser.ast.fragments[el.fragment].nodes.first().map_or(start, |&n| parser.ast.nodes[n].start());
+                    let w = crate::analyze::warnings::element_implicitly_closed(&format!("<{tag_name}>"), &format!("</{parent_name}>"));
+                    let el_start = el.start;
+                    parser.warn(el_start, end, w);
+                }
                 parser.ast.nodes[parent_id].set_end(start);
                 parser.pop();
                 parser.last_auto_closed_tag = Some(LastAutoClosedTag {
@@ -302,6 +320,7 @@ pub fn element(parser: &mut Parser) -> Result<()> {
         }
 
         if !is_expression_attribute(&definition) {
+            parser.warn(def_start, def_end, crate::analyze::warnings::svelte_element_invalid_this());
             // note that this is wrong, in the case of e.g. `this="h{n}"` — it will result in `<h>`.
             // Svelte preserves the buggy Svelte 4 behaviour; TODO in 6.0, error
             let Attr::Attribute { value, .. } = definition else { unreachable!() };
@@ -916,6 +935,9 @@ fn read_script<'a>(parser: &mut Parser<'a>, start: usize, attributes: Vec<Attr<'
         let Attr::Attribute { name, value, .. } = attribute else { continue };
         if RESERVED_ATTRIBUTES.contains(name) {
             return Err(e::script_reserved_attribute((attribute.start(), attribute.end()), name));
+        }
+        if !["context", "generics", "lang", "module"].contains(name) {
+            parser.warn(attribute.start(), attribute.end(), crate::analyze::warnings::script_unknown_attribute());
         }
         if *name == "module" {
             if !matches!(value, AttrValue::True) {

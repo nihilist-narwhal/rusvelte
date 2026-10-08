@@ -43,4 +43,4 @@ cargo run --release --bin bench -- svelte-upstream/packages/svelte/tests oracle/
   acorn's shape
 - `src/ast.rs` — the Svelte template AST and its JSON serialization
 - `src/css.rs` — the CSS AST
-- `src/errors.rs` — generated from Svelte's `errors.js` by `tools/gen_errors.mjs`
+- `src/errors.rs` — generated from Svelte's `errors.js` by `tools/gen_messages.mjs`

@@ -114,6 +114,12 @@ impl<'s> Locator<'s> {
         (line + 1, col)
     }
 
+    /// Svelte's locator as numbers: (line, column, character)
+    pub fn line_column(&self, byte: usize) -> (usize, usize, usize) {
+        let (line, column) = self.line_col(self.lf_lines(), byte);
+        (line, column, self.utf16(byte))
+    }
+
     /// Svelte's locator: `{ line, column, character }`
     pub fn locate(&self, byte: usize) -> Value {
         let (line, column) = self.line_col(self.lf_lines(), byte);

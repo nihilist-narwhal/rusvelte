@@ -56,6 +56,14 @@ pub struct Parser<'a> {
     pub loc: Rc<Locator<'a>>,
     pub js: JsParser<'a>,
     pub builder: AstBuilder<'a>,
+    /// Warnings the parser emits (`w.*` calls in `phases/1-parse`)
+    pub warnings: Vec<crate::analyze::Warning>,
+}
+
+impl Parser<'_> {
+    pub fn warn(&mut self, start: usize, end: usize, w: crate::analyze::warnings::W) {
+        self.warnings.push(crate::analyze::Warning { code: w.code, message: w.message, position: Some((start, end)) });
+    }
 }
 
 /// An identifier read by `read_identifier` (the name may be empty)
@@ -131,6 +139,35 @@ fn lang_in_tag(rest: &str) -> Option<&str> {
 
 /// Parse a component. `source` must already have its BOM removed.
 pub fn parse<'a>(alloc: &'a Allocator, source: &'a str, loc: Rc<Locator<'a>>, loose: bool) -> Result<(Ast<'a>, Root<'a>)> {
+    parse_collecting(alloc, source, loc, loose, None)
+}
+
+/// [`parse`], appending the parser's warnings to `warnings`
+pub fn parse_collecting<'a>(
+    alloc: &'a Allocator,
+    source: &'a str,
+    loc: Rc<Locator<'a>>,
+    loose: bool,
+    warnings: Option<&mut Vec<crate::analyze::Warning>>,
+) -> Result<(Ast<'a>, Root<'a>)> {
+    let result = parse_inner(alloc, source, loc, loose);
+    match result {
+        Ok((ast, root, w)) => {
+            if let Some(warnings) = warnings {
+                warnings.extend(w);
+            }
+            Ok((ast, root))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn parse_inner<'a>(
+    alloc: &'a Allocator,
+    source: &'a str,
+    loc: Rc<Locator<'a>>,
+    loose: bool,
+) -> Result<(Ast<'a>, Root<'a>, Vec<crate::analyze::Warning>)> {
     let template = js_trim_end(source);
 
     let ts = script_lang(source) == Some("ts");
@@ -165,6 +202,7 @@ pub fn parse<'a>(alloc: &'a Allocator, source: &'a str, loc: Rc<Locator<'a>>, lo
         js: JsParser::new(ts, loc.clone(), alloc),
         loc,
         builder: AstBuilder::new(alloc),
+        warnings: Vec::new(),
     };
 
     while parser.index < parser.template.len() {
@@ -219,7 +257,7 @@ pub fn parse<'a>(alloc: &'a Allocator, source: &'a str, loc: Rc<Locator<'a>>, lo
         }
     }
 
-    Ok((parser.ast, parser.root))
+    Ok((parser.ast, parser.root, parser.warnings))
 }
 
 impl<'a> Parser<'a> {
