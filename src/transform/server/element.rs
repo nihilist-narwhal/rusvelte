@@ -37,6 +37,8 @@ enum ElAttr<'s> {
     Clsx(&'s Attr<'s>),
     /// `{ type: 'transformed', name, expression }`
     Transformed(String, Node),
+    /// a `bind:` directive (in `prepare_element_spread_object`)
+    Bind(&'s Attr<'s>),
 }
 
 /// `/^\r?\n/`
@@ -253,6 +255,7 @@ impl<'a, 's> Server<'a, 's> {
                     }
                     ElAttr::Attr(a) => (a, false),
                     ElAttr::Clsx(a) => (a, true),
+                    ElAttr::Bind(_) => continue,
                 };
                 let Attr::Attribute { name: raw_name, value, .. } = a else { continue };
                 let name = self.attribute_name(n, raw_name);
@@ -406,6 +409,25 @@ impl<'a, 's> Server<'a, 's> {
         vec![Some(object), css_hash, classes, styles, (flags != 0.0).then(|| b::literal(flags))]
     }
 
+    /// `prepare_element_spread_object(element, context, transform)`
+    pub fn prepare_element_spread_object(&mut self, n: NodeId, st: &State, opt: &mut PromiseOptimiser) -> Vec<Option<Node>> {
+        let ast = self.ast();
+        let TNode::Element(el) = &ast.nodes[n] else { return vec![] };
+        let mut attributes = Vec::new();
+        let mut class_directives = Vec::new();
+        let mut style_directives = Vec::new();
+        for a in &el.attributes {
+            match a {
+                Attr::Attribute { .. } | Attr::Spread { .. } => attributes.push(ElAttr::Attr(a)),
+                Attr::Directive { kind: "BindDirective", .. } => attributes.push(ElAttr::Bind(a)),
+                Attr::Directive { kind: "ClassDirective", .. } => class_directives.push(a),
+                Attr::StyleDirective { .. } => style_directives.push(a),
+                _ => {}
+            }
+        }
+        self.prepare_element_spread(n, &attributes, &style_directives, &class_directives, st, opt)
+    }
+
     /// `build_spread_object(element, attributes, context, transform)`
     fn build_spread_object(&mut self, n: NodeId, attributes: &[ElAttr<'s>], st: &State, opt: &mut PromiseOptimiser) -> Node {
         let ast = self.ast();
@@ -427,6 +449,15 @@ impl<'a, 's> Server<'a, 's> {
                     };
                     let _ = a;
                     props.push(b::prop("init", b::key(&name), v));
+                }
+                ElAttr::Bind(Attr::Directive { name, expression: Some(expression), .. }) => {
+                    let name = self.attribute_name(n, name);
+                    let e = self.visit_expr_here(expression, st);
+                    let value = match &e.kind {
+                        NodeKind::SequenceExpression(s) => b::call(s.expressions[0].clone(), ()),
+                        _ => e,
+                    };
+                    props.push(b::prop("init", b::key(&name), value));
                 }
                 ElAttr::Attr(a @ Attr::Spread { expression, .. }) => {
                     self.path.push(super::super::js::PathNode::Tpl(P::Attr(a)));

@@ -15,7 +15,7 @@ pub(crate) mod nodes;
 pub(crate) mod scope;
 mod ts;
 pub(crate) mod utils;
-mod visit;
+pub(crate) mod visit;
 #[allow(clippy::all)]
 pub mod warnings;
 

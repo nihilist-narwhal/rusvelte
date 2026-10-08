@@ -169,6 +169,8 @@ impl<'a, 's> Server<'a, 's> {
             let can_remove_entirely = (namespace == "svg" && parent_name != Some("text") && !in_text)
                 || matches!(parent_name, Some("select" | "tr" | "table" | "tbody" | "thead" | "tfoot" | "colgroup" | "datalist"));
 
+            // the JS mutates each text node, and reads the previous one's mutated data
+            let mut modified: Vec<Option<String>> = vec![None; regular.len()];
             for i in 0..regular.len() {
                 let node = &regular[i];
                 let Some((mut data, mut raw)) = text_of(node) else {
@@ -178,7 +180,8 @@ impl<'a, 's> Server<'a, 's> {
                 let prev_ty = if i > 0 { Some(regular[i - 1].ty(ast)) } else { None };
                 let next_ty = regular.get(i + 1).map(|c| c.ty(ast));
                 if prev_ty != Some("ExpressionTag") {
-                    let prev_ends_ws = i > 0 && text_of(&regular[i - 1]).is_some_and(|(d, _)| d.ends_with(is_whitespace));
+                    let prev_data = if i > 0 { modified[i - 1].clone().or_else(|| text_of(&regular[i - 1]).map(|(d, _)| d)) } else { None };
+                    let prev_ends_ws = prev_data.is_some_and(|d| d.ends_with(is_whitespace));
                     let replacement = if prev_ends_ws { "" } else { " " };
                     data = replace_leading_ws(&data, replacement);
                     raw = replace_leading_ws(&raw, replacement);
@@ -187,6 +190,7 @@ impl<'a, 's> Server<'a, 's> {
                     data = replace_trailing_ws(&data, " ");
                     raw = replace_trailing_ws(&raw, " ");
                 }
+                modified[i] = Some(data.clone());
                 if !data.is_empty() && (data != " " || !can_remove_entirely) {
                     trimmed.push(Child::Text { node: node.node_id().unwrap(), data, raw });
                 }
@@ -823,10 +827,23 @@ impl<'a, 's> Server<'a, 's> {
 
         self.path.push(PathNode::Tpl(P::Node(n)));
 
-        // TODO: <select value> / <option> special cases
-        state.template.borrow_mut().push(b::literal(format!("<{name}").as_str()));
-        let body = self.build_element_attributes(n, &attribute_state, &mut optimiser);
-        state.template.borrow_mut().push(b::literal(if node_is_void { "/>" } else { ">" }));
+        // <select value> and <option> have their attributes handled by the runtime
+        let is_select_special = name == "select"
+            && el.attributes.iter().any(|a| match a {
+                crate::ast::Attr::Attribute { name, .. } | crate::ast::Attr::Directive { kind: "BindDirective", name, .. } => {
+                    *name == "value" || name.to_lowercase() == "defaultvalue"
+                }
+                crate::ast::Attr::Spread { .. } => true,
+                _ => false,
+            });
+        let is_option_special = name == "option";
+        let is_special = is_select_special || is_option_special;
+        let mut body = None;
+        if !is_special {
+            state.template.borrow_mut().push(b::literal(format!("<{name}").as_str()));
+            body = self.build_element_attributes(n, &attribute_state, &mut optimiser);
+            state.template.borrow_mut().push(b::literal(if node_is_void { "/>" } else { ">" }));
+        }
 
         let frag_nodes = ast.fragments[el.fragment].nodes.clone();
         if (name == "script" || name == "style") && frag_nodes.len() == 1 {
@@ -854,6 +871,52 @@ impl<'a, 's> Server<'a, 's> {
             )));
         }
 
+        if is_select_special || is_option_special {
+            let customizable = self.is_customizable_select(n);
+            let body_node = if is_option_special {
+                if let Some(svn) = meta.synthetic_value_node {
+                    let TNode::ExpressionTag { expression, .. } = &ast.nodes[svn] else { unreachable!() };
+                    self.path.push(PathNode::Tpl(P::Node(svn)));
+                    let e = self.visit_template_expr_here(expression, &state);
+                    self.path.pop();
+                    let m = self.meta_of_node(svn);
+                    optimiser.transform(self, e, m)
+                } else {
+                    let inner = state.with_new_arrays();
+                    self.process_children(&cleaned.trimmed, &inner);
+                    let mut statements = state.init.borrow().clone();
+                    statements.extend(build_template(std::mem::take(&mut *inner.template.borrow_mut())));
+                    if self.dev {
+                        let (line, column) = self.locate(el.start);
+                        statements.insert(
+                            0,
+                            b::stmt(b::call("$.push_element", vec![b::id("$$renderer"), b::literal(name.as_str()), b::literal(line as f64), b::literal(column as f64)])),
+                        );
+                        statements.push(b::stmt(b::call("$.pop_element", ())));
+                    }
+                    b::arrow(vec![b::id("$$renderer")], b::block(statements))
+                }
+            } else {
+                let inner = state.with_new_arrays();
+                self.process_children(&cleaned.trimmed, &inner);
+                let mut statements = state.init.borrow().clone();
+                statements.extend(build_template(std::mem::take(&mut *inner.template.borrow_mut())));
+                b::arrow(vec![b::id("$$renderer")], b::block(statements))
+            };
+            self.path.pop();
+            let mut args = self.prepare_element_spread_object(n, st, &mut optimiser);
+            if customizable {
+                args.push(Some(b::r#true()));
+            }
+            let mut call_args = vec![args.remove(0), Some(body_node)];
+            call_args.extend(args);
+            let statement = b::stmt(b::call(if is_option_special { "$$renderer.option" } else { "$$renderer.select" }, call_args));
+            let mut statements = std::mem::take(&mut *state.init.borrow_mut());
+            statements.push(statement);
+            st.template.borrow_mut().extend(optimiser.render(statements));
+            return;
+        }
+
         if let Some(body) = body {
             let inner = state.with_new_arrays();
             self.process_children(&cleaned.trimmed, &inner);
@@ -869,6 +932,9 @@ impl<'a, 's> Server<'a, 's> {
             state.template.borrow_mut().push(b::r#if(id.clone(), b::block(build_template(vec![id])), b::block(inner_body)));
         } else {
             self.process_children(&cleaned.trimmed, &state);
+            if (name == "optgroup" || name == "select") && self.is_customizable_select(n) {
+                state.template.borrow_mut().push(b::literal("<!>"));
+            }
         }
 
         if !node_is_void {
@@ -892,6 +958,14 @@ impl<'a, 's> Server<'a, 's> {
         } else {
             st.init.borrow_mut().extend(init);
             st.template.borrow_mut().extend(template);
+        }
+    }
+
+    /// `is_customizable_select_element(node)`
+    pub fn is_customizable_select(&self, n: NodeId) -> bool {
+        match &self.ast().nodes[n] {
+            TNode::Element(el) => crate::analyze::visit::is_customizable_select_element(self.ast(), el),
+            _ => false,
         }
     }
 

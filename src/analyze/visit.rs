@@ -3814,7 +3814,7 @@ fn callee_rune(scopes: &scope::Scopes, node: P, scope: super::ScopeId) -> Option
 }
 
 /// `is_customizable_select_element`: `<select>`, `<optgroup>` or `<option>` with rich content
-fn is_customizable_select_element(ast: &crate::ast::Ast, el: &crate::ast::Element) -> bool {
+pub(crate) fn is_customizable_select_element(ast: &crate::ast::Ast, el: &crate::ast::Element) -> bool {
     if !matches!(el.name, "select" | "optgroup" | "option") {
         return false;
     }
