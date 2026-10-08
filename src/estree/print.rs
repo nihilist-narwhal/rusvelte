@@ -63,8 +63,15 @@ impl Printed {
 
 /// `print(node, ts(options), options)`
 pub fn print(node: &Node, options: &PrintOptions) -> Printed {
+    fn count_nodes(node: &Node) -> usize {
+        let mut n = 1;
+        node.for_each_child(&mut |c| n += count_nodes(c));
+        n
+    }
+    let count = count_nodes(node);
     let mut p = Printer {
-        bufs: Vec::new(),
+        bufs: Vec::with_capacity(count / 2 + 16),
+        cmds: Vec::with_capacity(count * if options.source_map { 6 } else { 3 } + 16),
         comments: options.comments,
         comment_index: 0,
         quote: if options.double_quotes { '"' } else { '\'' },
@@ -93,6 +100,13 @@ enum Cmd<'a> {
     Buf(u32),
 }
 
+const NONE: u32 = u32::MAX;
+
+struct Entry<'a> {
+    cmd: Cmd<'a>,
+    next: u32,
+}
+
 /// A `Context`: its command list lives in the printer's arena
 #[derive(Clone, Copy)]
 struct Ctx {
@@ -104,8 +118,13 @@ struct Ctx {
 /// A context's commands, with a cache of `measure()`. A write marks the context and every
 /// context it is appended to as dirty (stopping at contexts that already are), and `measure`
 /// only recomputes dirty contexts.
-struct Buf<'a> {
-    cmds: Vec<Cmd<'a>>,
+///
+/// The commands of all contexts live in one arena (`Printer::cmds`), each context's as a
+/// linked list, so creating a context doesn't allocate.
+struct Buf {
+    /// first and last command in `Printer::cmds` (`NONE` when empty)
+    head: u32,
+    tail: u32,
     /// the UTF-16 length of the strings written directly into this context
     own: usize,
     /// `measure()`, valid unless `dirty`
@@ -116,7 +135,8 @@ struct Buf<'a> {
 }
 
 struct Printer<'a> {
-    bufs: Vec<Buf<'a>>,
+    bufs: Vec<Buf>,
+    cmds: Vec<Entry<'a>>,
     comments: &'a [Comment],
     comment_index: usize,
     quote: char,
@@ -156,19 +176,27 @@ fn end(node: Option<&Node>) -> Option<Position> {
 
 impl<'a> Printer<'a> {
     fn new_ctx(&mut self) -> Ctx {
-        self.bufs.push(Buf { cmds: Vec::new(), own: 0, total: 0, dirty: false, parents: smallvec::SmallVec::new() });
+        self.bufs.push(Buf { head: NONE, tail: NONE, own: 0, total: 0, dirty: false, parents: smallvec::SmallVec::new() });
         Ctx { buf: (self.bufs.len() - 1) as u32, multiline: false, has_newline: false }
     }
 
     #[inline]
     fn push(&mut self, cx: &Ctx, cmd: Cmd<'a>) {
-        self.bufs[cx.buf as usize].cmds.push(cmd);
+        let i = self.cmds.len() as u32;
+        self.cmds.push(Entry { cmd, next: NONE });
+        let b = &mut self.bufs[cx.buf as usize];
+        if b.tail == NONE {
+            b.head = i;
+        } else {
+            self.cmds[b.tail as usize].next = i;
+        }
+        b.tail = i;
     }
 
     #[inline]
     fn push_str(&mut self, cx: &Ctx, s: Cow<'a, str>) {
         let len = utf16_len(&s);
-        self.bufs[cx.buf as usize].cmds.push(Cmd::Str(s));
+        self.push(cx, Cmd::Str(s));
         if len > 0 {
             self.bufs[cx.buf as usize].own += len;
             self.mark(cx.buf);
@@ -258,10 +286,14 @@ impl<'a> Printer<'a> {
             return b.total;
         }
         let mut total = b.own;
-        for i in 0..self.bufs[buf as usize].cmds.len() {
-            if let Cmd::Buf(child) = self.bufs[buf as usize].cmds[i] {
+        let mut i = b.head;
+        while i != NONE {
+            let entry = &self.cmds[i as usize];
+            let next = entry.next;
+            if let Cmd::Buf(child) = entry.cmd {
                 total += self.measure(child);
             }
+            i = next;
         }
         let b = &mut self.bufs[buf as usize];
         b.total = total;
@@ -270,9 +302,10 @@ impl<'a> Printer<'a> {
     }
 
     /// esrap's `print` after visiting: run the commands
-    fn run(self, root: u32, indent: &str, source_map: bool) -> Printed {
+    fn run(mut self, root: u32, indent: &str, source_map: bool) -> Printed {
+        let length = self.measure(root);
         let mut state = RunState {
-            code: String::with_capacity(self.bufs[root as usize].total * 11 / 10 + 64),
+            code: String::with_capacity(length + length / 4 + 64),
             current_column: 0,
             mappings: Vec::new(),
             current_line: Vec::new(),
@@ -284,7 +317,7 @@ impl<'a> Printer<'a> {
             pending: Vec::new(),
             source_map,
         };
-        state.run(&self.bufs, root);
+        state.run(&self.bufs, &self.cmds, root);
         state.flush_locations();
         if source_map {
             let line = std::mem::take(&mut state.current_line);
@@ -355,10 +388,13 @@ impl RunState<'_> {
         }
     }
 
-    fn run(&mut self, bufs: &[Buf], buf: u32) {
-        for cmd in &bufs[buf as usize].cmds {
-            match cmd {
-                Cmd::Buf(b) => self.run(bufs, *b),
+    fn run(&mut self, bufs: &[Buf], cmds: &[Entry], buf: u32) {
+        let mut i = bufs[buf as usize].head;
+        while i != NONE {
+            let entry = &cmds[i as usize];
+            i = entry.next;
+            match &entry.cmd {
+                Cmd::Buf(b) => self.run(bufs, cmds, *b),
                 Cmd::Newline => self.needs_newline = true,
                 Cmd::Margin => self.needs_margin = true,
                 Cmd::Space => self.needs_space = true,
@@ -1120,7 +1156,7 @@ impl<'a> Printer<'a> {
     }
 
     fn handle_var_declaration(&mut self, cx: &mut Ctx, node: &'a Node, d: &'a VariableDeclaration, no_in: bool) {
-        let mut open = self.new_ctx();
+        let open = self.new_ctx();
         let mut join = self.new_ctx();
         let mut child = self.new_ctx();
 
@@ -1155,7 +1191,6 @@ impl<'a> Printer<'a> {
         } else {
             self.write(&mut join, ", ");
         }
-        let _ = &mut open;
     }
 
     fn write_for_head_declaration(&mut self, cx: &mut Ctx, node: &'a Node, no_in: bool) {
