@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "magic-string": "^0.30.21",
-    "svelte": "5.57.2"
+    "svelte": "5.57.2",
+    "svelte2tsx": "^0.7.61"
   }
 }

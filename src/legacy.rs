@@ -42,7 +42,7 @@ pub enum LNode<'m, 'a> {
     ConstTag { start: usize, end: usize, id: &'m Pattern<'a>, init: &'m Expr<'a> },
     RenderTag { start: usize, end: usize, expression: &'m Expr<'a> },
     /// kept in its modern shape
-    DeclarationTag(NodeId),
+    DeclarationTag { id: NodeId, start: usize, end: usize },
     IfBlock {
         start: usize,
         end: Option<usize>,
@@ -100,7 +100,7 @@ impl LNode<'_, '_> {
             | LNode::KeyBlock { start, .. }
             | LNode::SnippetBlock { start, .. } => *start,
             LNode::Element(el) => el.start,
-            LNode::DeclarationTag(_) => return None,
+            LNode::DeclarationTag { start, .. } => *start,
         })
     }
 }
@@ -278,7 +278,7 @@ impl<'m, 'a> Converter<'m, 'a> {
             Node::DebugTag { start, end, identifiers } => LNode::DebugTag { start: *start, end: *end, id, identifiers },
             Node::ConstTag { start, end, id, init, .. } => LNode::ConstTag { start: *start, end: *end, id, init },
             Node::RenderTag { start, end, expression } => LNode::RenderTag { start: *start, end: *end, expression },
-            Node::DeclarationTag { .. } => LNode::DeclarationTag(id),
+            Node::DeclarationTag { start, end, .. } => LNode::DeclarationTag { id, start: *start, end: *end },
             Node::KeyBlock { start, end, expression, fragment } => LNode::KeyBlock {
                 start: *start,
                 end: *end,
@@ -621,7 +621,7 @@ impl LNode<'_, '_> {
                 ("end", (*end).into()),
                 ("expression", expression.to_json(cx)),
             ]),
-            LNode::DeclarationTag(id) | LNode::DebugTag { id, .. } => ast.node_json(*id, cx),
+            LNode::DeclarationTag { id, .. } | LNode::DebugTag { id, .. } => ast.node_json(*id, cx),
             LNode::ConstTag { start, end, id: pattern, init } => {
                 let mut left = pattern.to_json(cx);
                 if let Value::Object(m) = &mut left {

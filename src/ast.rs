@@ -94,9 +94,29 @@ impl<'a> Expr<'a> {
 }
 
 impl<'a> JsExpr<'a> {
-    /// `start` after parentheses removal
+    /// The expression Svelte ends up with: parentheses removed, and the `{#each}` rewrites
+    /// (first of a sequence, trailing `as T` removed) applied at the root
+    pub fn effective_root(&self) -> &oxc_ast::ast::Expression<'a> {
+        use oxc_ast::ast::Expression;
+        let mut root = self.inner();
+        if let Some(fix) = &self.fix {
+            if fix.seq_first {
+                if let Expression::SequenceExpression(seq) = root {
+                    root = seq.expressions[0].without_parentheses();
+                }
+            }
+            if let (Some(end), Expression::TSAsExpression(as_expr)) = (fix.strip_as_end, root) {
+                if as_expr.span.end == end {
+                    root = as_expr.expression.without_parentheses();
+                }
+            }
+        }
+        root
+    }
+
+    /// `start` after parentheses removal and Svelte's rewrites
     pub fn inner_start(&self) -> usize {
-        oxc_span::GetSpan::span(self.inner()).start as usize
+        oxc_span::GetSpan::span(self.effective_root()).start as usize
     }
     /// `end` after parentheses removal and Svelte's rewrites
     pub fn inner_end(&self) -> usize {

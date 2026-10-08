@@ -10,6 +10,7 @@ pub mod legacy;
 pub mod locator;
 pub mod magic_string;
 pub mod parser;
+pub mod svelte2tsx;
 #[allow(clippy::all)]
 mod warning_codes;
 
